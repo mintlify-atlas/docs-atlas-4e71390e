@@ -1,0 +1,176 @@
+{
+  "projectType": "framework",
+  "projectName": "Cosmos SDK",
+  "projectDescription": "A modular, open-source blockchain framework for building secure, high-performance Layer 1 chains with full customizability.",
+  "theme": "aspen",
+  "primaryColor": "#7c7c7c",
+  "lightColor": "#070707",
+  "darkColor": "#cfcfcf",
+  "navigation": {
+    "tabs": [
+      {
+        "tab": "Documentation",
+        "groups": [
+          {
+            "group": "Get Started",
+            "pages": [
+              "introduction",
+              "quickstart",
+              "installation"
+            ]
+          },
+          {
+            "group": "Architecture",
+            "pages": [
+              "architecture/overview",
+              "architecture/baseapp",
+              "architecture/modules",
+              "architecture/transactions",
+              "architecture/state-management",
+              "architecture/consensus"
+            ]
+          },
+          {
+            "group": "Building Chains",
+            "pages": [
+              "building/app-creation",
+              "building/dependency-injection",
+              "building/genesis",
+              "building/testing",
+              "building/simulation"
+            ]
+          },
+          {
+            "group": "Core Concepts",
+            "pages": [
+              "concepts/accounts",
+              "concepts/gas-fees",
+              "concepts/events",
+              "concepts/queries",
+              "concepts/encoding",
+              "concepts/migrations"
+            ]
+          },
+          {
+            "group": "Advanced Topics",
+            "pages": [
+              "advanced/ante-handler",
+              "advanced/post-handler",
+              "advanced/upgrade-guide",
+              "advanced/security",
+              "advanced/telemetry"
+            ]
+          }
+        ]
+      },
+      {
+        "tab": "Modules",
+        "groups": [
+          {
+            "group": "Overview",
+            "pages": [
+              "modules/index",
+              "modules/building-modules"
+            ]
+          },
+          {
+            "group": "Essential Modules",
+            "pages": [
+              "modules/auth",
+              "modules/bank",
+              "modules/consensus",
+              "modules/distribution",
+              "modules/governance",
+              "modules/mint",
+              "modules/staking",
+              "modules/slashing",
+              "modules/upgrade",
+              "modules/evidence"
+            ]
+          },
+          {
+            "group": "Supplementary Modules",
+            "pages": [
+              "modules/authz",
+              "modules/feegrant",
+              "modules/epochs",
+              "modules/protocolpool"
+            ]
+          },
+          {
+            "group": "Enterprise Modules",
+            "pages": [
+              "modules/enterprise-overview",
+              "modules/poa"
+            ]
+          }
+        ]
+      },
+      {
+        "tab": "API Reference",
+        "groups": [
+          {
+            "group": "Core APIs",
+            "pages": [
+              "api/baseapp",
+              "api/runtime",
+              "api/store",
+              "api/types"
+            ]
+          },
+          {
+            "group": "Client APIs",
+            "pages": [
+              "api/client",
+              "api/grpc",
+              "api/rest"
+            ]
+          },
+          {
+            "group": "Module APIs",
+            "pages": [
+              "api/module-manager",
+              "api/keeper-patterns",
+              "api/msg-service"
+            ]
+          }
+        ]
+      }
+    ]
+  },
+  "keyFeatures": [
+    "Modular architecture with composable modules",
+    "Built-in Proof-of-Stake consensus integration",
+    "Native IBC protocol support for interoperability",
+    "Comprehensive governance system",
+    "Account abstraction and flexible transaction handling",
+    "Advanced state management with IAVL trees",
+    "Dependency injection framework",
+    "Extensive testing and simulation tools",
+    "Upgrade coordination and migration support",
+    "Enterprise-grade modules for permissioned networks"
+  ],
+  "publicApiSurface": [
+    "baseapp.BaseApp",
+    "types.Context",
+    "types.Msg",
+    "keeper.Keeper",
+    "module.AppModule",
+    "module.BeginBlocker",
+    "module.EndBlocker",
+    "ante.AnteHandler",
+    "client.Context",
+    "codec.BinaryCodec",
+    "store.KVStore",
+    "store.CommitMultiStore",
+    "sdk.AccAddress",
+    "sdk.Coin",
+    "sdk.Dec",
+    "tx.Tx",
+    "tx.TxBuilder",
+    "grpc.Server",
+    "rest.BaseReq",
+    "server.StartCmd",
+    "depinject.Inject"
+  ]
+}
