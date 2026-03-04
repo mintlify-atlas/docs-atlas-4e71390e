@@ -1,0 +1,473 @@
+---
+title: Authorization Module (x/authz)
+description: Learn about the x/authz module for granting arbitrary privileges between accounts in Cosmos SDK.
+---
+
+# Authorization Module (x/authz)
+
+The `x/authz` module enables one account (the **granter**) to grant arbitrary privileges to another account (the **grantee**) to execute messages on their behalf. This powerful delegation mechanism allows for flexible authorization patterns across your blockchain application.
+
+## Overview
+
+`x/authz` implements [ADR 030](https://github.com/cosmos/cosmos-sdk/blob/main/docs/architecture/adr-030-authz-module.md) to provide a framework where accounts can authorize other accounts to perform specific actions without sharing private keys. Authorizations are granted per message type and can include spending limits, time expiration, and custom validation logic.
+
+## Key Concepts
+
+### Authorization Interface
+
+The `Authorization` interface is the core abstraction that all authorization types must implement:
+
+```go
+type Authorization interface {
+    proto.Message
+
+    // MsgTypeURL returns the fully-qualified Msg service method URL
+    MsgTypeURL() string
+
+    // Accept determines whether this grant permits the provided sdk.Msg
+    Accept(ctx context.Context, msg sdk.Msg) (AcceptResponse, error)
+
+    // ValidateBasic does a simple validation check
+    ValidateBasic() error
+}
+```
+
+When a grantee attempts to execute a message on behalf of a granter, the `Accept` method is called to validate the request:
+
+```go
+type AcceptResponse struct {
+    Accept  bool          // Whether to accept the authorization
+    Delete  bool          // Whether to delete the authorization after use
+    Updated Authorization // Updated authorization if limits changed
+}
+```
+
+### Grant Storage
+
+Grants are stored with a composite key:
+
+```
+0x01 | granter_address_len (1 byte) | granter_address_bytes | grantee_address_len (1 byte) | grantee_address_bytes | msgType_bytes -> Grant
+```
+
+Each grant contains:
+- **Authorization**: The specific authorization logic (e.g., SendAuthorization)
+- **Expiration**: Optional timestamp when the grant expires
+
+## Built-in Authorization Types
+
+### GenericAuthorization
+
+Grants unrestricted permission to execute any message of a specific type:
+
+```go
+// Grant permission to execute MsgSend
+authorization := authz.NewGenericAuthorization("/cosmos.bank.v1beta1.MsgSend")
+
+k.SaveGrant(ctx, grantee, granter, authorization, &expiration)
+```
+
+Use cases:
+- Allowing a trading bot to execute trades on your behalf
+- Granting a service account permission to submit governance proposals
+
+### SendAuthorization
+
+Restricts token transfers with spending limits and optional allow-lists:
+
+```go
+import banktypes "github.com/cosmos/cosmos-sdk/x/bank/types"
+
+// Grant permission to send up to 1000 tokens to specific addresses
+spendLimit := sdk.NewCoins(sdk.NewInt64Coin("stake", 1000))
+allowList := []sdk.AccAddress{addr1, addr2}
+
+authorization := banktypes.NewSendAuthorization(spendLimit, allowList)
+k.SaveGrant(ctx, grantee, granter, authorization, &expiration)
+```
+
+The spend limit is automatically decremented as tokens are transferred.
+
+### StakeAuthorization
+
+Controls delegation, undelegation, and redelegation operations:
+
+```go
+import stakingtypes "github.com/cosmos/cosmos-sdk/x/staking/types"
+
+// Grant permission to delegate up to 5000 tokens to allowed validators
+authorization := stakingtypes.NewStakeAuthorization(
+    []sdk.ValAddress{validator1, validator2}, // allowed validators
+    []sdk.ValAddress{},                        // denied validators
+    stakingtypes.AuthorizationType_AUTHORIZATION_TYPE_DELEGATE,
+    &sdk.NewInt(5000),
+)
+
+k.SaveGrant(ctx, grantee, granter, authorization, &expiration)
+```
+
+Note: Either `AllowList` or `DenyList` must be specified, but not both.
+
+## Message Handlers
+
+### MsgGrant
+
+Create or update an authorization grant:
+
+```go
+type MsgGrant struct {
+    Granter string
+    Grantee string
+    Grant   Grant
+}
+```
+
+**Validation:**
+- Granter and grantee must be different addresses
+- Expiration must be in the future (if provided)
+- Authorization must be a valid implementation
+- Message type must have a registered handler
+
+**Example:**
+
+```go
+grant, err := authz.NewGrant(
+    ctx.BlockTime(),
+    authz.NewGenericAuthorization("/cosmos.gov.v1.MsgVote"),
+    &expiration,
+)
+
+msg := &authz.MsgGrant{
+    Granter: granterAddr.String(),
+    Grantee: granteeAddr.String(),
+    Grant:   grant,
+}
+```
+
+### MsgRevoke
+
+Revoke an existing authorization:
+
+```go
+msg := &authz.MsgRevoke{
+    Granter:    granterAddr.String(),
+    Grantee:    granteeAddr.String(),
+    MsgTypeUrl: "/cosmos.bank.v1beta1.MsgSend",
+}
+```
+
+### MsgExec
+
+Execute authorized messages on behalf of the granter:
+
+```go
+// Grantee executes a bank send on behalf of granter
+sendMsg := &banktypes.MsgSend{
+    FromAddress: granterAddr.String(),
+    ToAddress:   recipientAddr.String(),
+    Amount:      sdk.NewCoins(sdk.NewInt64Coin("stake", 100)),
+}
+
+msg := &authz.MsgExec{
+    Grantee: granteeAddr.String(),
+    Msgs:    []*codectypes.Any{msgAny},
+}
+```
+
+**Processing Logic:**
+
+```go
+func (k Keeper) DispatchActions(ctx context.Context, grantee sdk.AccAddress, msgs []sdk.Msg) ([][]byte, error) {
+    results := make([][]byte, len(msgs))
+    now := sdk.UnwrapSDKContext(ctx).BlockTime()
+
+    for i, msg := range msgs {
+        granter := msg.GetSigners()[0]
+
+        // Check authorization
+        grant, found := k.getGrant(ctx, grantee, granter, sdk.MsgTypeURL(msg))
+        if !found || grant.Expiration.Before(now) {
+            return nil, authz.ErrAuthorizationExpired
+        }
+
+        authorization, _ := grant.GetAuthorization()
+        resp, err := authorization.Accept(ctx, msg)
+
+        if resp.Delete {
+            k.DeleteGrant(ctx, grantee, granter, sdk.MsgTypeURL(msg))
+        } else if resp.Updated != nil {
+            k.update(ctx, grantee, granter, resp.Updated)
+        }
+
+        // Execute message
+        handler := k.router.Handler(msg)
+        msgResp, err := handler(ctx, msg)
+        results[i] = msgResp.Data
+    }
+
+    return results, nil
+}
+```
+
+## Grant Expiration & Pruning
+
+The authz module automatically prunes expired grants using a grant queue:
+
+```go
+// Queue entry format
+0x02 | expiration_bytes | granter_address_len (1 byte) | granter_address_bytes | grantee_address_len (1 byte) | grantee_address_bytes -> GrantQueueItem
+```
+
+In `BeginBlock`, the keeper removes all grants with expiration times before the current block time:
+
+```go
+func (k Keeper) DequeueAndDeleteExpiredGrants(ctx context.Context) error {
+    store := k.storeService.OpenKVStore(ctx)
+    blockTime := sdk.UnwrapSDKContext(ctx).BlockTime()
+
+    iterator, err := store.Iterator(
+        GrantQueuePrefix,
+        storetypes.InclusiveEndBytes(GrantQueueTimePrefix(blockTime)),
+    )
+    defer iterator.Close()
+
+    for ; iterator.Valid(); iterator.Next() {
+        var queueItem authz.GrantQueueItem
+        k.cdc.MustUnmarshal(iterator.Value(), &queueItem)
+
+        _, granter, grantee, _ := parseGrantQueueKey(iterator.Key())
+
+        // Delete from queue
+        store.Delete(iterator.Key())
+
+        // Delete all grants for this granter-grantee pair
+        for _, typeURL := range queueItem.MsgTypeUrls {
+            store.Delete(grantStoreKey(grantee, granter, typeURL))
+        }
+    }
+
+    return nil
+}
+```
+
+## Query Endpoints
+
+### Grants
+
+Query all grants between a granter and grantee:
+
+```bash
+grpcurl -plaintext \
+    -d '{"granter":"cosmos1...","grantee":"cosmos1...","msg_type_url":"/cosmos.bank.v1beta1.MsgSend"}' \
+    localhost:9090 \
+    cosmos.authz.v1beta1.Query/Grants
+```
+
+**Response:**
+
+```json
+{
+  "grants": [
+    {
+      "authorization": {
+        "@type": "/cosmos.bank.v1beta1.SendAuthorization",
+        "spendLimit": [{"denom":"stake","amount":"100"}]
+      },
+      "expiration": "2024-12-31T23:59:59Z"
+    }
+  ]
+}
+```
+
+## Gas Considerations
+
+Iterating over grant queues and validator lists consumes gas:
+
+```go
+const gasCostPerIteration = uint64(20)
+
+// Charged when removing grants from queue
+for index, typeURL := range queueItems {
+    ctx.GasMeter().ConsumeGas(gasCostPerIteration, "grant queue")
+    // ... removal logic
+}
+```
+
+For `StakeAuthorization`, gas is charged for iterating through allowed/denied validator lists to prevent DoS attacks.
+
+## Use Cases
+
+### Trading Bot Authorization
+
+```go
+// Grant trading bot permission to execute trades
+tradingAuth := authz.NewGenericAuthorization("/cosmos.dex.v1.MsgSwap")
+expiration := time.Now().Add(30 * 24 * time.Hour) // 30 days
+
+k.SaveGrant(ctx, tradingBotAddr, userAddr, tradingAuth, &expiration)
+```
+
+### Recurring Payments
+
+```go
+// Allow a subscription service to withdraw monthly payments
+spendLimit := sdk.NewCoins(sdk.NewInt64Coin("usdc", 1000_000000)) // $1000
+expiration := time.Now().Add(365 * 24 * time.Hour) // 1 year
+
+auth := banktypes.NewSendAuthorization(spendLimit, nil)
+k.SaveGrant(ctx, subscriptionAddr, userAddr, auth, &expiration)
+```
+
+### Governance Delegation
+
+```go
+// Grant an advisor permission to vote on governance proposals
+voteAuth := authz.NewGenericAuthorization("/cosmos.gov.v1.MsgVote")
+expiration := time.Now().Add(90 * 24 * time.Hour) // 90 days
+
+k.SaveGrant(ctx, advisorAddr, userAddr, voteAuth, &expiration)
+```
+
+## Events
+
+The authz module emits events for all grant operations:
+
+### EventGrant
+
+```protobuf
+message EventGrant {
+  string msg_type_url = 1;
+  string granter = 2;
+  string grantee = 3;
+}
+```
+
+### EventRevoke
+
+```protobuf
+message EventRevoke {
+  string msg_type_url = 1;
+  string granter = 2;
+  string grantee = 3;
+}
+```
+
+## CLI Examples
+
+### Grant Authorization
+
+```bash
+# Grant send authorization with spending limit
+simd tx authz grant cosmos1grantee send \
+    --spend-limit=100stake \
+    --from=cosmos1granter \
+    --expiration=1735689599
+
+# Grant generic authorization
+simd tx authz grant cosmos1grantee generic \
+    --msg-type=/cosmos.gov.v1.MsgVote \
+    --from=cosmos1granter
+```
+
+### Execute Authorized Action
+
+```bash
+# Create transaction JSON
+cat > tx.json <<EOF
+{
+  "body": {
+    "messages": [{
+      "@type": "/cosmos.bank.v1beta1.MsgSend",
+      "from_address": "cosmos1granter",
+      "to_address": "cosmos1recipient",
+      "amount": [{"denom": "stake", "amount": "50"}]
+    }]
+  }
+}
+EOF
+
+simd tx authz exec tx.json --from=cosmos1grantee
+```
+
+### Revoke Authorization
+
+```bash
+simd tx authz revoke cosmos1grantee /cosmos.bank.v1beta1.MsgSend \
+    --from=cosmos1granter
+```
+
+### Query Grants
+
+```bash
+simd query authz grants cosmos1granter cosmos1grantee
+```
+
+## Integration Guide
+
+To use authz in your module:
+
+1. **Define a custom authorization:**
+
+```go
+type MyCustomAuthorization struct {
+    MaxActions int64
+}
+
+func (a MyCustomAuthorization) MsgTypeURL() string {
+    return "/myapp.mymodule.v1.MsgCustomAction"
+}
+
+func (a MyCustomAuthorization) Accept(ctx context.Context, msg sdk.Msg) (authz.AcceptResponse, error) {
+    if a.MaxActions <= 0 {
+        return authz.AcceptResponse{Accept: false}, nil
+    }
+
+    a.MaxActions--
+    return authz.AcceptResponse{
+        Accept:  true,
+        Updated: &a,
+        Delete:  a.MaxActions == 0,
+    }, nil
+}
+
+func (a MyCustomAuthorization) ValidateBasic() error {
+    if a.MaxActions < 0 {
+        return fmt.Errorf("max actions must be non-negative")
+    }
+    return nil
+}
+```
+
+2. **Register your authorization:**
+
+```go
+func RegisterInterfaces(registry codectypes.InterfaceRegistry) {
+    registry.RegisterImplementations(
+        (*authz.Authorization)(nil),
+        &MyCustomAuthorization{},
+    )
+}
+```
+
+## Best Practices
+
+1. **Always set expiration times** for grants to limit exposure
+2. **Use specific authorizations** (like SendAuthorization) over generic ones when possible
+3. **Monitor grant usage** through events to detect anomalies
+4. **Revoke grants** when they're no longer needed
+5. **Test authorization logic** thoroughly before deploying
+6. **Consider gas costs** when iterating over large validator sets in StakeAuthorization
+
+## Security Considerations
+
+- Granting `GenericAuthorization` gives **unrestricted access** to execute any message of that type
+- Always validate that grantee addresses are trusted before creating grants
+- Monitor for unexpected `MsgExec` transactions from your account
+- Set conservative spending limits on `SendAuthorization` grants
+- Be cautious with long expiration times on sensitive authorizations
+
+## References
+
+- [ADR 030: Authorization Module](https://github.com/cosmos/cosmos-sdk/blob/main/docs/architecture/adr-030-authz-module.md)
+- [Source Code: x/authz/keeper/keeper.go](/home/daytona/workspace/source/x/authz/keeper/keeper.go:103-187)
+- [Source Code: x/authz/authorizations.go](/home/daytona/workspace/source/x/authz/authorizations.go:11-27)

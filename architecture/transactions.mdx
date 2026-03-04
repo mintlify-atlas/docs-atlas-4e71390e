@@ -1,0 +1,598 @@
+---
+title: Transaction Processing
+description: Complete transaction lifecycle from submission to execution in Cosmos SDK
+---
+
+## Transaction Structure
+
+A transaction in Cosmos SDK consists of messages, signatures, and metadata:
+
+```go
+// Location: types/tx_msg.go:52
+type Tx interface {
+    // GetMsgs gets all the transaction's messages
+    GetMsgs() []Msg
+    
+    // GetMsgsV2 gets messages as protobuf v2
+    GetMsgsV2() ([]protov2.Message, error)
+}
+
+// FeeTx extends Tx with fee information
+type FeeTx interface {
+    Tx
+    GetGas() uint64
+    GetFee() Coins
+    FeePayer() []byte
+    FeeGranter() []byte
+}
+```
+
+### Message Interface
+
+```go
+// Location: types/tx_msg.go:18
+type Msg = proto.Message
+
+type LegacyMsg interface {
+    Msg
+    
+    // GetSigners returns the addresses that must sign the transaction
+    GetSigners() []AccAddress
+}
+```
+
+### Example Transaction
+
+```protobuf
+message Tx {
+  TxBody body = 1;
+  AuthInfo auth_info = 2;
+  repeated bytes signatures = 3;
+}
+
+message TxBody {
+  repeated google.protobuf.Any messages = 1;
+  string memo = 2;
+  uint64 timeout_height = 3;
+}
+
+message AuthInfo {
+  repeated SignerInfo signer_infos = 1;
+  Fee fee = 2;
+}
+```
+
+## Transaction Lifecycle
+
+<Steps>
+  <Step title="Client Creation">
+    Client constructs and signs the transaction
+  </Step>
+  
+  <Step title="Submission">
+    Transaction submitted to node via RPC
+  </Step>
+  
+  <Step title="CheckTx">
+    Node validates transaction for mempool inclusion
+  </Step>
+  
+  <Step title="Mempool">
+    Valid transactions wait in mempool
+  </Step>
+  
+  <Step title="Block Proposal">
+    Proposer selects transactions for block
+  </Step>
+  
+  <Step title="Consensus">
+    Validators reach consensus on block
+  </Step>
+  
+  <Step title="FinalizeBlock">
+    Transactions executed and state committed
+  </Step>
+</Steps>
+
+## CheckTx: Mempool Validation
+
+```go
+// Location: baseapp/abci.go (simplified)
+func (app *BaseApp) CheckTx(
+    req *abci.RequestCheckTx,
+) (*abci.ResponseCheckTx, error) {
+    // Decode transaction bytes
+    tx, err := app.txDecoder(req.Tx)
+    if err != nil {
+        return nil, err
+    }
+    
+    // Create check state context
+    checkState := app.stateManager.GetState(execModeCheck)
+    ctx := checkState.Context()
+    
+    // Execute transaction in check mode
+    gInfo, result, _, err := app.runTx(ctx, tx, execModeCheck)
+    if err != nil {
+        return &abci.ResponseCheckTx{
+            Code: 1,
+            Log:  err.Error(),
+        }, nil
+    }
+    
+    return &abci.ResponseCheckTx{
+        Code:      0,
+        GasWanted: int64(gInfo.GasWanted),
+        GasUsed:   int64(gInfo.GasUsed),
+        Priority:  result.Priority,
+    }, nil
+}
+```
+
+### CheckTx Validation
+
+<AccordionGroup>
+  <Accordion title="Signature Verification">
+    Verify all required signatures are present and valid
+  </Accordion>
+  
+  <Accordion title="Account Sequence">
+    Check transaction sequence matches account sequence (prevents replay)
+  </Accordion>
+  
+  <Accordion title="Sufficient Fees">
+    Ensure transaction fee meets minimum gas price
+  </Accordion>
+  
+  <Accordion title="Basic Validation">
+    Run message ValidateBasic() for stateless checks
+  </Accordion>
+  
+  <Accordion title="Ante Handler">
+    Execute ante handler for additional validation
+  </Accordion>
+</AccordionGroup>
+
+## Transaction Execution
+
+### runTx Method
+
+Core transaction execution logic:
+
+```go
+// Location: baseapp/baseapp.go (simplified)
+func (app *BaseApp) runTx(
+    ctx sdk.Context,
+    tx sdk.Tx,
+    mode execMode,
+) (gInfo sdk.GasInfo, result *sdk.Result, anteEvents []abci.Event, err error) {
+    // Defer recovery from panics
+    defer func() {
+        if r := recover(); r != nil {
+            err = fmt.Errorf("panic: %v", r)
+        }
+    }()
+    
+    // Create gas meter
+    gasWanted := tx.(FeeTx).GetGas()
+    ctx = ctx.WithGasMeter(storetypes.NewGasMeter(gasWanted))
+    
+    // 1. Run ante handler
+    newCtx, err := app.anteHandler(ctx, tx, mode == execModeSimulate)
+    if err != nil {
+        return gInfo, nil, nil, err
+    }
+    
+    // 2. Execute messages
+    msgs := tx.GetMsgs()
+    msgResponses, err := app.runMsgs(newCtx, msgs, mode)
+    if err != nil {
+        return gInfo, nil, anteEvents, err
+    }
+    
+    // 3. Run post handler (optional)
+    if app.postHandler != nil {
+        newCtx, err = app.postHandler(newCtx, tx, mode == execModeSimulate, err == nil)
+    }
+    
+    // Collect gas info
+    gInfo = sdk.GasInfo{
+        GasWanted: gasWanted,
+        GasUsed:   newCtx.GasMeter().GasConsumed(),
+    }
+    
+    result = &sdk.Result{
+        MsgResponses: msgResponses,
+        Events:       newCtx.EventManager().ABCIEvents(),
+    }
+    
+    return gInfo, result, anteEvents, nil
+}
+```
+
+### Message Execution
+
+```go
+func (app *BaseApp) runMsgs(
+    ctx sdk.Context,
+    msgs []sdk.Msg,
+    mode execMode,
+) ([]*codectypes.Any, error) {
+    msgResponses := make([]*codectypes.Any, len(msgs))
+    
+    for i, msg := range msgs {
+        // Route message to handler
+        handler := app.msgServiceRouter.Handler(msg)
+        if handler == nil {
+            return nil, fmt.Errorf("no handler for message type %T", msg)
+        }
+        
+        // Execute handler
+        msgResult, err := handler(ctx, msg)
+        if err != nil {
+            return nil, fmt.Errorf("message %d failed: %w", i, err)
+        }
+        
+        msgResponses[i] = msgResult
+    }
+    
+    return msgResponses, nil
+}
+```
+
+## Ante Handler
+
+The ante handler performs pre-execution validation and setup:
+
+```go
+type AnteHandler func(
+    ctx Context,
+    tx Tx,
+    simulate bool,
+) (newCtx Context, err error)
+```
+
+### Ante Decorator Chain
+
+Ante handlers are composed of decorators:
+
+```go
+import (
+    "cosmossdk.io/x/auth/ante"
+    "cosmossdk.io/x/auth/signing"
+)
+
+func NewAnteHandler(options HandlerOptions) sdk.AnteHandler {
+    return sdk.ChainAnteDecorators(
+        ante.NewSetUpContextDecorator(),           // Setup context
+        ante.NewValidateBasicDecorator(),          // Basic validation
+        ante.NewTxTimeoutHeightDecorator(),        // Check timeout
+        ante.NewValidateMemoDecorator(),           // Validate memo
+        ante.NewConsumeGasForTxSizeDecorator(),    // Charge for tx size
+        ante.NewDeductFeeDecorator(),              // Deduct fees
+        ante.NewSetPubKeyDecorator(),              // Set pubkey
+        ante.NewValidateSigCountDecorator(),       // Check sig count
+        ante.NewSigGasConsumeDecorator(),          // Consume sig gas
+        ante.NewSigVerificationDecorator(),        // Verify signatures
+        ante.NewIncrementSequenceDecorator(),      // Increment sequence
+    )
+}
+```
+
+### Custom Ante Decorator
+
+```go
+type MyDecorator struct{}
+
+func (md MyDecorator) AnteHandle(
+    ctx sdk.Context,
+    tx sdk.Tx,
+    simulate bool,
+    next sdk.AnteHandler,
+) (sdk.Context, error) {
+    // Custom validation logic
+    if !simulate {
+        // Only run in real execution
+        if err := myValidation(tx); err != nil {
+            return ctx, err
+        }
+    }
+    
+    // Call next decorator in chain
+    return next(ctx, tx, simulate)
+}
+```
+
+## Post Handler
+
+Optional post-execution logic:
+
+```go
+type PostHandler func(
+    ctx Context,
+    tx Tx,
+    simulate bool,
+    success bool,
+) (newCtx Context, err error)
+```
+
+Use cases:
+- Emit additional events
+- Refund unused gas
+- Execute cleanup logic
+
+## Gas Metering
+
+### Gas Meter
+
+```go
+type GasMeter interface {
+    GasConsumed() Gas
+    GasConsumedToLimit() Gas
+    GasRemaining() Gas
+    Limit() Gas
+    
+    ConsumeGas(amount Gas, descriptor string)
+    RefundGas(amount Gas, descriptor string)
+    
+    IsPastLimit() bool
+    IsOutOfGas() bool
+}
+```
+
+### Gas Config
+
+```go
+// Location: types/context.go:63
+kvGasConfig := storetypes.GasConfig{
+    HasCost:          1000,
+    DeleteCost:       1000,
+    ReadCostFlat:     1000,
+    ReadCostPerByte:  3,
+    WriteCostFlat:    2000,
+    WriteCostPerByte: 30,
+    IterNextCostFlat: 30,
+}
+```
+
+### Gas Consumption
+
+```go
+// Explicitly consume gas
+ctx.GasMeter().ConsumeGas(10000, "custom operation")
+
+// KVStore operations automatically consume gas
+store := ctx.KVStore(key)
+store.Set([]byte("key"), []byte("value"))  // Consumes write gas
+```
+
+## Execution Modes
+
+```go
+// Location: types/context.go:22
+type ExecMode uint8
+
+const (
+    ExecModeCheck               ExecMode = iota  // CheckTx validation
+    ExecModeReCheck                              // Recheck mempool
+    ExecModeSimulate                             // Simulate execution
+    ExecModePrepareProposal                      // Prepare block
+    ExecModeProcessProposal                      // Process block
+    ExecModeVoteExtension                        // Vote extension
+    ExecModeVerifyVoteExtension                  // Verify vote ext
+    ExecModeFinalize                             // Finalize block
+)
+```
+
+### Mode-Specific Behavior
+
+```go
+func (k Keeper) ProcessMessage(ctx context.Context, msg *MsgSend) error {
+    sdkCtx := sdk.UnwrapSDKContext(ctx)
+    
+    // Skip expensive operations in simulation
+    if sdkCtx.ExecMode() == sdk.ExecModeSimulate {
+        return nil
+    }
+    
+    // Real execution
+    return k.transfer(ctx, msg.From, msg.To, msg.Amount)
+}
+```
+
+## Priority and Ordering
+
+### Transaction Priority
+
+```go
+// Set priority in ante handler
+ctx = ctx.WithPriority(calculatePriority(tx))
+
+func calculatePriority(tx sdk.Tx) int64 {
+    feeTx := tx.(sdk.FeeTx)
+    feeCoins := feeTx.GetFee()
+    gas := feeTx.GetGas()
+    
+    // Priority = fee / gas
+    return feeCoins.AmountOf("stake").Int64() / int64(gas)
+}
+```
+
+### Priority Mempool
+
+```go
+import "cosmossdk.io/x/auth/mempool"
+
+// Use priority-based mempool
+mempool := mempool.NewPriorityMempool(
+    mempool.PriorityNonceMempoolConfig[int64]{
+        MaxTx: 5000,
+    },
+)
+
+app := baseapp.NewBaseApp(
+    appName,
+    logger,
+    db,
+    txDecoder,
+    baseapp.SetMempool(mempool),
+)
+```
+
+## Events
+
+Transactions emit events for indexing:
+
+```go
+// Emit events in message handler
+func (k Keeper) Send(ctx context.Context, msg *MsgSend) error {
+    // Execute transfer
+    if err := k.bankKeeper.SendCoins(ctx, msg.From, msg.To, msg.Amount); err != nil {
+        return err
+    }
+    
+    // Emit event
+    sdkCtx := sdk.UnwrapSDKContext(ctx)
+    sdkCtx.EventManager().EmitEvent(
+        sdk.NewEvent(
+            "transfer",
+            sdk.NewAttribute("sender", msg.From.String()),
+            sdk.NewAttribute("recipient", msg.To.String()),
+            sdk.NewAttribute("amount", msg.Amount.String()),
+        ),
+    )
+    
+    return nil
+}
+```
+
+### Querying Events
+
+```bash
+# Query transactions by event
+appd query txs --events 'transfer.sender=cosmos1...' \
+                --events 'transfer.amount=100stake'
+```
+
+## Error Handling
+
+```go
+import (
+    "cosmossdk.io/errors"
+    sdkerrors "github.com/cosmos/cosmos-sdk/types/errors"
+)
+
+func (k Keeper) ValidateTransfer(from, to sdk.AccAddress, amount sdk.Coins) error {
+    // Wrapped error with context
+    if !amount.IsValid() {
+        return errors.Wrap(
+            sdkerrors.ErrInvalidCoins,
+            "transfer amount is invalid",
+        )
+    }
+    
+    // Custom error
+    if k.IsBlocked(to) {
+        return errors.Wrapf(
+            sdkerrors.ErrUnauthorized,
+            "address %s is blocked",
+            to.String(),
+        )
+    }
+    
+    return nil
+}
+```
+
+## Transaction Simulation
+
+```go
+// Simulate transaction execution
+func SimulateTx(tx sdk.Tx) (*sdk.Result, error) {
+    ctx := ctx.WithExecMode(sdk.ExecModeSimulate)
+    
+    // Disable gas metering in simulation
+    ctx = ctx.WithGasMeter(sdk.NewInfiniteGasMeter())
+    
+    gInfo, result, _, err := app.runTx(ctx, tx, sdk.ExecModeSimulate)
+    
+    return result, err
+}
+```
+
+## Context Management
+
+```go
+// Location: types/context.go:41
+type Context struct {
+    baseCtx          context.Context
+    ms               storetypes.MultiStore
+    header           cmtproto.Header
+    chainID          string
+    txBytes          []byte
+    logger           log.Logger
+    gasMeter         storetypes.GasMeter
+    blockGasMeter    storetypes.GasMeter
+    checkTx          bool
+    execMode         ExecMode
+    eventManager     *EventManager
+    // ...
+}
+```
+
+### Context Branching
+
+```go
+// Create cached context for rollback
+cacheCtx, writeCache := ctx.CacheContext()
+
+err := riskyOperation(cacheCtx)
+if err != nil {
+    // Changes discarded
+    return err
+}
+
+// Commit changes to parent context
+writeCache()
+```
+
+## Best Practices
+
+<AccordionGroup>
+  <Accordion title="Validate Early">
+    Perform stateless validation in `ValidateBasic()` before execution.
+  </Accordion>
+  
+  <Accordion title="Emit Meaningful Events">
+    Emit events with relevant attributes for transaction indexing.
+  </Accordion>
+  
+  <Accordion title="Handle Errors Properly">
+    Use wrapped errors with context for better debugging.
+  </Accordion>
+  
+  <Accordion title="Optimize Gas Usage">
+    Minimize state reads/writes and expensive operations.
+  </Accordion>
+  
+  <Accordion title="Use Context Branching">
+    Branch context for speculative execution that may need rollback.
+  </Accordion>
+</AccordionGroup>
+
+## Related Topics
+
+<CardGroup cols={2}>
+  <Card title="BaseApp" icon="cubes" href="/architecture/baseapp">
+    Transaction routing and execution
+  </Card>
+  <Card title="State Management" icon="database" href="/architecture/state-management">
+    How transactions modify state
+  </Card>
+  <Card title="Gas and Fees" icon="fire" href="/concepts/gas-fees">
+    Gas metering and fee payment
+  </Card>
+  <Card title="Ante Handler" icon="shield-alt" href="/advanced/ante-handler">
+    Building custom ante handlers
+  </Card>
+</CardGroup>

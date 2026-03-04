@@ -1,0 +1,446 @@
+---
+title: Dependency Injection with depinject
+description: Use depinject for declarative application wiring in the Cosmos SDK
+---
+
+# Dependency Injection with depinject
+
+The Cosmos SDK provides `depinject`, a dependency injection framework that allows you to configure your application declaratively. This approach reduces boilerplate and makes module wiring more maintainable.
+
+## Overview
+
+`depinject` enables you to:
+
+- Configure modules declaratively using configuration files
+- Automatically resolve dependencies between modules
+- Reduce manual keeper initialization code
+- Make your app structure more maintainable
+
+## Core Concepts
+
+### Providers
+
+Providers are functions that create and return dependencies. Modules register providers that `depinject` calls to instantiate keepers and other components.
+
+### Container
+
+The container manages dependency resolution and lifecycle. From `depinject/container.go:12-24`:
+
+```go
+type container struct {
+    resolvers         map[string]resolver
+    interfaceBindings map[string]interfaceBinding
+    invokers          []invoker
+    moduleKeyContext  *ModuleKeyContext
+    resolveStack      []resolveFrame
+    callerStack       []Location
+    callerMap         map[Location]bool
+}
+```
+
+### Module Configuration
+
+Modules are configured using protobuf messages that `depinject` reads to wire up the application.
+
+## Configuration Loading
+
+### Loading from JSON
+
+From `depinject/appconfig/config.go:22-42`:
+
+```go
+// LoadJSON loads an app config in JSON format
+func LoadJSON(bz []byte) depinject.Config {
+    resolver := gogoproto.HybridResolver
+    desc, err := resolver.FindDescriptorByName(
+        protoreflect.FullName(gogoproto.MessageName(&v1alpha1.Config{}))
+    )
+    if err != nil {
+        return depinject.Error(err)
+    }
+
+    config := dynamicpb.NewMessage(desc.(protoreflect.MessageDescriptor))
+    err = protojson.UnmarshalOptions{
+        Resolver: dynamicTypeResolver{resolver: gogoproto.HybridResolver},
+    }.Unmarshal(bz, config)
+    if err != nil {
+        return depinject.Error(err)
+    }
+
+    return Compose(config)
+}
+```
+
+### Loading from YAML
+
+YAML is converted to JSON before processing from `depinject/appconfig/config.go:44-52`:
+
+```go
+// LoadYAML loads an app config in YAML format
+func LoadYAML(bz []byte) depinject.Config {
+    j, err := yaml.YAMLToJSON(bz)
+    if err != nil {
+        return depinject.Error(err)
+    }
+    
+    return LoadJSON(j)
+}
+```
+
+## Composing Application Configuration
+
+### The Compose Function
+
+The `Compose` function processes module configurations and builds dependency injection configs from `depinject/appconfig/config.go:71-165`:
+
+```go
+func Compose(appConfig gogoproto.Message) depinject.Config {
+    // Convert to concrete type if needed
+    appConfigConcrete, ok := appConfig.(*v1alpha1.Config)
+    if !ok {
+        appConfigConcrete = &v1alpha1.Config{}
+        bz, err := gogoproto.Marshal(appConfig)
+        if err != nil {
+            return depinject.Error(err)
+        }
+        err = gogoproto.Unmarshal(bz, appConfigConcrete)
+        if err != nil {
+            return depinject.Error(err)
+        }
+    }
+
+    opts := []depinject.Config{
+        depinject.Supply(appConfig),
+    }
+
+    modules, err := internal.ModulesByModuleTypeName()
+    if err != nil {
+        return depinject.Error(err)
+    }
+
+    // Process each module configuration
+    for _, module := range appConfigConcrete.Modules {
+        if module.Name == "" {
+            return depinject.Error(errors.New("module is missing name"))
+        }
+
+        if module.Config == nil {
+            return depinject.Error(
+                fmt.Errorf("module %q is missing a config object", module.Name)
+            )
+        }
+
+        msgName := module.Config.TypeUrl
+        // Strip type URL prefix
+        if slashIdx := strings.LastIndex(msgName, "/"); slashIdx >= 0 {
+            msgName = msgName[slashIdx+1:]
+        }
+
+        init, ok := modules[msgName]
+        if !ok {
+            // Module not found - provide helpful error
+            return depinject.Error(
+                fmt.Errorf("no module registered for type URL %s", 
+                    module.Config.TypeUrl)
+            )
+        }
+
+        // Unmarshal module config
+        var config gogoproto.Message
+        if configInit, ok := init.ConfigProtoMessage.(protov2.Message); ok {
+            config = configInit.ProtoReflect().Type().New().Interface().(gogoproto.Message)
+        } else {
+            config = reflect.New(init.ConfigGoType.Elem()).Interface().(gogoproto.Message)
+        }
+        err = gogoproto.Unmarshal(module.Config.Value, config)
+        if err != nil {
+            return depinject.Error(err)
+        }
+
+        // Supply module config
+        opts = append(opts, depinject.Supply(config))
+
+        // Register module providers
+        for _, provider := range init.Providers {
+            opts = append(opts, depinject.ProvideInModule(module.Name, provider))
+        }
+
+        // Register module invokers
+        for _, invoker := range init.Invokers {
+            opts = append(opts, depinject.InvokeInModule(module.Name, invoker))
+        }
+
+        // Register interface bindings
+        for _, binding := range module.GolangBindings {
+            opts = append(opts, 
+                depinject.BindInterfaceInModule(
+                    module.Name, 
+                    binding.InterfaceType, 
+                    binding.Implementation,
+                )
+            )
+        }
+    }
+
+    // Register global interface bindings
+    for _, binding := range appConfigConcrete.GolangBindings {
+        opts = append(opts, 
+            depinject.BindInterface(
+                binding.InterfaceType, 
+                binding.Implementation,
+            )
+        )
+    }
+
+    return depinject.Configs(opts...)
+}
+```
+
+## Runtime App Integration
+
+The `runtime` module provides integration between `depinject` and the traditional app structure.
+
+### Runtime App Structure
+
+From `runtime/app.go:40-60`:
+
+```go
+type App struct {
+    *baseapp.BaseApp
+
+    ModuleManager *module.Manager
+
+    configurator      module.Configurator
+    config            *runtimev1alpha1.Module
+    storeKeys         []storetypes.StoreKey
+    interfaceRegistry codectypes.InterfaceRegistry
+    cdc               codec.Codec
+    amino             *codec.LegacyAmino
+    basicManager      module.BasicManager
+    baseAppOptions    []BaseAppOption
+    msgServiceRouter  *baseapp.MsgServiceRouter
+    grpcQueryRouter   *baseapp.GRPCQueryRouter
+    appConfig         *appv1alpha1.Config
+    logger            log.Logger
+    initChainer       sdk.InitChainer
+}
+```
+
+### Loading the App
+
+From `runtime/app.go:104-157`:
+
+```go
+func (a *App) Load(loadLatest bool) error {
+    // Set init genesis order
+    if len(a.config.InitGenesis) != 0 {
+        a.ModuleManager.SetOrderInitGenesis(a.config.InitGenesis...)
+        if a.initChainer == nil {
+            a.SetInitChainer(a.InitChainer)
+        }
+    }
+
+    // Set export genesis order
+    if len(a.config.ExportGenesis) != 0 {
+        a.ModuleManager.SetOrderExportGenesis(a.config.ExportGenesis...)
+    } else if len(a.config.InitGenesis) != 0 {
+        a.ModuleManager.SetOrderExportGenesis(a.config.InitGenesis...)
+    }
+
+    // Set pre-blockers order
+    if len(a.config.PreBlockers) != 0 {
+        a.ModuleManager.SetOrderPreBlockers(a.config.PreBlockers...)
+        if a.BaseApp.PreBlocker() == nil {
+            a.SetPreBlocker(a.PreBlocker)
+        }
+    }
+
+    // Set begin blockers order
+    if len(a.config.BeginBlockers) != 0 {
+        a.ModuleManager.SetOrderBeginBlockers(a.config.BeginBlockers...)
+        a.SetBeginBlocker(a.BeginBlocker)
+    }
+
+    // Set end blockers order
+    if len(a.config.EndBlockers) != 0 {
+        a.ModuleManager.SetOrderEndBlockers(a.config.EndBlockers...)
+        a.SetEndBlocker(a.EndBlocker)
+    }
+
+    // Set precommiters order
+    if len(a.config.Precommiters) != 0 {
+        a.ModuleManager.SetOrderPrecommiters(a.config.Precommiters...)
+        a.SetPrecommiter(a.Precommiter)
+    }
+
+    // Set migration order
+    if len(a.config.OrderMigrations) != 0 {
+        a.ModuleManager.SetOrderMigrations(a.config.OrderMigrations...)
+    }
+
+    if loadLatest {
+        if err := a.LoadLatestVersion(); err != nil {
+            return err
+        }
+    }
+
+    return nil
+}
+```
+
+### Runtime Init Chainer
+
+From `runtime/app.go:184-191`:
+
+```go
+func (a *App) InitChainer(ctx sdk.Context, req *abci.RequestInitChain) (*abci.ResponseInitChain, error) {
+    var genesisState map[string]json.RawMessage
+    if err := json.Unmarshal(req.AppStateBytes, &genesisState); err != nil {
+        panic(err)
+    }
+    return a.ModuleManager.InitGenesis(ctx, a.cdc, genesisState)
+}
+```
+
+## Example Configuration
+
+Here's an example app configuration in YAML:
+
+```yaml
+modules:
+  - name: auth
+    config:
+      "@type": cosmos.auth.module.v1.Module
+      bech32_prefix: cosmos
+      module_account_permissions:
+        - account: fee_collector
+        - account: mint
+          permissions: [minter]
+        - account: bonded_tokens_pool
+          permissions: [burner, staking]
+
+  - name: bank
+    config:
+      "@type": cosmos.bank.module.v1.Module
+      blocked_module_accounts_override:
+        - fee_collector
+        - mint
+
+  - name: staking
+    config:
+      "@type": cosmos.staking.module.v1.Module
+
+  - name: distribution
+    config:
+      "@type": cosmos.distribution.module.v1.Module
+
+  - name: gov
+    config:
+      "@type": cosmos.gov.module.v1.Module
+```
+
+## Benefits of Dependency Injection
+
+### Reduced Boilerplate
+
+With `depinject`, you don't need to manually wire up keepers:
+
+**Without depinject:**
+```go
+app.BankKeeper = bankkeeper.NewBaseKeeper(
+    appCodec,
+    runtime.NewKVStoreService(keys[banktypes.StoreKey]),
+    app.AccountKeeper,
+    BlockedAddresses(),
+    authtypes.NewModuleAddress(govtypes.ModuleName).String(),
+    logger,
+)
+```
+
+**With depinject:**
+```yaml
+- name: bank
+  config:
+    "@type": cosmos.bank.module.v1.Module
+```
+
+### Automatic Dependency Resolution
+
+`depinject` automatically resolves dependencies between modules, ensuring they're initialized in the correct order.
+
+### Better Testability
+
+Dependency injection makes it easier to substitute mock implementations for testing.
+
+### Declarative Configuration
+
+Module wiring is defined in configuration files, making it easier to understand the app structure at a glance.
+
+## Registering Custom Modules
+
+To make your custom module work with `depinject`, register providers:
+
+```go
+func init() {
+    appmodule.Register(
+        &modulev1.Module{},
+        appmodule.Provide(
+            ProvideModule,
+        ),
+    )
+}
+
+func ProvideModule(
+    in ModuleInputs,
+) (ModuleOutputs, error) {
+    keeper := keeper.NewKeeper(
+        in.Cdc,
+        in.StoreService,
+        in.AccountKeeper,
+    )
+
+    m := NewAppModule(in.Cdc, keeper)
+
+    return ModuleOutputs{
+        Keeper: keeper,
+        Module: m,
+    }, nil
+}
+```
+
+## Hybrid Approach
+
+You can combine `depinject` with manual wiring using `runtime.App.RegisterModules` from `runtime/app.go:65-91`:
+
+```go
+func (a *App) RegisterModules(modules ...module.AppModule) error {
+    for _, appModule := range modules {
+        name := appModule.Name()
+        if _, ok := a.ModuleManager.Modules[name]; ok {
+            return fmt.Errorf("AppModule named %q already exists", name)
+        }
+
+        if _, ok := a.basicManager[name]; ok {
+            return fmt.Errorf("AppModuleBasic named %q already exists", name)
+        }
+
+        a.ModuleManager.Modules[name] = appModule
+        a.basicManager[name] = appModule
+        appModule.RegisterInterfaces(a.interfaceRegistry)
+        appModule.RegisterLegacyAminoCodec(a.amino)
+
+        if module, ok := appModule.(module.HasServices); ok {
+            module.RegisterServices(a.configurator)
+        }
+    }
+
+    return nil
+}
+```
+
+## Next Steps
+
+- Review [App Creation](/building/app-creation) for manual wiring patterns
+- Learn about [Genesis Configuration](/building/genesis)
+- Explore [Testing](/building/testing) with dependency injection
+- See the [Module Development](/modules/overview) guide

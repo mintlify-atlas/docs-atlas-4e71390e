@@ -1,0 +1,457 @@
+---
+title: Coordinated Upgrades
+description: Implementing coordinated chain upgrades with the x/upgrade module
+---
+
+The `x/upgrade` module enables coordinated, height-based chain upgrades with automatic binary validation and migration execution. It ensures all validators switch to the new binary at exactly the same block height.
+
+## Overview
+
+Coordinated upgrades allow blockchains to upgrade their software without forking or halting. The upgrade module:
+
+- Schedules upgrades at specific block heights
+- Validates binary versions match expected upgrades
+- Executes migration handlers automatically
+- Handles store schema changes
+- Prevents premature or late upgrades
+
+## Upgrade Flow
+
+The upgrade process in PreBlocker:
+
+```go title="x/upgrade/abci.go"
+func PreBlocker(ctx context.Context, k *keeper.Keeper) (appmodule.ResponsePreBlock, error) {
+    defer telemetry.ModuleMeasureSince(types.ModuleName, telemetry.Now(), telemetry.MetricKeyPreBlocker)
+
+    sdkCtx := sdk.UnwrapSDKContext(ctx)
+    blockHeight := sdkCtx.HeaderInfo().Height
+    plan, err := k.GetUpgradePlan(ctx)
+    if err != nil && !errors.Is(err, types.ErrNoUpgradePlanFound) {
+        return nil, err
+    }
+    found := err == nil
+
+    if !k.DowngradeVerified() {
+        k.SetDowngradeVerified(true)
+        // Verify we're using a valid binary
+        if !found || !plan.ShouldExecute(blockHeight) || (plan.ShouldExecute(blockHeight) && k.IsSkipHeight(blockHeight)) {
+            lastAppliedPlan, _, err := k.GetLastCompletedUpgrade(ctx)
+            if err != nil {
+                return nil, err
+            }
+
+            if lastAppliedPlan != "" && !k.HasHandler(lastAppliedPlan) {
+                var appVersion uint64
+
+                cp := sdkCtx.ConsensusParams()
+                if cp.Version != nil {
+                    appVersion = cp.Version.App
+                }
+
+                return nil, fmt.Errorf("wrong app version %d, upgrade handler is missing for %s upgrade plan", appVersion, lastAppliedPlan)
+            }
+        }
+    }
+
+    if !found {
+        return &sdk.ResponsePreBlock{
+            ConsensusParamsChanged: false,
+        }, nil
+    }
+
+    logger := k.Logger(ctx)
+
+    // To make sure clear upgrade is executed at the same block
+    if plan.ShouldExecute(blockHeight) {
+        // If skip upgrade has been set for current height, we clear the upgrade plan
+        if k.IsSkipHeight(blockHeight) {
+            skipUpgradeMsg := fmt.Sprintf("UPGRADE \"%s\" SKIPPED at %d: %s", plan.Name, plan.Height, plan.Info)
+            logger.Info(skipUpgradeMsg)
+
+            // Clear the upgrade plan at current height
+            if err := k.ClearUpgradePlan(ctx); err != nil {
+                return nil, err
+            }
+            return &sdk.ResponsePreBlock{
+                ConsensusParamsChanged: false,
+            }, nil
+        }
+
+        // Prepare shutdown if we don't have an upgrade handler for this upgrade name (meaning this software is out of date)
+        if !k.HasHandler(plan.Name) {
+            // Write the upgrade info to disk. The UpgradeStoreLoader uses this info to perform or skip
+            // store migrations.
+            err := k.DumpUpgradeInfoToDisk(blockHeight, plan)
+            if err != nil {
+                return nil, fmt.Errorf("unable to write upgrade info to filesystem: %w", err)
+            }
+
+            upgradeMsg := BuildUpgradeNeededMsg(plan)
+            logger.Error(upgradeMsg)
+
+            // Returning an error will end up in a panic
+            return nil, errors.New(upgradeMsg)
+        }
+
+        // We have an upgrade handler for this upgrade name, so apply the upgrade
+        logger.Info(fmt.Sprintf("applying upgrade \"%s\" at %s", plan.Name, plan.DueAt()))
+        sdkCtx = sdkCtx.WithBlockGasMeter(storetypes.NewInfiniteGasMeter())
+        if err := k.ApplyUpgrade(sdkCtx, plan); err != nil {
+            return nil, err
+        }
+        return &sdk.ResponsePreBlock{
+            // the consensus parameters might be modified in the migration,
+            // refresh the consensus parameters in context.
+            ConsensusParamsChanged: true,
+        }, nil
+    }
+
+    // if we have a pending upgrade, but it is not yet time, make sure we did not
+    // set the handler already
+    if k.HasHandler(plan.Name) {
+        downgradeMsg := fmt.Sprintf("BINARY UPDATED BEFORE TRIGGER! UPGRADE \"%s\" - in binary but not executed on chain. Downgrade your binary", plan.Name)
+        logger.Error(downgradeMsg)
+
+        // Returning an error will end up in a panic
+        return nil, errors.New(downgradeMsg)
+    }
+    return &sdk.ResponsePreBlock{
+        ConsensusParamsChanged: false,
+    }, nil
+}
+```
+
+Source: [x/upgrade/abci.go:27](https://github.com/cosmos/cosmos-sdk/blob/main/x/upgrade/abci.go#L27)
+
+## Upgrade Plan
+
+An upgrade plan specifies when and how to upgrade:
+
+```go title="x/upgrade/types/plan.go"
+type Plan struct {
+    Name   string // upgrade name
+    Height int64  // block height to execute upgrade
+    Info   string // additional upgrade information
+}
+
+// ShouldExecute returns true if the Plan is ready to execute given the current block height
+func (p Plan) ShouldExecute(blockHeight int64) bool {
+    return p.Height > 0 && p.Height <= blockHeight
+}
+
+// DueAt is a string representation of when this plan is due to be executed
+func (p Plan) DueAt() string {
+    return fmt.Sprintf("height: %d", p.Height)
+}
+```
+
+Source: [x/upgrade/types/plan.go:32](https://github.com/cosmos/cosmos-sdk/blob/main/x/upgrade/types/plan.go#L32)
+
+## Implementing an Upgrade
+
+### 1. Define the Upgrade Handler
+
+Create a handler that performs the upgrade logic:
+
+```go
+// UpgradeName defines the on-chain upgrade name
+const UpgradeName = "v2"
+
+func (app *App) RegisterUpgradeHandlers() {
+    app.UpgradeKeeper.SetUpgradeHandler(
+        UpgradeName,
+        func(ctx context.Context, plan upgradetypes.Plan, fromVM module.VersionMap) (module.VersionMap, error) {
+            // Run migrations for all modules
+            return app.ModuleManager.RunMigrations(ctx, app.Configurator(), fromVM)
+        },
+    )
+}
+```
+
+### 2. Configure Store Upgrades
+
+Specify store additions or deletions:
+
+```go
+func (app *App) RegisterUpgradeHandlers() {
+    app.UpgradeKeeper.SetUpgradeHandler(
+        UpgradeName,
+        func(ctx context.Context, plan upgradetypes.Plan, fromVM module.VersionMap) (module.VersionMap, error) {
+            return app.ModuleManager.RunMigrations(ctx, app.Configurator(), fromVM)
+        },
+    )
+
+    upgradeInfo, err := app.UpgradeKeeper.ReadUpgradeInfoFromDisk()
+    if err != nil {
+        panic(err)
+    }
+
+    if upgradeInfo.Name == UpgradeName && !app.UpgradeKeeper.IsSkipHeight(upgradeInfo.Height) {
+        storeUpgrades := storetypes.StoreUpgrades{
+            Added: []string{
+                newmoduletypes.ModuleName,
+            },
+            Deleted: []string{
+                oldmoduletypes.ModuleName,
+            },
+        }
+
+        // configure store loader that checks if version == upgradeHeight and applies store upgrades
+        app.SetStoreLoader(upgradetypes.UpgradeStoreLoader(upgradeInfo.Height, &storeUpgrades))
+    }
+}
+```
+
+### 3. Submit Upgrade Proposal
+
+Create and submit an upgrade proposal via governance:
+
+```bash
+# Create upgrade proposal
+appd tx gov submit-proposal software-upgrade v2 \
+  --title="Upgrade to v2" \
+  --description="Upgrade the chain to version 2" \
+  --upgrade-height=1000000 \
+  --upgrade-info='{}' \
+  --from=validator
+
+# Vote on proposal
+appd tx gov vote 1 yes --from=validator
+```
+
+Or via code:
+
+```go
+import (
+    upgradetypes "github.com/cosmos/cosmos-sdk/x/upgrade/types"
+    govtypes "github.com/cosmos/cosmos-sdk/x/gov/types/v1"
+)
+
+plan := upgradetypes.Plan{
+    Name:   "v2",
+    Height: 1000000,
+    Info:   `{"binaries":{"linux/amd64":"https://example.com/app-v2-linux-amd64"}}`,
+}
+
+msg := &upgradetypes.MsgSoftwareUpgrade{
+    Authority: authority, // typically gov module account
+    Plan:      plan,
+}
+```
+
+## Module Migrations
+
+Implement migrations in your modules:
+
+```go
+package mymodule
+
+import (
+    "context"
+    
+    "cosmossdk.io/core/appmodule"
+    "github.com/cosmos/cosmos-sdk/types/module"
+)
+
+// ConsensusVersion defines the current module consensus version
+func (am AppModule) ConsensusVersion() uint64 { return 2 }
+
+// RegisterMigrations registers module migrations
+func (am AppModule) RegisterMigrations(mr appmodule.MigrationRegistrar) error {
+    // Register migration from version 1 to 2
+    if err := mr.Register(types.ModuleName, 1, func(ctx context.Context) error {
+        return am.keeper.MigrateToV2(ctx)
+    }); err != nil {
+        return err
+    }
+    
+    return nil
+}
+
+// MigrateToV2 performs state migration from v1 to v2
+func (k Keeper) MigrateToV2(ctx context.Context) error {
+    // Implement migration logic
+    // Example: update store schema, migrate data
+    return nil
+}
+```
+
+## Real-World Example: v0.50 to v0.53
+
+From the SDK's upgrade guide:
+
+```go title="app/upgrades.go"
+const UpgradeName = "v050-to-v053"
+
+func (app SimApp) RegisterUpgradeHandlers() {
+    app.UpgradeKeeper.SetUpgradeHandler(
+        UpgradeName,
+        func(ctx context.Context, _ upgradetypes.Plan, fromVM module.VersionMap) (module.VersionMap, error) {
+            return app.ModuleManager.RunMigrations(ctx, app.Configurator(), fromVM)
+        },
+    )
+
+    upgradeInfo, err := app.UpgradeKeeper.ReadUpgradeInfoFromDisk()
+    if err != nil {
+        panic(err)
+    }
+
+    if upgradeInfo.Name == UpgradeName && !app.UpgradeKeeper.IsSkipHeight(upgradeInfo.Height) {
+        storeUpgrades := storetypes.StoreUpgrades{
+            Added: []string{
+                epochstypes.ModuleName,        // if adding x/epochs
+                protocolpooltypes.ModuleName,  // if adding x/protocolpool
+            },
+        }
+
+        // configure store loader that checks if version == upgradeHeight and applies store upgrades
+        app.SetStoreLoader(upgradetypes.UpgradeStoreLoader(upgradeInfo.Height, &storeUpgrades))
+    }
+}
+```
+
+Source: [UPGRADE_GUIDE.md:469](https://github.com/cosmos/cosmos-sdk/blob/main/UPGRADE_GUIDE.md#L469)
+
+## Skip Heights
+
+Skip specific upgrade heights for testing or emergency scenarios:
+
+```bash
+# Start node with skip heights
+appd start --unsafe-skip-upgrades 1000000,1000001
+```
+
+Or configure programmatically:
+
+```go
+skipUpgradeHeights := map[int64]bool{
+    1000000: true,
+    1000001: true,
+}
+
+app.UpgradeKeeper = upgradekeeper.NewKeeper(
+    skipUpgradeHeights,
+    storeService,
+    appCodec,
+    homePath,
+    app.BaseApp,
+    authority,
+)
+```
+
+## Upgrade Info File
+
+The upgrade module writes upgrade info to disk:
+
+```json title="data/upgrade-info.json"
+{
+  "name": "v2",
+  "height": 1000000,
+  "info": "{\"binaries\":{\"linux/amd64\":\"https://example.com/app-v2-linux-amd64\"}}"
+}
+```
+
+This file is created when the upgrade height is reached but the handler is not present, signaling validators to switch binaries.
+
+## Keeper Interface
+
+Key keeper methods:
+
+```go title="x/upgrade/keeper/keeper.go"
+type Keeper struct {
+    homePath           string
+    skipUpgradeHeights map[int64]bool
+    storeService       corestore.KVStoreService
+    cdc                codec.BinaryCodec
+    upgradeHandlers    map[string]types.UpgradeHandler
+    versionSetter      xp.ProtocolVersionSetter
+    downgradeVerified  bool
+    authority          string
+    initVersionMap     module.VersionMap
+}
+
+// SetUpgradeHandler sets an UpgradeHandler for the upgrade specified by name
+func (k Keeper) SetUpgradeHandler(name string, upgradeHandler types.UpgradeHandler) {
+    k.upgradeHandlers[name] = upgradeHandler
+}
+
+// HasHandler checks if an upgrade handler is registered for the given name
+func (k Keeper) HasHandler(name string) bool {
+    _, ok := k.upgradeHandlers[name]
+    return ok
+}
+
+// GetUpgradePlan returns the currently scheduled upgrade plan
+func (k Keeper) GetUpgradePlan(ctx context.Context) (types.Plan, error)
+
+// ApplyUpgrade executes the upgrade handler
+func (k Keeper) ApplyUpgrade(ctx sdk.Context, plan types.Plan) error
+```
+
+Source: [x/upgrade/keeper/keeper.go:39](https://github.com/cosmos/cosmos-sdk/blob/main/x/upgrade/keeper/keeper.go#L39)
+
+## Best Practices
+
+1. **Test Thoroughly**: Test upgrades on testnets first
+2. **Version Mapping**: Track module versions in `VersionMap`
+3. **Store Changes**: Plan store additions/deletions carefully
+4. **Binary Distribution**: Ensure binaries are available before upgrade height
+5. **Communication**: Coordinate with validators well in advance
+6. **Rollback Plan**: Have a contingency plan for failed upgrades
+7. **Gas Limits**: Upgrades run with infinite gas, but keep them efficient
+8. **State Migrations**: Test state migrations with production data snapshots
+
+## Testing Upgrades
+
+Test your upgrade logic:
+
+```go
+func (s *UpgradeTestSuite) TestUpgrade() {
+    // Setup chain at pre-upgrade height
+    ctx := s.ctx.WithBlockHeight(upgradeHeight - 1)
+    
+    // Submit upgrade proposal
+    plan := upgradetypes.Plan{
+        Name:   "v2",
+        Height: upgradeHeight,
+    }
+    err := s.app.UpgradeKeeper.ScheduleUpgrade(ctx, plan)
+    s.Require().NoError(err)
+    
+    // Execute blocks until upgrade height
+    for h := upgradeHeight - 1; h <= upgradeHeight; h++ {
+        ctx = ctx.WithBlockHeight(h)
+        _, err := s.app.PreBlocker(ctx)
+        if h == upgradeHeight {
+            // Upgrade should execute
+            s.Require().NoError(err)
+        }
+    }
+    
+    // Verify post-upgrade state
+    // Check that migrations ran correctly
+}
+```
+
+## Emergency Procedures
+
+### Cancel Upgrade
+
+```go
+msg := &upgradetypes.MsgCancelUpgrade{
+    Authority: authority,
+}
+```
+
+### Force Skip
+
+```bash
+appd start --unsafe-skip-upgrades <height>
+```
+
+## See Also
+
+- [Module Development](/building/modules) - Creating upgradeable modules
+- [Governance](/modules/gov) - Submitting upgrade proposals
+- [Store](/core/store) - Understanding store migrations
+- [UPGRADE_GUIDE.md](https://github.com/cosmos/cosmos-sdk/blob/main/UPGRADE_GUIDE.md) - Official upgrade guide

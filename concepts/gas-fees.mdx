@@ -1,0 +1,395 @@
+---
+title: Gas and Fees
+description: Understanding gas metering, fee calculation, and transaction costs in Cosmos SDK
+---
+
+# Gas and Fees
+
+Gas is the mechanism used to track and limit resource consumption in Cosmos SDK. Every operation consumes gas, and transactions must include sufficient fees to cover their gas consumption.
+
+## Gas Metering
+
+### Gas Type and Limits
+
+```go store/types/gas.go
+// Gas is measured as an unsigned 64-bit integer
+type Gas = uint64
+
+// Gas errors
+type ErrorOutOfGas struct {
+    Descriptor string
+}
+
+type ErrorGasOverflow struct {
+    Descriptor string
+}
+
+type ErrorNegativeGasConsumed struct {
+    Descriptor string
+}
+```
+
+### GasMeter Interface
+
+The `GasMeter` tracks gas consumption during transaction execution:
+
+```go store/types/gas.go
+type GasMeter interface {
+    GasConsumed() Gas              // Total gas consumed
+    GasConsumedToLimit() Gas       // Gas consumed up to limit
+    GasRemaining() Gas             // Gas remaining before limit
+    Limit() Gas                     // Maximum gas allowed
+    ConsumeGas(amount Gas, descriptor string)
+    RefundGas(amount Gas, descriptor string)
+    IsPastLimit() bool             // Consumed > limit
+    IsOutOfGas() bool              // Consumed >= limit
+    String() string
+}
+```
+
+### Basic Gas Meter
+
+```go store/types/gas.go
+// Create a gas meter with limit
+func NewGasMeter(limit Gas) GasMeter {
+    return &basicGasMeter{
+        limit:    limit,
+        consumed: 0,
+    }
+}
+
+// Consume gas - panics if exceeds limit
+func (g *basicGasMeter) ConsumeGas(amount Gas, descriptor string) {
+    var overflow bool
+    g.consumed, overflow = addUint64Overflow(g.consumed, amount)
+    if overflow {
+        g.consumed = math.MaxUint64
+        panic(ErrorGasOverflow{descriptor})
+    }
+    
+    if g.consumed > g.limit {
+        panic(ErrorOutOfGas{descriptor})
+    }
+}
+```
+
+### Infinite Gas Meter
+
+Used for genesis, queries, and simulations:
+
+```go store/types/gas.go
+// No gas limit - used for queries and genesis
+func NewInfiniteGasMeter() GasMeter {
+    return &infiniteGasMeter{
+        consumed: 0,
+    }
+}
+
+// Never returns true - no limit
+func (g *infiniteGasMeter) IsOutOfGas() bool {
+    return false
+}
+
+func (g *infiniteGasMeter) Limit() Gas {
+    return math.MaxUint64
+}
+```
+
+## Gas Consumption
+
+### Storage Operations
+
+KVStore operations consume gas based on operation type and data size:
+
+```go store/types/gas.go
+// Default gas configuration for KVStores
+func KVGasConfig() GasConfig {
+    return GasConfig{
+        HasCost:          1000,  // Check if key exists
+        DeleteCost:       1000,  // Delete key
+        ReadCostFlat:     1000,  // Base read cost
+        ReadCostPerByte:  3,     // Per byte read
+        WriteCostFlat:    2000,  // Base write cost
+        WriteCostPerByte: 30,    // Per byte written
+        IterNextCostFlat: 30,    // Iterator next cost
+    }
+}
+
+// Transient store operations are cheaper
+func TransientGasConfig() GasConfig {
+    return GasConfig{
+        HasCost:          100,
+        DeleteCost:       100,
+        ReadCostFlat:     100,
+        ReadCostPerByte:  0,    // No per-byte cost
+        WriteCostFlat:    200,
+        WriteCostPerByte: 3,
+        IterNextCostFlat: 3,
+    }
+}
+```
+
+### Gas Consumption Examples
+
+```go
+// Reading from store
+store := ctx.KVStore(storeKey)
+value := store.Get(key) // Consumes: ReadCostFlat + (len(value) * ReadCostPerByte)
+
+// Writing to store
+store.Set(key, value) // Consumes: WriteCostFlat + (len(value) * WriteCostPerByte)
+
+// Checking existence
+has := store.Has(key) // Consumes: HasCost (1000 gas)
+
+// Deleting
+store.Delete(key) // Consumes: DeleteCost (1000 gas)
+
+// Iterating
+iter := store.Iterator(start, end)
+defer iter.Close()
+for ; iter.Valid(); iter.Next() { // Each Next(): IterNextCostFlat
+    key := iter.Key()
+    value := iter.Value()
+    // Process...
+}
+```
+
+### Custom Gas Consumption
+
+Modules can consume gas for computational operations:
+
+```go
+// Consume gas with descriptor for debugging
+ctx.GasMeter().ConsumeGas(10000, "signature verification")
+
+// Complex computation gas
+func VerifySignature(ctx sdk.Context, sig []byte) error {
+    // Charge gas for signature verification
+    ctx.GasMeter().ConsumeGas(5000, "ed25519 signature verification")
+    
+    // Perform verification...
+    return nil
+}
+```
+
+## Fee Calculation
+
+### Fee Structure
+
+Fees are denominated in native tokens:
+
+```go types/coin.go
+// Fee as coins
+type Coins []Coin
+
+type Coin struct {
+    Denom  string    // e.g., "uatom"
+    Amount math.Int // e.g., 1000
+}
+
+// Create fee
+fee := sdk.NewCoins(sdk.NewInt64Coin("uatom", 1000))
+```
+
+### Minimum Gas Prices
+
+Validators can set minimum gas prices they'll accept:
+
+```go
+// In app.toml config
+minimum-gas-prices = "0.025uatom"
+
+// Multiple denoms supported
+minimum-gas-prices = "0.025uatom,0.001uosmo"
+```
+
+**Fee validation:**
+
+```go
+// Validator checks if fee meets minimum
+minGasPrices := ctx.MinGasPrices() // DecCoins
+requiredFees := minGasPrices.MulInt(gasLimit)
+
+if !providedFees.IsAllGTE(requiredFees) {
+    return errors.New("insufficient fee")
+}
+```
+
+### Gas Price Calculation
+
+```go
+// Calculate gas price from fee and gas limit
+gasPrice = fee / gasLimit
+
+// Example:
+// Fee: 1000 uatom
+// Gas limit: 200,000
+// Gas price: 1000 / 200,000 = 0.005 uatom per gas
+```
+
+## Gas Estimation
+
+### Simulating Transactions
+
+Clients can simulate transactions to estimate gas:
+
+```go
+// Simulate transaction
+resp, err := client.Simulate(ctx, txBytes)
+if err != nil {
+    return err
+}
+
+// Get gas used
+gasUsed := resp.GasInfo.GasUsed
+
+// Add buffer for safety (20% recommended)
+gasLimit := gasUsed * 1.2
+```
+
+### Gas Wanted vs Gas Used
+
+```go
+type GasInfo struct {
+    GasWanted uint64 // Gas limit set in transaction
+    GasUsed   uint64 // Actual gas consumed
+}
+
+// Transaction result
+if gasInfo.GasUsed > gasInfo.GasWanted {
+    // Transaction failed - out of gas
+}
+```
+
+## Fee Payment
+
+### Fee Deduction
+
+Fees are deducted before transaction execution:
+
+```go
+// AnteHandler deducts fee from account
+func DeductFeeDecorator(ak AccountKeeper, bk BankKeeper) sdk.AnteHandler {
+    return func(ctx sdk.Context, tx sdk.Tx, simulate bool) {
+        feeTx := tx.(sdk.FeeTx)
+        fees := feeTx.GetFee()
+        
+        // Deduct from fee payer (typically signer)
+        feePayer := feeTx.FeePayer()
+        err := bk.SendCoinsFromAccountToModule(
+            ctx,
+            feePayer,
+            "fee_collector",
+            fees,
+        )
+        if err != nil {
+            return ctx, err
+        }
+        
+        return ctx, nil
+    }
+}
+```
+
+### Fee Grants
+
+One account can pay fees for another using fee grants:
+
+```go
+// Grant permission to pay fees
+granter := sdk.AccAddress("cosmos1...")
+grantee := sdk.AccAddress("cosmos1...")
+
+// Grant up to 1000 uatom in fees
+allowance := &feegrant.BasicAllowance{
+    SpendLimit: sdk.NewCoins(sdk.NewInt64Coin("uatom", 1000)),
+}
+
+keeper.GrantAllowance(ctx, granter, grantee, allowance)
+```
+
+## Gas Refunds
+
+Unused gas can be refunded (used in EVM compatibility):
+
+```go store/types/gas.go
+// Refund gas - panics if refund > consumed
+func (g *basicGasMeter) RefundGas(amount Gas, descriptor string) {
+    if g.consumed < amount {
+        panic(ErrorNegativeGasConsumed{Descriptor: descriptor})
+    }
+    
+    g.consumed -= amount
+}
+```
+
+## Transaction Gas Example
+
+Complete example of gas in a transaction lifecycle:
+
+```go
+// 1. Client creates transaction with gas limit
+txBuilder := clientCtx.TxBuilder()
+txBuilder.SetGasLimit(200000)
+txBuilder.SetFeeAmount(sdk.NewCoins(
+    sdk.NewInt64Coin("uatom", 5000),
+))
+
+// 2. Node validates minimum fee
+minGasPrice := sdk.NewDecCoinFromDec("uatom", sdk.MustNewDecFromStr("0.025"))
+requiredFee := minGasPrice.Amount.MulInt64(200000).Ceil().TruncateInt()
+if feeAmount < requiredFee {
+    return errors.New("insufficient fee")
+}
+
+// 3. AnteHandler deducts fee
+deductFeeHandler.AnteHandle(ctx, tx, false)
+
+// 4. Create gas meter for execution
+ctx = ctx.WithGasMeter(sdk.NewGasMeter(200000))
+
+// 5. Execute transaction
+result, err := app.DeliverTx(ctx, tx)
+if err != nil {
+    // Check if out of gas
+    if errors.Is(err, sdk.ErrorOutOfGas{}) {
+        return errors.New("transaction ran out of gas")
+    }
+}
+
+// 6. Record gas used
+gasInfo := result.GasInfo
+logger.Info("Gas used", "wanted", gasInfo.GasWanted, "used", gasInfo.GasUsed)
+```
+
+## Best Practices
+
+1. **Always simulate** before submitting transactions to estimate gas
+2. **Add gas buffer** (10-20%) to avoid out-of-gas errors
+3. **Set reasonable limits** - excessively high gas limits waste resources
+4. **Monitor gas costs** in your modules to optimize performance
+5. **Use descriptors** when consuming gas for better debugging
+6. **Charge gas before expensive operations** to prevent DOS attacks
+7. **Use transient stores** for temporary data to reduce gas costs
+8. **Batch operations** when possible to amortize gas costs
+
+## Common Gas Costs
+
+Typical gas consumption for common operations:
+
+| Operation | Gas Cost |
+|-----------|----------|
+| Basic transfer | ~75,000 |
+| Delegate tokens | ~120,000 |
+| Vote on proposal | ~80,000 |
+| Create validator | ~180,000 |
+| IBC transfer | ~150,000 |
+| Smart contract call | Varies widely |
+| Signature verification | ~5,000 per sig |
+
+## Related Concepts
+
+- [Accounts](/concepts/accounts) - Account management and addresses
+- [Transactions](/essentials/transactions) - Transaction structure and signing
+- [AnteHandler](/concepts/ante-handler) - Pre-execution validation and fee deduction

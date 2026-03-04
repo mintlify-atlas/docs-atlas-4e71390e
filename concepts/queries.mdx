@@ -1,0 +1,525 @@
+---
+title: Queries
+description: Understanding query routing, gRPC queries, and ABCI query handling in Cosmos SDK
+---
+
+# Queries
+
+Queries allow clients to retrieve application state without modifying it. Cosmos SDK supports multiple query mechanisms including gRPC, REST, and ABCI queries.
+
+## Query Types
+
+### gRPC Queries
+
+The primary query mechanism using Protocol Buffers and gRPC:
+
+```protobuf
+// Define query service in .proto
+service Query {
+    // Query account balance
+    rpc Balance(QueryBalanceRequest) returns (QueryBalanceResponse) {
+        option (google.api.http).get = "/cosmos/bank/v1beta1/balances/{address}/{denom}";
+    }
+    
+    // Query all balances
+    rpc AllBalances(QueryAllBalancesRequest) returns (QueryAllBalancesResponse) {
+        option (google.api.http).get = "/cosmos/bank/v1beta1/balances/{address}";
+    }
+}
+
+message QueryBalanceRequest {
+    string address = 1;
+    string denom = 2;
+}
+
+message QueryBalanceResponse {
+    cosmos.base.v1beta1.Coin balance = 1;
+}
+```
+
+### ABCI Queries
+
+Low-level queries using the ABCI interface:
+
+```go client/grpc_query.go
+// ABCI query structure
+type RequestQuery struct {
+    Path   string  // Query path
+    Data   []byte  // Query data (protobuf encoded)
+    Height int64   // Block height (0 = latest)
+    Prove  bool    // Include merkle proof
+}
+
+type ResponseQuery struct {
+    Code   uint32  // Response code
+    Log    string  // Log output
+    Info   string  // Additional info
+    Index  int64   // Index in block
+    Key    []byte  // Key for proof
+    Value  []byte  // Result data
+    Proof  []byte  // Merkle proof
+    Height int64   // Block height
+}
+```
+
+## Query Routing
+
+### gRPC Query Server
+
+Modules implement query servers:
+
+```go
+// Query server implementation
+type Keeper struct {
+    storeKey sdk.StoreKey
+}
+
+// Implement query service
+func (k Keeper) Balance(
+    ctx context.Context,
+    req *types.QueryBalanceRequest,
+) (*types.QueryBalanceResponse, error) {
+    // Unwrap SDK context
+    sdkCtx := sdk.UnwrapSDKContext(ctx)
+    
+    // Validate request
+    if req.Address == "" {
+        return nil, status.Error(codes.InvalidArgument, "address cannot be empty")
+    }
+    
+    // Parse address
+    addr, err := sdk.AccAddressFromBech32(req.Address)
+    if err != nil {
+        return nil, status.Error(codes.InvalidArgument, "invalid address")
+    }
+    
+    // Get balance from store
+    balance := k.GetBalance(sdkCtx, addr, req.Denom)
+    
+    return &types.QueryBalanceResponse{
+        Balance: &balance,
+    }, nil
+}
+```
+
+### Query Registration
+
+```go
+// Register query server
+func (am AppModule) RegisterServices(cfg module.Configurator) {
+    types.RegisterQueryServer(cfg.QueryServer(), keeper)
+}
+```
+
+## Client Query Implementation
+
+### Context-based Queries
+
+```go client/grpc_query.go
+// Client context implements gRPC ClientConn
+type Context struct {
+    Client      *rpc.HTTP
+    GRPCClient  *grpc.ClientConn
+    ChainID     string
+    Height      int64
+    // ... other fields
+}
+
+// Invoke implements gRPC ClientConn
+func (ctx Context) Invoke(
+    grpcCtx context.Context,
+    method string,
+    req, reply any,
+    opts ...grpc.CallOption,
+) error {
+    // Two execution paths:
+    // 1. Use gRPC client if available
+    // 2. Fall back to ABCI query
+    
+    if ctx.GRPCClient != nil {
+        return ctx.GRPCClient.Invoke(grpcCtx, method, req, reply, opts...)
+    }
+    
+    // ABCI query path
+    reqBz, err := ctx.gRPCCodec().Marshal(req)
+    if err != nil {
+        return err
+    }
+    
+    // Extract height from metadata
+    height, err := GetHeightFromMetadataStrict(grpcCtx)
+    if err != nil {
+        return err
+    }
+    
+    if height > 0 {
+        ctx = ctx.WithHeight(height)
+    }
+    
+    // Execute ABCI query
+    abciReq := abci.RequestQuery{
+        Path:   method,
+        Data:   reqBz,
+        Height: ctx.Height,
+    }
+    
+    res, err := ctx.QueryABCI(abciReq)
+    if err != nil {
+        return err
+    }
+    
+    // Unmarshal response
+    return ctx.gRPCCodec().Unmarshal(res.Value, reply)
+}
+```
+
+### Height Handling
+
+```go client/grpc_query.go
+// Extract height from gRPC metadata
+func GetHeightFromMetadataStrict(grpcCtx context.Context) (int64, error) {
+    md, ok := metadata.FromOutgoingContext(grpcCtx)
+    if !ok {
+        return 0, nil
+    }
+    
+    heights := md.Get(grpctypes.GRPCBlockHeightHeader)
+    if len(heights) == 0 {
+        return 0, nil
+    }
+    
+    height, err := strconv.ParseInt(heights[0], 10, 64)
+    if err != nil {
+        return 0, fmt.Errorf("invalid height header: %v", err)
+    }
+    
+    if height < 0 {
+        return 0, fmt.Errorf("height must be >= 0, got %d", height)
+    }
+    
+    return height, nil
+}
+```
+
+## Making Queries
+
+### Go Client
+
+```go
+import (
+    "context"
+    "google.golang.org/grpc"
+    banktypes "github.com/cosmos/cosmos-sdk/x/bank/types"
+)
+
+// Create gRPC connection
+conn, err := grpc.Dial(
+    "localhost:9090",
+    grpc.WithInsecure(),
+)
+if err != nil {
+    return err
+}
+defer conn.Close()
+
+// Create query client
+queryClient := banktypes.NewQueryClient(conn)
+
+// Query balance
+resp, err := queryClient.Balance(
+    context.Background(),
+    &banktypes.QueryBalanceRequest{
+        Address: "cosmos1abc...",
+        Denom:   "uatom",
+    },
+)
+if err != nil {
+    return err
+}
+
+fmt.Printf("Balance: %s\n", resp.Balance.String())
+```
+
+### Query at Specific Height
+
+```go
+import "google.golang.org/grpc/metadata"
+
+// Add height to context metadata
+ctx := metadata.AppendToOutgoingContext(
+    context.Background(),
+    "x-cosmos-block-height", "12345",
+)
+
+// Query at height 12345
+resp, err := queryClient.Balance(ctx, req)
+```
+
+### CLI Queries
+
+```bash
+# Query using CLI
+mychaind query bank balances cosmos1abc...
+
+# Query at specific height
+mychaind query bank balances cosmos1abc... --height 12345
+
+# Output as JSON
+mychaind query bank balances cosmos1abc... --output json
+```
+
+### REST Queries
+
+```bash
+# Query via REST (gRPC-gateway)
+curl http://localhost:1317/cosmos/bank/v1beta1/balances/cosmos1abc...
+
+# Query at specific height
+curl http://localhost:1317/cosmos/bank/v1beta1/balances/cosmos1abc... \
+  -H "x-cosmos-block-height: 12345"
+```
+
+## Pagination
+
+Queries support pagination for large result sets:
+
+```protobuf
+message QueryAllBalancesRequest {
+    string address = 1;
+    cosmos.base.query.v1beta1.PageRequest pagination = 2;
+}
+
+message QueryAllBalancesResponse {
+    repeated cosmos.base.v1beta1.Coin balances = 1;
+    cosmos.base.query.v1beta1.PageResponse pagination = 2;
+}
+```
+
+### Using Pagination
+
+```go
+import "github.com/cosmos/cosmos-sdk/types/query"
+
+// Query with pagination
+resp, err := queryClient.AllBalances(
+    context.Background(),
+    &banktypes.QueryAllBalancesRequest{
+        Address: "cosmos1abc...",
+        Pagination: &query.PageRequest{
+            Key:        nil,    // Start from beginning
+            Offset:     0,      // Skip 0 items
+            Limit:      100,    // Return 100 items
+            CountTotal: true,   // Include total count
+            Reverse:    false,  // Normal order
+        },
+    },
+)
+
+// Get next page
+resp2, err := queryClient.AllBalances(
+    context.Background(),
+    &banktypes.QueryAllBalancesRequest{
+        Address: "cosmos1abc...",
+        Pagination: &query.PageRequest{
+            Key: resp.Pagination.NextKey, // Continue from previous
+        },
+    },
+)
+```
+
+## Store Queries
+
+### Direct Store Access
+
+```go
+// Query from keeper
+func (k Keeper) GetBalance(
+    ctx sdk.Context,
+    addr sdk.AccAddress,
+    denom string,
+) sdk.Coin {
+    store := ctx.KVStore(k.storeKey)
+    
+    // Build key
+    key := types.CreateAccountBalancesPrefix(addr)
+    key = append(key, []byte(denom)...)
+    
+    // Get value
+    bz := store.Get(key)
+    if bz == nil {
+        return sdk.NewCoin(denom, sdk.ZeroInt())
+    }
+    
+    // Unmarshal
+    var balance sdk.Coin
+    k.cdc.MustUnmarshal(bz, &balance)
+    return balance
+}
+```
+
+### Iterator Queries
+
+```go
+// Query all balances for an account
+func (k Keeper) GetAllBalances(
+    ctx sdk.Context,
+    addr sdk.AccAddress,
+) sdk.Coins {
+    store := ctx.KVStore(k.storeKey)
+    
+    // Create prefix iterator
+    prefix := types.CreateAccountBalancesPrefix(addr)
+    iterator := sdk.KVStorePrefixIterator(store, prefix)
+    defer iterator.Close()
+    
+    balances := sdk.NewCoins()
+    for ; iterator.Valid(); iterator.Next() {
+        var balance sdk.Coin
+        k.cdc.MustUnmarshal(iterator.Value(), &balance)
+        balances = balances.Add(balance)
+    }
+    
+    return balances
+}
+```
+
+## Query Helpers
+
+### Paginate Store
+
+```go
+import "github.com/cosmos/cosmos-sdk/types/query"
+
+// Paginate over store
+func (k Keeper) GetAllBalancesPaginated(
+    ctx sdk.Context,
+    addr sdk.AccAddress,
+    pageReq *query.PageRequest,
+) (sdk.Coins, *query.PageResponse, error) {
+    store := ctx.KVStore(k.storeKey)
+    prefix := types.CreateAccountBalancesPrefix(addr)
+    balanceStore := prefix.KVStore(store, prefix)
+    
+    balances := sdk.NewCoins()
+    pageRes, err := query.Paginate(balanceStore, pageReq, func(key, value []byte) error {
+        var balance sdk.Coin
+        if err := k.cdc.Unmarshal(value, &balance); err != nil {
+            return err
+        }
+        balances = balances.Add(balance)
+        return nil
+    })
+    
+    return balances, pageRes, err
+}
+```
+
+## Query Performance
+
+### Indexing
+
+Create indexes for frequently queried data:
+
+```go
+// Primary key: address + denom -> balance
+// Index key: denom + address -> nil (for queries by denom)
+
+func (k Keeper) SetBalance(ctx sdk.Context, addr sdk.AccAddress, balance sdk.Coin) {
+    store := ctx.KVStore(k.storeKey)
+    
+    // Store by address + denom (primary)
+    key := append(types.BalancesPrefix, addr...)
+    key = append(key, []byte(balance.Denom)...)
+    store.Set(key, k.cdc.MustMarshal(&balance))
+    
+    // Store index by denom (for reverse lookup)
+    indexKey := append(types.DenomAddressPrefix, []byte(balance.Denom)...)
+    indexKey = append(indexKey, addr...)
+    store.Set(indexKey, []byte{}) // Empty value
+}
+```
+
+### Caching
+
+```go
+// Cache frequently accessed data
+type Keeper struct {
+    cache *lru.Cache
+}
+
+func (k Keeper) GetBalance(
+    ctx sdk.Context,
+    addr sdk.AccAddress,
+    denom string,
+) sdk.Coin {
+    // Check cache
+    cacheKey := fmt.Sprintf("%s:%s", addr.String(), denom)
+    if val, ok := k.cache.Get(cacheKey); ok {
+        return val.(sdk.Coin)
+    }
+    
+    // Query from store
+    balance := k.getBalanceFromStore(ctx, addr, denom)
+    
+    // Cache result
+    k.cache.Add(cacheKey, balance)
+    
+    return balance
+}
+```
+
+## Best Practices
+
+1. **Use gRPC queries** - preferred over ABCI queries
+2. **Implement pagination** for queries returning multiple items
+3. **Validate input** - check addresses, denoms, etc.
+4. **Return errors** using gRPC status codes
+5. **Include metadata** - height, pagination info, etc.
+6. **Create indexes** for frequently queried data
+7. **Cache results** when appropriate
+8. **Use prefix iterators** for range queries
+9. **Set query limits** to prevent DOS
+10. **Document queries** in proto files
+
+## Query Error Handling
+
+```go
+import "google.golang.org/grpc/status"
+import "google.golang.org/grpc/codes"
+
+func (k Keeper) Balance(
+    ctx context.Context,
+    req *types.QueryBalanceRequest,
+) (*types.QueryBalanceResponse, error) {
+    // Validation errors
+    if req.Address == "" {
+        return nil, status.Error(
+            codes.InvalidArgument,
+            "address cannot be empty",
+        )
+    }
+    
+    // Parse errors
+    addr, err := sdk.AccAddressFromBech32(req.Address)
+    if err != nil {
+        return nil, status.Errorf(
+            codes.InvalidArgument,
+            "invalid address: %v",
+            err,
+        )
+    }
+    
+    // Not found (return zero, don't error)
+    balance := k.GetBalance(sdkCtx, addr, req.Denom)
+    
+    return &types.QueryBalanceResponse{
+        Balance: &balance,
+    }, nil
+}
+```
+
+## Related Concepts
+
+- [Events](/concepts/events) - Event emission and querying
+- [Encoding](/concepts/encoding) - Protocol Buffer encoding
+- [Transactions](/essentials/transactions) - Transaction queries

@@ -1,0 +1,624 @@
+---
+title: State Management
+description: State storage architecture, Collections, and the KVStore abstraction
+---
+
+## Overview
+
+Cosmos SDK uses a layered approach to state management, providing type-safe abstractions over a key-value store. The state layer ensures deterministic execution, efficient queries, and Merkle proofs for light clients.
+
+## Storage Architecture
+
+### CommitMultiStore
+
+The root store containing all module substores:
+
+```go
+// Location: store/types/store.go:115
+type CommitMultiStore interface {
+    Committer
+    MultiStore
+    
+    // Mount a store with a given key and type
+    MountStoreWithDB(key StoreKey, typ StoreType, db dbm.DB)
+    
+    // Load the latest version
+    LoadLatestVersion() error
+    
+    // Load a specific version
+    LoadVersion(ver int64) error
+    
+    // Get store by key
+    GetCommitStore(key StoreKey) CommitStore
+    GetCommitKVStore(key StoreKey) CommitKVStore
+}
+```
+
+### Store Types
+
+<CardGroup cols={2}>
+  <Card title="KVStore" icon="database">
+    Standard key-value store for persistent state
+  </Card>
+  <Card title="TransientStore" icon="clock">
+    Temporary state cleared after each block
+  </Card>
+  <Card title="MemoryStore" icon="memory">
+    In-memory state for caching
+  </Card>
+  <Card title="ObjectStore" icon="cube">
+    Store for objects (experimental)
+  </Card>
+</CardGroup>
+
+### KVStore Interface
+
+```go
+// Location: store/types/store.go:17
+type Store interface {
+    GetStoreType() StoreType
+    CacheWrapper
+}
+
+type KVStore interface {
+    Store
+    
+    // Get returns nil if key doesn't exist
+    Get(key []byte) []byte
+    
+    // Has checks if key exists
+    Has(key []byte) bool
+    
+    // Set sets the key-value pair
+    Set(key, value []byte)
+    
+    // Delete removes the key
+    Delete(key []byte)
+    
+    // Iterator over a domain
+    Iterator(start, end []byte) Iterator
+    ReverseIterator(start, end []byte) Iterator
+}
+```
+
+## Collections Framework
+
+Collections provide type-safe state management, replacing raw byte manipulation.
+
+<Note>
+Collections is the recommended approach for state management in modern Cosmos SDK applications.
+</Note>
+
+### Core Collection Types
+
+```go
+// Location: collections/README.md:25
+
+// Map: typed key-value mappings
+type Map[K, V any] interface {
+    Get(ctx context.Context, key K) (V, error)
+    Set(ctx context.Context, key K, value V) error
+    Has(ctx context.Context, key K) (bool, error)
+    Remove(ctx context.Context, key K) error
+    Iterate(ctx context.Context, ranger Ranger[K]) (Iterator[K, V], error)
+}
+
+// KeySet: set of keys without values
+type KeySet[K any] interface {
+    Set(ctx context.Context, key K) error
+    Has(ctx context.Context, key K) (bool, error)
+    Remove(ctx context.Context, key K) error
+}
+
+// Item: single value storage
+type Item[V any] interface {
+    Get(ctx context.Context) (V, error)
+    Set(ctx context.Context, value V) error
+}
+
+// Sequence: monotonically increasing counter
+type Sequence interface {
+    Next(ctx context.Context) (uint64, error)
+    Peek(ctx context.Context) (uint64, error)
+}
+```
+
+### Using Collections
+
+#### Basic Map Example
+
+```go
+// Location: collections/README.md:261
+import (
+    "cosmossdk.io/collections"
+    "cosmossdk.io/core/store"
+    sdk "github.com/cosmos/cosmos-sdk/types"
+    authtypes "github.com/cosmos/cosmos-sdk/x/auth/types"
+)
+
+var AccountsPrefix = collections.NewPrefix(0)
+
+type Keeper struct {
+    Schema   collections.Schema
+    Accounts collections.Map[sdk.AccAddress, authtypes.BaseAccount]
+}
+
+func NewKeeper(storeService store.KVStoreService, cdc codec.BinaryCodec) Keeper {
+    sb := collections.NewSchemaBuilder(storeService)
+    return Keeper{
+        Accounts: collections.NewMap(
+            sb,
+            AccountsPrefix,
+            "accounts",
+            sdk.AccAddressKey,
+            codec.CollValue[authtypes.BaseAccount](cdc),
+        ),
+    }
+}
+
+func (k Keeper) CreateAccount(ctx sdk.Context, addr sdk.AccAddress, account authtypes.BaseAccount) error {
+    // Check if exists
+    has, err := k.Accounts.Has(ctx, addr)
+    if err != nil {
+        return err
+    }
+    if has {
+        return fmt.Errorf("account already exists")
+    }
+    
+    // Store account
+    return k.Accounts.Set(ctx, addr, account)
+}
+
+func (k Keeper) GetAccount(ctx sdk.Context, addr sdk.AccAddress) (authtypes.BaseAccount, error) {
+    return k.Accounts.Get(ctx, addr)
+}
+```
+
+#### Composite Keys
+
+For multi-part keys like `(address, denom)` for balances:
+
+```go
+// Location: collections/README.md:667
+var BalancesPrefix = collections.NewPrefix(1)
+
+type Keeper struct {
+    Schema   collections.Schema
+    Balances collections.Map[collections.Pair[sdk.AccAddress, string], math.Int]
+}
+
+func NewKeeper(storeService store.KVStoreService) Keeper {
+    sb := collections.NewSchemaBuilder(storeService)
+    return Keeper{
+        Balances: collections.NewMap(
+            sb,
+            BalancesPrefix,
+            "balances",
+            collections.PairKeyCodec(sdk.AccAddressKey, collections.StringKey),
+            sdk.IntValue,
+        ),
+    }
+}
+
+func (k Keeper) SetBalance(ctx sdk.Context, address sdk.AccAddress, denom string, amount math.Int) error {
+    key := collections.Join(address, denom)
+    return k.Balances.Set(ctx, key, amount)
+}
+
+func (k Keeper) GetBalance(ctx sdk.Context, address sdk.AccAddress, denom string) (math.Int, error) {
+    return k.Balances.Get(ctx, collections.Join(address, denom))
+}
+```
+
+#### Iteration
+
+```go
+// Location: collections/README.md:526
+func (k Keeper) GetAllAccounts(ctx sdk.Context) ([]authtypes.BaseAccount, error) {
+    // Iterate over all keys (nil = no range restriction)
+    iter, err := k.Accounts.Iterate(ctx, nil)
+    if err != nil {
+        return nil, err
+    }
+    
+    // Collect all values
+    accounts, err := iter.Values()
+    if err != nil {
+        return nil, err
+    }
+    
+    return accounts, nil
+}
+
+func (k Keeper) IterateAccountsBetween(ctx sdk.Context, start, end uint64) ([]authtypes.BaseAccount, error) {
+    // Define iteration range
+    rng := new(collections.Range[uint64]).
+        StartInclusive(start).
+        EndExclusive(end).
+        Descending()
+    
+    iter, err := k.Accounts.Iterate(ctx, rng)
+    if err != nil {
+        return nil, err
+    }
+    
+    return iter.Values()
+}
+```
+
+#### Prefix Iteration
+
+```go
+// Location: collections/README.md:735
+func (k Keeper) GetAllAddressBalances(ctx sdk.Context, address sdk.AccAddress) (sdk.Coins, error) {
+    balances := sdk.NewCoins()
+    
+    // Iterate over all balances for this address
+    rng := collections.NewPrefixedPairRange[sdk.AccAddress, string](address)
+    
+    iter, err := k.Balances.Iterate(ctx, rng)
+    if err != nil {
+        return nil, err
+    }
+    
+    kvs, err := iter.KeyValues()
+    if err != nil {
+        return nil, err
+    }
+    
+    for _, kv := range kvs {
+        balances = balances.Add(sdk.NewCoin(kv.Key.K2(), kv.Value))
+    }
+    
+    return balances, nil
+}
+```
+
+### IndexedMap
+
+Maps with secondary indexes:
+
+```go
+// Location: collections/README.md:832
+import "cosmossdk.io/collections/indexes"
+
+var AccountsNumberIndexPrefix = collections.NewPrefix(1)
+
+type AccountsIndexes struct {
+    Number *indexes.Unique[uint64, sdk.AccAddress, authtypes.BaseAccount]
+}
+
+func NewAccountIndexes(sb *collections.SchemaBuilder) AccountsIndexes {
+    return AccountsIndexes{
+        Number: indexes.NewUnique(
+            sb,
+            AccountsNumberIndexPrefix,
+            "accounts_by_number",
+            collections.Uint64Key,
+            sdk.AccAddressKey,
+            func(_ sdk.AccAddress, v authtypes.BaseAccount) (uint64, error) {
+                return v.AccountNumber, nil
+            },
+        ),
+    }
+}
+
+type Keeper struct {
+    Schema   collections.Schema
+    Accounts *collections.IndexedMap[sdk.AccAddress, authtypes.BaseAccount, AccountsIndexes]
+}
+
+func NewKeeper(storeService store.KVStoreService, cdc codec.BinaryCodec) Keeper {
+    sb := collections.NewSchemaBuilder(storeService)
+    return Keeper{
+        Accounts: collections.NewIndexedMap(
+            sb,
+            collections.NewPrefix(0),
+            "accounts",
+            sdk.AccAddressKey,
+            codec.CollValue[authtypes.BaseAccount](cdc),
+            NewAccountIndexes(sb),
+        ),
+    }
+}
+
+func (k Keeper) GetAccountByNumber(ctx sdk.Context, accNumber uint64) (sdk.AccAddress, authtypes.BaseAccount, error) {
+    // Query by secondary index
+    accAddress, err := k.Accounts.Indexes.Number.MatchExact(ctx, accNumber)
+    if err != nil {
+        return nil, authtypes.BaseAccount{}, err
+    }
+    
+    // Get full account
+    acc, err := k.Accounts.Get(ctx, accAddress)
+    return accAddress, acc, err
+}
+```
+
+## State Prefixes
+
+Modules partition state using prefixes:
+
+```go
+// Location: collections/README.md:49
+var (
+    // Each collection gets a unique prefix
+    AccountsPrefix         = collections.NewPrefix(0)
+    BalancesPrefix         = collections.NewPrefix(1)
+    DenomMetadataPrefix    = collections.NewPrefix(2)
+    SupplyPrefix           = collections.NewPrefix(3)
+    ParamsPrefix           = collections.NewPrefix(4)
+)
+```
+
+<Warning>
+**Critical Rules:**
+- Each collection MUST have a unique prefix
+- Prefixes MUST NOT overlap (e.g., "a" and "aa")
+- Use incrementing uint8 for efficiency
+- Never reuse deleted prefixes (causes state conflicts)
+</Warning>
+
+## Key and Value Codecs
+
+Codecs handle type serialization:
+
+```go
+// Built-in key codecs
+collections.StringKey        // string
+collections.Uint64Key        // uint64
+collections.Uint32Key        // uint32
+collections.BytesKey         // []byte
+sdk.AccAddressKey           // sdk.AccAddress
+sdk.ValAddressKey           // sdk.ValAddress
+
+// Value codecs
+collections.Uint64Value      // uint64
+collections.StringValue      // string
+sdk.IntValue                // math.Int
+codec.CollValue[T](cdc)     // protobuf messages
+```
+
+### Custom Codec Example
+
+```go
+type CustomKey struct {
+    Field1 string
+    Field2 uint64
+}
+
+var CustomKeyCodec = collections.KeyCodec[CustomKey]{
+    Encode: func(key CustomKey) ([]byte, error) {
+        // Custom encoding logic
+        return encodeCustomKey(key)
+    },
+    Decode: func(b []byte) (CustomKey, error) {
+        // Custom decoding logic
+        return decodeCustomKey(b)
+    },
+}
+```
+
+## State Commitment
+
+### CommitInfo
+
+```go
+// Location: store/types/commit_info.go:32
+func (ci CommitInfo) Hash() []byte {
+    // Empty set special case
+    if len(ci.StoreInfos) == 0 {
+        emptyHash := sha256.Sum256([]byte{})
+        return emptyHash[:]
+    }
+    
+    // Merkle root of all store hashes
+    rootHash, _, _ := maps.ProofsFromMap(ci.toMap())
+    
+    if len(rootHash) == 0 {
+        emptyHash := sha256.Sum256([]byte{})
+        return emptyHash[:]
+    }
+    
+    return rootHash
+}
+```
+
+### IAVL Tree
+
+The default store implementation uses IAVL (immutable AVL tree):
+
+- Provides Merkle proofs for any key-value
+- Supports historical queries
+- Balances tree for O(log n) operations
+- Pruning removes old versions
+
+## Context and State Isolation
+
+### CacheMultiStore
+
+```go
+// Branch context for isolated changes
+cacheCtx, writeCache := ctx.CacheContext()
+
+// Make changes in cache
+err := k.SomeOperation(cacheCtx)
+if err != nil {
+    // Changes discarded automatically
+    return err
+}
+
+// Commit changes to parent
+writeCache()
+```
+
+### Transient Store
+
+For data that doesn't need to persist:
+
+```go
+type Keeper struct {
+    transientKey storetypes.StoreKey
+}
+
+func (k Keeper) SetTransientData(ctx sdk.Context, key, value []byte) {
+    store := ctx.TransientStore(k.transientKey)
+    store.Set(key, value)
+    // Automatically cleared after block
+}
+```
+
+## Gas Metering
+
+State operations consume gas:
+
+```go
+// Location: types/context.go:63
+kvGasConfig := storetypes.GasConfig{
+    HasCost:          1000,
+    DeleteCost:       1000,
+    ReadCostFlat:     1000,
+    ReadCostPerByte:  3,
+    WriteCostFlat:    2000,
+    WriteCostPerByte: 30,
+    IterNextCostFlat: 30,
+}
+
+store := gaskv.NewStore(rawStore, gasConfig, gasMeter)
+```
+
+### Gas Costs
+
+| Operation | Base Cost | Per Byte Cost |
+|-----------|-----------|---------------|
+| Read (Has) | 1,000 | 3 |
+| Read (Get) | 1,000 | 3 |
+| Write (Set) | 2,000 | 30 |
+| Delete | 1,000 | 0 |
+| Iterate (Next) | 30 | 0 |
+
+## Store Upgrades
+
+Modifying store structure during upgrades:
+
+```go
+// Location: store/types/store.go:71
+type StoreUpgrades struct {
+    Added   []string      // New stores to add
+    Renamed []StoreRename // Stores to rename
+    Deleted []string      // Stores to remove
+}
+
+type StoreRename struct {
+    OldKey string
+    NewKey string
+}
+```
+
+### Example Upgrade
+
+```go
+import storetypes "cosmossdk.io/store/types"
+
+func (app *App) RegisterUpgradeHandlers() {
+    app.UpgradeKeeper.SetUpgradeHandler(
+        "v2",
+        func(ctx sdk.Context, plan upgradetypes.Plan, fromVM module.VersionMap) (module.VersionMap, error) {
+            // Upgrade logic
+            return app.mm.RunMigrations(ctx, app.configurator, fromVM)
+        },
+    )
+    
+    upgradeInfo, err := app.UpgradeKeeper.ReadUpgradeInfoFromDisk()
+    if upgradeInfo.Name == "v2" {
+        storeUpgrades := storetypes.StoreUpgrades{
+            Added: []string{"newmodule"},
+            Deleted: []string{"oldmodule"},
+        }
+        
+        app.SetStoreLoader(upgradetypes.UpgradeStoreLoader(upgradeInfo.Height, &storeUpgrades))
+    }
+}
+```
+
+## Pruning
+
+Control historical state retention:
+
+```go
+import pruningtypes "cosmossdk.io/store/pruning/types"
+
+// Pruning strategies
+pruningOpts := pruningtypes.PruningOptions{
+    KeepRecent: 100,        // Keep last 100 versions
+    Interval:   10,         // Prune every 10 blocks
+}
+
+// Presets
+pruningtypes.PruningOptionNothing    // Keep everything
+pruningtypes.PruningOptionEverything // Keep only latest
+pruningtypes.PruningOptionDefault    // Balanced
+```
+
+## State Listening
+
+Stream state changes:
+
+```go
+type StreamingManager interface {
+    // Register listener for state changes
+    RegisterListener(listener ABCIListener) error
+}
+
+type ABCIListener interface {
+    // Called on state changes
+    ListenFinalizeBlock(ctx context.Context, req abci.RequestFinalizeBlock, res abci.ResponseFinalizeBlock) error
+    ListenCommit(ctx context.Context, res abci.ResponseCommit, changeSet []*StoreKVPair) error
+}
+```
+
+## Best Practices
+
+<AccordionGroup>
+  <Accordion title="Use Collections">
+    Always prefer Collections over raw KVStore access for type safety and better developer experience.
+  </Accordion>
+  
+  <Accordion title="Plan Prefixes Carefully">
+    Define all collection prefixes upfront and document them. Never change existing prefixes.
+  </Accordion>
+  
+  <Accordion title="Minimize State Reads">
+    Cache frequently accessed state in memory. Each read consumes gas.
+  </Accordion>
+  
+  <Accordion title="Use Composite Keys">
+    Design keys to enable efficient prefix iteration for related data.
+  </Accordion>
+  
+  <Accordion title="Index Judiciously">
+    Secondary indexes improve query performance but increase write costs.
+  </Accordion>
+  
+  <Accordion title="Branch for Speculation">
+    Use `CacheContext()` when you might need to rollback changes.
+  </Accordion>
+</AccordionGroup>
+
+## Related Documentation
+
+<CardGroup cols={2}>
+  <Card title="Modules" icon="puzzle-piece" href="/architecture/modules">
+    How modules use state
+  </Card>
+  <Card title="Transactions" icon="exchange-alt" href="/architecture/transactions">
+    Transaction state changes
+  </Card>
+  <Card title="Collections Guide" icon="book" href="/architecture/state-management">
+    Complete Collections reference
+  </Card>
+  <Card title="Store Types" icon="database" href="/architecture/state-management">
+    Detailed store documentation
+  </Card>
+</CardGroup>

@@ -1,0 +1,386 @@
+---
+title: Bank Module
+description: Multi-asset coin transfers and supply tracking for Cosmos SDK
+---
+
+# Bank Module (x/bank)
+
+## Overview
+
+The `x/bank` module is responsible for handling multi-asset coin transfers between accounts and tracking the total supply of all assets in the application. It provides secure interfaces for other modules to interact with user balances.
+
+**Purpose**: Enable token transfers, track total supply, and manage denomination metadata for all assets in the blockchain.
+
+## Key Features
+
+- **Multi-Asset Support**: Handle multiple token denominations
+- **Supply Tracking**: Passive tracking of total supply for all coins
+- **Module Accounts**: Special accounts for modules to hold and manage tokens
+- **Send Restrictions**: Flexible restrictions on token transfers
+- **Denomination Metadata**: Store descriptive information about tokens
+
+## State
+
+The bank module maintains the following state:
+
+### Storage Indexes
+
+```
+0x0 | byte(denom) -> byte(amount)                              // Supply Index
+0x1 | byte(denom) -> ProtocolBuffer(Metadata)                 // Denom Metadata
+0x2 | byte(address length) | []byte(address) | []byte(denom) // Balances
+     -> ProtocolBuffer(balance)
+0x03 | byte(denom) | 0x00 | []byte(address) -> 0             // Reverse Index
+0x05 | ProtocolBuffer(Params)                                 // Params
+```
+
+### Account Balances
+
+Balances are stored per address and denomination, allowing efficient O(1) lookups.
+
+### Total Supply
+
+The total supply is updated every time coins are minted or burned:
+- Minting: During inflation or module-specific operations
+- Burning: Due to slashing, vetoed proposals, or module operations
+
+## Module Accounts
+
+Module accounts are special accounts used by modules to hold tokens:
+
+```go
+type ModuleAccount interface {
+    auth.Account
+    GetName() string
+    GetPermissions() []string
+    HasPermission(string) bool
+}
+```
+
+### Permissions
+
+- **Minter**: Allows minting specific amounts of coins
+- **Burner**: Allows burning specific amounts of coins
+- **Staking**: Allows delegating and undelegating coins
+
+## Keepers
+
+### BaseKeeper
+
+Provides full-permission access to modify any account's balance:
+
+```go
+type Keeper interface {
+    SendKeeper
+    InitGenesis(context.Context, *types.GenesisState)
+    ExportGenesis(context.Context) *types.GenesisState
+    GetSupply(ctx context.Context, denom string) sdk.Coin
+    GetPaginatedTotalSupply(ctx context.Context, pagination *query.PageRequest) (sdk.Coins, *query.PageResponse, error)
+    GetDenomMetaData(ctx context.Context, denom string) (types.Metadata, bool)
+    SetDenomMetaData(ctx context.Context, denomMetaData types.Metadata)
+    IterateAllDenomMetaData(ctx context.Context, cb func(types.Metadata) bool)
+    SendCoinsFromModuleToAccount(ctx context.Context, senderModule string, recipientAddr sdk.AccAddress, amt sdk.Coins) error
+    SendCoinsFromAccountToModule(ctx context.Context, senderAddr sdk.AccAddress, recipientModule string, amt sdk.Coins) error
+    MintCoins(ctx context.Context, moduleName string, amt sdk.Coins) error
+    BurnCoins(ctx context.Context, moduleName string, amt sdk.Coins) error
+}
+```
+
+### SendKeeper
+
+Provides access to transfer coins between accounts (without minting/burning):
+
+```go
+type SendKeeper interface {
+    ViewKeeper
+    InputOutputCoins(ctx context.Context, input types.Input, outputs []types.Output) error
+    SendCoins(ctx context.Context, fromAddr, toAddr sdk.AccAddress, amt sdk.Coins) error
+    GetParams(ctx context.Context) types.Params
+    SetParams(ctx context.Context, params types.Params) error
+    IsSendEnabledDenom(ctx context.Context, denom string) bool
+    BlockedAddr(addr sdk.AccAddress) bool
+}
+```
+
+### ViewKeeper
+
+Provides read-only access to account balances:
+
+```go
+type ViewKeeper interface {
+    ValidateBalance(ctx context.Context, addr sdk.AccAddress) error
+    HasBalance(ctx context.Context, addr sdk.AccAddress, amt sdk.Coin) bool
+    GetAllBalances(ctx context.Context, addr sdk.AccAddress) sdk.Coins
+    GetBalance(ctx context.Context, addr sdk.AccAddress, denom string) sdk.Coin
+    SpendableCoins(ctx context.Context, addr sdk.AccAddress) sdk.Coins
+}
+```
+
+## Messages
+
+### MsgSend
+
+Send coins from one address to another:
+
+```protobuf
+message MsgSend {
+    string from_address = 1;
+    string to_address = 2;
+    repeated cosmos.base.v1beta1.Coin amount = 3;
+}
+```
+
+**Validation**:
+- Coins must have sending enabled
+- Recipient address cannot be restricted
+- Sender must have sufficient balance
+
+### MsgMultiSend
+
+Send coins from one sender to multiple recipients:
+
+```protobuf
+message MsgMultiSend {
+    repeated Input inputs = 1;
+    repeated Output outputs = 2;
+}
+
+message Input {
+    string address = 1;
+    repeated cosmos.base.v1beta1.Coin coins = 2;
+}
+
+message Output {
+    string address = 1;
+    repeated cosmos.base.v1beta1.Coin coins = 2;
+}
+```
+
+## Parameters
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| DefaultSendEnabled | bool | Default value for whether transfers are enabled |
+| SendEnabled (deprecated) | []SendEnabled | List of specific denoms with custom send settings |
+
+## Events
+
+### MsgSend Events
+
+| Type | Attribute Key | Attribute Value |
+|------|---------------|----------------|
+| transfer | recipient | {recipientAddress} |
+| transfer | amount | {amount} |
+| message | module | bank |
+| message | action | send |
+| message | sender | {senderAddress} |
+
+### Keeper Events
+
+#### MintCoins
+
+```json
+{
+  "type": "coinbase",
+  "attributes": [
+    {"key": "minter", "value": "{moduleAccount}"},
+    {"key": "amount", "value": "{coins}"}
+  ]
+}
+```
+
+#### BurnCoins
+
+```json
+{
+  "type": "burn",
+  "attributes": [
+    {"key": "burner", "value": "{moduleAccount}"},
+    {"key": "amount", "value": "{coins}"}
+  ]
+}
+```
+
+## Queries
+
+### Balance Query
+
+```bash
+simd query bank balances cosmos1...
+```
+
+Example output:
+```yaml
+balances:
+- amount: "1000000000"
+  denom: stake
+pagination:
+  next_key: null
+  total: "0"
+```
+
+### Total Supply
+
+```bash
+simd query bank total --denom stake
+```
+
+### Denomination Metadata
+
+```bash
+simd query bank denom-metadata --denom stake
+```
+
+### Send Enabled
+
+```bash
+simd query bank send-enabled
+```
+
+## Transactions
+
+### Send Tokens
+
+```bash
+simd tx bank send [from] [to] [amount] --from [key]
+```
+
+Example:
+```bash
+simd tx bank send cosmos1... cosmos1... 100stake --from mykey
+```
+
+## gRPC Endpoints
+
+### Balance
+
+```bash
+grpcurl -plaintext \
+    -d '{"address":"cosmos1..","denom":"stake"}' \
+    localhost:9090 \
+    cosmos.bank.v1beta1.Query/Balance
+```
+
+### AllBalances
+
+```bash
+grpcurl -plaintext \
+    -d '{"address":"cosmos1.."}' \
+    localhost:9090 \
+    cosmos.bank.v1beta1.Query/AllBalances
+```
+
+### TotalSupply
+
+```bash
+grpcurl -plaintext \
+    localhost:9090 \
+    cosmos.bank.v1beta1.Query/TotalSupply
+```
+
+## Code Examples
+
+### Send Coins
+
+```go
+// Send coins from one account to another
+fromAddr := sdk.AccAddress([]byte("from"))
+toAddr := sdk.AccAddress([]byte("to"))
+amount := sdk.NewCoins(sdk.NewInt64Coin("stake", 100))
+
+err := bankKeeper.SendCoins(ctx, fromAddr, toAddr, amount)
+if err != nil {
+    return err
+}
+```
+
+### Mint Coins to Module
+
+```go
+// Mint coins to a module account
+amount := sdk.NewCoins(sdk.NewInt64Coin("stake", 1000))
+err := bankKeeper.MintCoins(ctx, "mint", amount)
+if err != nil {
+    return err
+}
+```
+
+### Transfer from Module to Account
+
+```go
+// Transfer from module to user account
+recipient := sdk.AccAddress([]byte("recipient"))
+amount := sdk.NewCoins(sdk.NewInt64Coin("stake", 100))
+
+err := bankKeeper.SendCoinsFromModuleToAccount(ctx, "distribution", recipient, amount)
+if err != nil {
+    return err
+}
+```
+
+### Query Balance
+
+```go
+// Get balance for specific denomination
+addr := sdk.AccAddress([]byte("address"))
+balance := bankKeeper.GetBalance(ctx, addr, "stake")
+
+// Get all balances
+allBalances := bankKeeper.GetAllBalances(ctx, addr)
+```
+
+### Check Spendable Balance
+
+```go
+// Get spendable coins (excluding locked/vesting)
+addr := sdk.AccAddress([]byte("address"))
+spendable := bankKeeper.SpendableCoins(ctx, addr)
+```
+
+## Send Restrictions
+
+Custom send restrictions can be added to control token transfers:
+
+```go
+type SendRestrictionFn func(
+    ctx context.Context,
+    fromAddr, toAddr sdk.AccAddress,
+    amt sdk.Coins,
+) (newToAddr sdk.AccAddress, err error)
+
+// Add restriction
+bankKeeper.AppendSendRestriction(myRestrictionFn)
+
+// Prepend restriction
+bankKeeper.PrependSendRestriction(myRestrictionFn)
+```
+
+## CLI Commands Reference
+
+| Command | Description |
+|---------|-------------|
+| `simd query bank balances [address]` | Query account balances |
+| `simd query bank total` | Query total supply |
+| `simd query bank denom-metadata` | Query denomination metadata |
+| `simd query bank send-enabled` | Query send enabled settings |
+| `simd tx bank send [from] [to] [amount]` | Send tokens |
+
+## Integration Guide
+
+```go
+// Initialize bank keeper
+app.BankKeeper = bankkeeper.NewBaseKeeper(
+    appCodec,
+    runtime.NewKVStoreService(keys[banktypes.StoreKey]),
+    app.AccountKeeper,
+    blockedAddresses,
+    authtypes.NewModuleAddress(govtypes.ModuleName).String(),
+    logger,
+)
+
+// Register module
+app.ModuleManager = module.NewManager(
+    bank.NewAppModule(appCodec, app.BankKeeper, app.AccountKeeper),
+    // other modules...
+)
+```

@@ -1,0 +1,292 @@
+---
+title: Accounts
+description: Understanding account types, address formats, and account management in Cosmos SDK
+---
+
+# Accounts
+
+Accounts are core primitives in Cosmos SDK that represent user identities and store state. Every transaction must be signed by an account, and accounts hold balances, sequence numbers, and public keys.
+
+## Account Types
+
+Cosmos SDK provides several account types to support different use cases.
+
+### BaseAccount
+
+The `BaseAccount` is the fundamental account type that implements the `AccountI` interface. It contains the essential fields required for transaction processing.
+
+```go types/address.go
+// BaseAccount structure from x/auth/types/account.go
+type BaseAccount struct {
+    Address       string          // Bech32 encoded address
+    PubKey        *codectypes.Any // Public key (can be nil)
+    AccountNumber uint64          // Unique account identifier
+    Sequence      uint64          // Nonce for replay protection
+}
+```
+
+**Key fields:**
+- **Address**: Bech32-encoded string representation of the account address
+- **PubKey**: Protobuf `Any` wrapping the account's public key (set on first transaction)
+- **AccountNumber**: Globally unique identifier assigned when account is created
+- **Sequence**: Transaction counter for replay protection (increments with each tx)
+
+### Module Accounts
+
+Module accounts are special accounts controlled by modules rather than external users. They're used for holding tokens in escrow, collecting fees, and other module-specific operations.
+
+```go x/auth/types/account.go
+// Module account with permissions
+type ModuleAccount struct {
+    *BaseAccount
+    Name        string   // Module name
+    Permissions []string // e.g., "minter", "burner"
+}
+
+// Create a module account
+func NewModuleAddress(name string) sdk.AccAddress {
+    return address.Module(name)
+}
+```
+
+**Common module accounts:**
+- **fee_collector**: Collects transaction fees
+- **distribution**: Holds tokens for validator rewards
+- **bonded_tokens_pool**: Holds bonded staking tokens
+- **not_bonded_tokens_pool**: Holds unbonding tokens
+
+## Address Formats
+
+Cosmos SDK uses Bech32 encoding for human-readable addresses with different prefixes for different address types.
+
+### Address Types
+
+```go types/address.go
+// Address type definitions
+type AccAddress []byte    // Account address
+type ValAddress []byte    // Validator operator address
+type ConsAddress []byte   // Consensus node address
+```
+
+### Bech32 Prefixes
+
+Default prefixes (can be customized per chain):
+
+```go types/address.go
+const (
+    Bech32MainPrefix = "cosmos"
+    
+    // Account addresses and keys
+    Bech32PrefixAccAddr = "cosmos"      // cosmos1...
+    Bech32PrefixAccPub  = "cosmospub"   // cosmospub1...
+    
+    // Validator operator addresses and keys
+    Bech32PrefixValAddr = "cosmosvaloper"    // cosmosvaloper1...
+    Bech32PrefixValPub  = "cosmosvaloperpub" // cosmosvaloperpub1...
+    
+    // Consensus addresses and keys
+    Bech32PrefixConsAddr = "cosmosvalcons"    // cosmosvalcons1...
+    Bech32PrefixConsPub  = "cosmosvalconspub" // cosmosvalconspub1...
+)
+```
+
+### Address Derivation
+
+**HD Wallet Path (BIP-44):**
+
+```go types/address.go
+const (
+    Purpose = 44  // BIP-44
+    CoinType = 118 // ATOM coin type
+    FullFundraiserPath = "m/44'/118'/0'/0/0"
+)
+```
+
+**Address generation:**
+1. Derive private key from mnemonic using HD path
+2. Generate public key from private key
+3. Hash public key with SHA-256, then RIPEMD-160 (20 bytes)
+4. Encode with Bech32 using appropriate prefix
+
+### Working with Addresses
+
+```go
+// Parse from Bech32 string
+addr, err := sdk.AccAddressFromBech32("cosmos1...")
+if err != nil {
+    return err
+}
+
+// Convert to string
+strAddr := addr.String() // Returns Bech32 encoded
+
+// Get raw bytes
+rawBytes := addr.Bytes()
+
+// Verify address format
+if err := sdk.VerifyAddressFormat(addr); err != nil {
+    return err
+}
+
+// Check if empty
+if addr.Empty() {
+    // Handle empty address
+}
+
+// Compare addresses
+if addr1.Equals(addr2) {
+    // Addresses are equal
+}
+```
+
+### Validator Addresses
+
+```go
+// Validator operator address
+valAddr, err := sdk.ValAddressFromBech32("cosmosvaloper1...")
+
+// Consensus address from public key
+pubKey := validator.GetConsPubKey()
+consAddr := sdk.GetConsAddress(pubKey)
+```
+
+## Address Validation
+
+The SDK validates addresses to prevent errors:
+
+```go types/address.go
+func VerifyAddressFormat(bz []byte) error {
+    verifier := GetConfig().GetAddressVerifier()
+    if verifier != nil {
+        return verifier(bz)
+    }
+    
+    // Default validation
+    if len(bz) == 0 {
+        return errors.New("addresses cannot be empty")
+    }
+    
+    if len(bz) > address.MaxAddrLen {
+        return fmt.Errorf("address max length is %d, got %d", 
+            address.MaxAddrLen, len(bz))
+    }
+    
+    return nil
+}
+```
+
+**Address constraints:**
+- Cannot be empty
+- Maximum length: 255 bytes (typically 20 bytes for standard accounts)
+- Must use valid Bech32 encoding
+- Prefix must match expected type
+
+## Account Management
+
+### Creating Accounts
+
+Accounts are created implicitly when they receive tokens:
+
+```go
+// Create a new base account
+func NewBaseAccount(
+    address sdk.AccAddress,
+    pubKey cryptotypes.PubKey,
+    accountNumber, sequence uint64,
+) *BaseAccount {
+    return &BaseAccount{
+        Address:       address.String(),
+        PubKey:        codectypes.NewAnyWithValue(pubKey),
+        AccountNumber: accountNumber,
+        Sequence:      sequence,
+    }
+}
+```
+
+### Account Numbers and Sequences
+
+**Account Number:**
+- Globally unique identifier
+- Assigned when account is first created
+- Never changes
+- Used in transaction signing
+
+**Sequence:**
+- Transaction counter (nonce)
+- Starts at 0
+- Increments with each successful transaction
+- Prevents replay attacks
+- Must be included correctly in transaction signatures
+
+### Account Retrieval
+
+```go
+// Get account from keeper
+account := accountKeeper.GetAccount(ctx, address)
+if account == nil {
+    return errors.New("account not found")
+}
+
+// Get account number and sequence
+accNum := account.GetAccountNumber()
+sequence := account.GetSequence()
+
+// Get public key (may be nil if account never sent tx)
+pubKey := account.GetPubKey()
+```
+
+## Address Caching
+
+The SDK caches Bech32 address string conversions for performance:
+
+```go types/address.go
+// Address caching is enabled by default
+func SetAddrCacheEnabled(enabled bool)
+func IsAddrCacheEnabled() bool
+
+// Cache sizes:
+// - Account addresses: 60,000 entries
+// - Validator addresses: 500 entries
+// - Consensus addresses: 500 entries
+```
+
+The cache uses LRU eviction and significantly improves performance for repeated address operations.
+
+## Custom Address Derivation
+
+Chains can customize address prefixes:
+
+```go
+// In app initialization
+config := sdk.GetConfig()
+config.SetBech32PrefixForAccount(
+    "mychain",    // Account address prefix
+    "mychainpub", // Account public key prefix
+)
+config.SetBech32PrefixForValidator(
+    "mychainvaloper",    // Validator operator prefix
+    "mychainvaloperpub", // Validator public key prefix
+)
+config.SetBech32PrefixForConsensusNode(
+    "mychainvalcons",    // Consensus address prefix
+    "mychainvalconspub", // Consensus public key prefix
+)
+config.SetCoinType(118) // Set coin type for HD derivation
+config.Seal() // Prevent further modifications
+```
+
+## Best Practices
+
+1. **Always validate addresses** before using them in transactions
+2. **Cache address strings** when performing repeated operations
+3. **Use type-safe address types** (AccAddress, ValAddress, ConsAddress)
+4. **Handle nil public keys** gracefully (accounts may not have sent transactions yet)
+5. **Never hardcode address prefixes** - use the config system
+6. **Verify sequence numbers** to prevent replay attacks
+7. **Use module accounts** for holding tokens on behalf of modules
+
+## Related Concepts
+
+- [Gas and Fees](/concepts/gas-fees) - Transaction costs and fee payment
+- [Transactions](/essentials/transactions) - Creating and signing transactions
+- [Authentication](/modules/auth) - Account authentication and management

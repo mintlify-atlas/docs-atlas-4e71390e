@@ -1,0 +1,561 @@
+---
+title: Staking Module
+description: Proof-of-Stake system for validator management and delegation
+---
+
+# Staking Module (x/staking)
+
+## Overview
+
+The `x/staking` module enables Cosmos SDK-based blockchains to support an advanced Proof-of-Stake (PoS) system where token holders can become validators or delegate tokens to validators.
+
+**Purpose**: Manage validator set, handle delegations, and facilitate the Proof-of-Stake consensus mechanism.
+
+## Key Features
+
+- **Validator Management**: Create, edit, and track validators
+- **Delegation**: Delegate tokens to validators for staking rewards  
+- **Unbonding**: Safely unbond tokens with time delay
+- **Redelegation**: Move delegations between validators instantly
+- **Slashing Integration**: Penalize validator misbehavior
+- **Dynamic Validator Set**: Automatically update active validators
+
+## Validator States
+
+Validators can be in one of three states:
+
+### Unbonded
+- Not in active set
+- Cannot sign blocks
+- Do not earn rewards
+- Can receive delegations
+
+### Bonded
+- In active set
+- Sign blocks and receive rewards
+- Can be slashed for misbehavior
+- Delegations have unbonding period
+
+### Unbonding
+- Leaving active set
+- All delegations begin unbonding
+- Still slashable during unbonding period
+- Duration defined by `UnbondingTime` parameter
+
+## State
+
+### Pool
+
+Tracks bonded and not-bonded token supply:
+- **BondedPool**: Tokens from bonded validators
+- **NotBondedPool**: Tokens from unbonding/unbonded validators
+
+### Validators
+
+**Storage Keys**:
+```
+0x21 | OperatorAddr -> ProtocolBuffer(validator)
+0x22 | ConsAddr -> OperatorAddr
+0x23 | BigEndian(Power) | OperatorAddr -> OperatorAddr
+0x11 | OperatorAddr -> ProtocolBuffer(Power)
+```
+
+```protobuf
+message Validator {
+    string operator_address = 1;
+    google.protobuf.Any consensus_pubkey = 2;
+    bool jailed = 3;
+    BondStatus status = 4;
+    string tokens = 5;
+    string delegator_shares = 6;
+    Description description = 7;
+    int64 unbonding_height = 8;
+    google.protobuf.Timestamp unbonding_time = 9;
+    Commission commission = 10;
+    string min_self_delegation = 11;
+}
+```
+
+### Delegation
+
+**Storage**: `0x31 | DelegatorAddr | ValidatorAddr -> ProtocolBuffer(delegation)`
+
+```protobuf
+message Delegation {
+    string delegator_address = 1;
+    string validator_address = 2;
+    string shares = 3;
+}
+```
+
+#### Delegator Shares
+
+Shares are issued based on exchange rate:
+```
+SharesPerToken = validator.TotalShares() / validator.Tokens()
+TokensPerShare = validator.Tokens() / validator.TotalShares()
+```
+
+### UnbondingDelegation
+
+**Storage**: `0x32 | DelegatorAddr | ValidatorAddr -> ProtocolBuffer(unbondingDelegation)`
+
+```protobuf
+message UnbondingDelegation {
+    string delegator_address = 1;
+    string validator_address = 2;
+    repeated UnbondingDelegationEntry entries = 3;
+}
+
+message UnbondingDelegationEntry {
+    int64 creation_height = 1;
+    google.protobuf.Timestamp completion_time = 2;
+    string initial_balance = 3;
+    string balance = 4;
+    uint64 unbonding_id = 5;
+}
+```
+
+### Redelegation
+
+**Storage**: `0x34 | DelegatorAddr | ValidatorSrcAddr | ValidatorDstAddr -> ProtocolBuffer(redelegation)`
+
+```protobuf
+message Redelegation {
+    string delegator_address = 1;
+    string validator_src_address = 2;
+    string validator_dst_address = 3;
+    repeated RedelegationEntry entries = 4;
+}
+
+message RedelegationEntry {
+    int64 creation_height = 1;
+    google.protobuf.Timestamp completion_time = 2;
+    string initial_balance = 3;
+    string shares_dst = 4;
+    uint64 unbonding_id = 5;
+}
+```
+
+## Parameters
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| UnbondingTime | Duration | 1814400s (21 days) | Time for unbonding completion |
+| MaxValidators | uint32 | 100 | Maximum active validators |
+| MaxEntries | uint32 | 7 | Max unbonding/redelegation entries |
+| HistoricalEntries | uint32 | 10000 | Historical info entries to persist |
+| BondDenom | string | "stake" | Denomination for staking |
+| MinCommissionRate | Dec | "0" | Minimum validator commission rate |
+
+## Messages
+
+### MsgCreateValidator
+
+Create a new validator:
+
+```protobuf
+message MsgCreateValidator {
+    Description description = 1;
+    CommissionRates commission = 2;
+    string min_self_delegation = 3;
+    string delegator_address = 4;
+    string validator_address = 5;
+    google.protobuf.Any pubkey = 6;
+    Coin value = 7;
+}
+```
+
+**Usage**:
+```bash
+simd tx staking create-validator \
+    --amount=1000000stake \
+    --pubkey=$(simd tendermint show-validator) \
+    --moniker="my-validator" \
+    --commission-rate="0.10" \
+    --commission-max-rate="0.20" \
+    --commission-max-change-rate="0.01" \
+    --min-self-delegation="1" \
+    --from=mykey
+```
+
+### MsgEditValidator
+
+Edit validator description and commission:
+
+```protobuf
+message MsgEditValidator {
+    Description description = 1;
+    string validator_address = 2;
+    string commission_rate = 3;
+    string min_self_delegation = 4;
+}
+```
+
+**Usage**:
+```bash
+simd tx staking edit-validator \
+    --moniker="updated-moniker" \
+    --commission-rate="0.15" \
+    --from=mykey
+```
+
+### MsgDelegate
+
+Delegate tokens to a validator:
+
+```protobuf
+message MsgDelegate {
+    string delegator_address = 1;
+    string validator_address = 2;
+    Coin amount = 3;
+}
+```
+
+**Usage**:
+```bash
+simd tx staking delegate cosmosvaloper1... 1000000stake --from=mykey
+```
+
+### MsgUndelegate
+
+Unbond delegation from validator:
+
+```protobuf
+message MsgUndelegate {
+    string delegator_address = 1;
+    string validator_address = 2;
+    Coin amount = 3;
+}
+```
+
+**Usage**:
+```bash
+simd tx staking unbond cosmosvaloper1... 1000000stake --from=mykey
+```
+
+### MsgBeginRedelegate
+
+Redelegate tokens to different validator:
+
+```protobuf
+message MsgBeginRedelegate {
+    string delegator_address = 1;
+    string validator_src_address = 2;
+    string validator_dst_address = 3;
+    Coin amount = 4;
+}
+```
+
+**Usage**:
+```bash
+simd tx staking redelegate \
+    cosmosvaloper1... \
+    cosmosvaloper2... \
+    1000000stake \
+    --from=mykey
+```
+
+### MsgCancelUnbondingDelegation
+
+Cancel unbonding and re-delegate:
+
+```protobuf
+message MsgCancelUnbondingDelegation {
+    string delegator_address = 1;
+    string validator_address = 2;
+    Coin amount = 3;
+    int64 creation_height = 4;
+}
+```
+
+## Queries
+
+### Query Validator
+
+```bash
+simd query staking validator cosmosvaloper1...
+```
+
+### Query Validators
+
+```bash
+simd query staking validators
+```
+
+### Query Delegation
+
+```bash
+simd query staking delegation cosmos1... cosmosvaloper1...
+```
+
+### Query Delegations
+
+```bash
+# All delegations for delegator
+simd query staking delegations cosmos1...
+
+# All delegations to validator
+simd query staking delegations-to cosmosvaloper1...
+```
+
+### Query Unbonding Delegation
+
+```bash
+simd query staking unbonding-delegation cosmos1... cosmosvaloper1...
+```
+
+### Query Redelegation
+
+```bash
+simd query staking redelegation cosmos1... cosmosvaloper1... cosmosvaloper2...
+```
+
+### Query Pool
+
+```bash
+simd query staking pool
+```
+
+Example output:
+```yaml
+bonded_tokens: "10000000"
+not_bonded_tokens: "0"
+```
+
+### Query Parameters
+
+```bash
+simd query staking params
+```
+
+### Query Historical Info
+
+```bash
+simd query staking historical-info 100
+```
+
+## gRPC Endpoints
+
+### Validator
+
+```bash
+grpcurl -plaintext \
+    -d '{"validator_addr":"cosmosvaloper1.."}' \
+    localhost:9090 \
+    cosmos.staking.v1beta1.Query/Validator
+```
+
+### Validators
+
+```bash
+grpcurl -plaintext \
+    localhost:9090 \
+    cosmos.staking.v1beta1.Query/Validators
+```
+
+### Delegation
+
+```bash
+grpcurl -plaintext \
+    -d '{"delegator_addr":"cosmos1..","validator_addr":"cosmosvaloper1.."}' \
+    localhost:9090 \
+    cosmos.staking.v1beta1.Query/Delegation
+```
+
+### Pool
+
+```bash
+grpcurl -plaintext \
+    localhost:9090 \
+    cosmos.staking.v1beta1.Query/Pool
+```
+
+## Events
+
+### MsgCreateValidator
+
+| Type | Attribute Key | Attribute Value |
+|------|---------------|----------------|
+| create_validator | validator | {validatorAddress} |
+| create_validator | amount | {delegationAmount} |
+| message | module | staking |
+| message | action | create_validator |
+| message | sender | {senderAddress} |
+
+### MsgDelegate
+
+| Type | Attribute Key | Attribute Value |
+|------|---------------|----------------|
+| delegate | validator | {validatorAddress} |
+| delegate | amount | {delegationAmount} |
+| message | module | staking |
+| message | action | delegate |
+| message | sender | {senderAddress} |
+
+### EndBlocker
+
+| Type | Attribute Key | Attribute Value |
+|------|---------------|----------------|
+| complete_unbonding | amount | {totalUnbondingAmount} |
+| complete_unbonding | validator | {validatorAddress} |
+| complete_unbonding | delegator | {delegatorAddress} |
+| complete_redelegation | amount | {totalRedelegationAmount} |
+| complete_redelegation | source_validator | {srcValidatorAddress} |
+| complete_redelegation | destination_validator | {dstValidatorAddress} |
+
+## Code Examples
+
+### Create Validator
+
+```go
+// Create validator
+valAddr := sdk.ValAddress(operatorAddr)
+pubKey := ed25519.GenPrivKey().PubKey()
+
+commission := stakingtypes.NewCommissionRates(
+    sdk.NewDecWithPrec(10, 2), // 10% rate
+    sdk.NewDecWithPrec(20, 2), // 20% max rate  
+    sdk.NewDecWithPrec(1, 2),  // 1% max change
+)
+
+description := stakingtypes.Description{
+    Moniker:  "My Validator",
+    Identity: "keybase-id",
+    Website:  "https://example.com",
+    Details:  "Validator details",
+}
+
+msg := stakingtypes.NewMsgCreateValidator(
+    valAddr,
+    pubKey,
+    sdk.NewCoin("stake", sdk.NewInt(1000000)),
+    description,
+    commission,
+    sdk.OneInt(),
+)
+```
+
+### Delegate Tokens
+
+```go
+// Delegate to validator
+delAddr := sdk.AccAddress([]byte("delegator"))
+valAddr := sdk.ValAddress([]byte("validator"))
+amount := sdk.NewCoin("stake", sdk.NewInt(100000))
+
+msg := stakingtypes.NewMsgDelegate(delAddr, valAddr, amount)
+```
+
+### Query Delegation
+
+```go
+// Get delegation
+del, found := stakingKeeper.GetDelegation(ctx, delAddr, valAddr)
+if !found {
+    return fmt.Errorf("delegation not found")
+}
+
+// Get delegation tokens
+val := stakingKeeper.Validator(ctx, valAddr)
+tokens := val.TokensFromShares(del.Shares)
+fmt.Printf("Delegated tokens: %s\n", tokens)
+```
+
+### Unbond Delegation
+
+```go
+// Unbond from validator
+amount := sdk.NewCoin("stake", sdk.NewInt(50000))
+msg := stakingtypes.NewMsgUndelegate(delAddr, valAddr, amount)
+
+// Process unbonding
+completionTime, err := stakingKeeper.Undelegate(ctx, delAddr, valAddr, shares)
+if err != nil {
+    return err
+}
+
+fmt.Printf("Unbonding completes at: %s\n", completionTime)
+```
+
+### Redelegate
+
+```go
+// Redelegate to new validator
+srcValAddr := sdk.ValAddress([]byte("source"))
+dstValAddr := sdk.ValAddress([]byte("destination"))
+amount := sdk.NewCoin("stake", sdk.NewInt(50000))
+
+msg := stakingtypes.NewMsgBeginRedelegate(
+    delAddr,
+    srcValAddr,
+    dstValAddr,
+    amount,
+)
+```
+
+## Hooks
+
+The staking module provides hooks for other modules:
+
+```go
+type StakingHooks interface {
+    AfterValidatorCreated(ctx context.Context, valAddr sdk.ValAddress) error
+    BeforeValidatorModified(ctx context.Context, valAddr sdk.ValAddress) error
+    AfterValidatorRemoved(ctx context.Context, consAddr sdk.ConsAddress, valAddr sdk.ValAddress) error
+    AfterValidatorBonded(ctx context.Context, consAddr sdk.ConsAddress, valAddr sdk.ValAddress) error
+    AfterValidatorBeginUnbonding(ctx context.Context, consAddr sdk.ConsAddress, valAddr sdk.ValAddress) error
+    BeforeDelegationCreated(ctx context.Context, delAddr sdk.AccAddress, valAddr sdk.ValAddress) error
+    BeforeDelegationSharesModified(ctx context.Context, delAddr sdk.AccAddress, valAddr sdk.ValAddress) error
+    BeforeDelegationRemoved(ctx context.Context, delAddr sdk.AccAddress, valAddr sdk.ValAddress) error
+    AfterDelegationModified(ctx context.Context, delAddr sdk.AccAddress, valAddr sdk.ValAddress) error
+    BeforeValidatorSlashed(ctx context.Context, valAddr sdk.ValAddress, fraction sdk.Dec) error
+    AfterUnbondingInitiated(ctx context.Context, id uint64) error
+}
+```
+
+## CLI Commands Reference
+
+| Command | Description |
+|---------|-------------|
+| `simd query staking validator [addr]` | Query validator |
+| `simd query staking validators` | Query all validators |
+| `simd query staking delegation [del] [val]` | Query delegation |
+| `simd query staking delegations [delegator]` | Query delegations |
+| `simd query staking unbonding-delegation [del] [val]` | Query unbonding |
+| `simd query staking pool` | Query staking pool |
+| `simd query staking params` | Query parameters |
+| `simd tx staking create-validator` | Create validator |
+| `simd tx staking edit-validator` | Edit validator |
+| `simd tx staking delegate [val] [amount]` | Delegate tokens |
+| `simd tx staking unbond [val] [amount]` | Unbond delegation |
+| `simd tx staking redelegate [src] [dst] [amount]` | Redelegate tokens |
+
+## Integration Guide
+
+```go
+// Initialize staking keeper
+app.StakingKeeper = stakingkeeper.NewKeeper(
+    appCodec,
+    runtime.NewKVStoreService(keys[stakingtypes.StoreKey]),
+    app.AccountKeeper,
+    app.BankKeeper,
+    authtypes.NewModuleAddress(govtypes.ModuleName).String(),
+    authcodec.NewBech32Codec(sdk.Bech32PrefixValAddr),
+    authcodec.NewBech32Codec(sdk.Bech32PrefixConsAddr),
+)
+
+// Register module
+app.ModuleManager = module.NewManager(
+    staking.NewAppModule(appCodec, &app.StakingKeeper, app.AccountKeeper, app.BankKeeper),
+    // other modules...
+)
+
+// Set hooks
+app.StakingKeeper.SetHooks(
+    stakingtypes.NewMultiStakingHooks(
+        app.DistrKeeper.Hooks(),
+        app.SlashingKeeper.Hooks(),
+    ),
+)
+```

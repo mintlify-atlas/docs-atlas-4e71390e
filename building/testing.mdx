@@ -1,0 +1,616 @@
+---
+title: Testing Cosmos SDK Applications
+description: Learn testing strategies for Cosmos SDK applications including unit tests, integration tests, and simulation
+---
+
+# Testing Cosmos SDK Applications
+
+Testing is critical for blockchain applications. The Cosmos SDK provides several testing utilities and patterns to help you build robust applications.
+
+## Testing Approaches
+
+The SDK supports multiple testing levels:
+
+1. **Unit Tests** - Test individual keepers and functions
+2. **Integration Tests** - Test module interactions
+3. **Simulation Tests** - Randomized testing for edge cases
+4. **End-to-End Tests** - Full chain testing
+
+## Unit Testing
+
+### Setting Up Test Applications
+
+Create minimal test applications for unit testing from `simapp/test_helpers.go:40-51`:
+
+```go
+func setup(withGenesis bool, invCheckPeriod uint) (*SimApp, GenesisState) {
+    db := dbm.NewMemDB()
+
+    appOptions := make(simtestutil.AppOptionsMap, 0)
+    appOptions[flags.FlagHome] = DefaultNodeHome
+
+    app := NewSimApp(log.NewNopLogger(), db, nil, true, appOptions)
+    if withGenesis {
+        return app, app.DefaultGenesis()
+    }
+    return app, GenesisState{}
+}
+```
+
+### Creating Test Instances
+
+Build test apps with custom options from `simapp/test_helpers.go:54-92`:
+
+```go
+func NewSimappWithCustomOptions(
+    t *testing.T, 
+    isCheckTx bool, 
+    options SetupOptions,
+) *SimApp {
+    t.Helper()
+
+    privVal := mock.NewPV()
+    pubKey, err := privVal.GetPubKey()
+    require.NoError(t, err)
+    
+    // Create validator set with single validator
+    validator := cmttypes.NewValidator(pubKey, 1)
+    valSet := cmttypes.NewValidatorSet([]*cmttypes.Validator{validator})
+
+    // Generate genesis account
+    senderPrivKey := secp256k1.GenPrivKey()
+    acc := authtypes.NewBaseAccount(
+        senderPrivKey.PubKey().Address().Bytes(), 
+        senderPrivKey.PubKey(), 
+        0, 
+        0,
+    )
+    balance := banktypes.Balance{
+        Address: acc.GetAddress().String(),
+        Coins:   sdk.NewCoins(
+            sdk.NewCoin(sdk.DefaultBondDenom, sdkmath.NewInt(100000000000000)),
+        ),
+    }
+
+    app := NewSimApp(options.Logger, options.DB, nil, true, options.AppOpts)
+    genesisState := app.DefaultGenesis()
+    genesisState, err = simtestutil.GenesisStateWithValSet(
+        app.AppCodec(), 
+        genesisState, 
+        valSet, 
+        []authtypes.GenesisAccount{acc}, 
+        balance,
+    )
+    require.NoError(t, err)
+
+    if !isCheckTx {
+        stateBytes, err := cmtjson.MarshalIndent(genesisState, "", " ")
+        require.NoError(t, err)
+
+        // Initialize the chain
+        _, err = app.InitChain(&abci.RequestInitChain{
+            Validators:      []abci.ValidatorUpdate{},
+            ConsensusParams: simtestutil.DefaultConsensusParams,
+            AppStateBytes:   stateBytes,
+        })
+        require.NoError(t, err)
+    }
+
+    return app
+}
+```
+
+### Simple Test Helper
+
+Create a basic test app from `simapp/test_helpers.go:95-117`:
+
+```go
+func Setup(t *testing.T, isCheckTx bool) *SimApp {
+    t.Helper()
+
+    privVal := mock.NewPV()
+    pubKey, err := privVal.GetPubKey()
+    require.NoError(t, err)
+
+    validator := cmttypes.NewValidator(pubKey, 1)
+    valSet := cmttypes.NewValidatorSet([]*cmttypes.Validator{validator})
+
+    senderPrivKey := secp256k1.GenPrivKey()
+    acc := authtypes.NewBaseAccount(
+        senderPrivKey.PubKey().Address().Bytes(), 
+        senderPrivKey.PubKey(), 
+        0, 
+        0,
+    )
+    balance := banktypes.Balance{
+        Address: acc.GetAddress().String(),
+        Coins:   sdk.NewCoins(
+            sdk.NewCoin(sdk.DefaultBondDenom, sdkmath.NewInt(100000000000000)),
+        ),
+    }
+
+    app := SetupWithGenesisValSet(t, valSet, []authtypes.GenesisAccount{acc}, balance)
+    return app
+}
+```
+
+## Integration Testing
+
+The `testutil/integration` package provides a lightweight testing framework.
+
+### Integration App Structure
+
+From `testutil/integration/router.go:32-40`:
+
+```go
+type App struct {
+    *baseapp.BaseApp
+
+    ctx           sdk.Context
+    logger        log.Logger
+    moduleManager module.Manager
+    queryHelper   *baseapp.QueryServiceTestHelper
+}
+```
+
+### Creating Integration Apps
+
+From `testutil/integration/router.go:44-120`:
+
+```go
+func NewIntegrationApp(
+    sdkCtx sdk.Context,
+    logger log.Logger,
+    keys map[string]*storetypes.KVStoreKey,
+    appCodec codec.Codec,
+    modules map[string]appmodule.AppModule,
+    baseAppOptions ...func(*baseapp.BaseApp),
+) *App {
+    db := dbm.NewMemDB()
+
+    interfaceRegistry := codectypes.NewInterfaceRegistry()
+    moduleManager := module.NewManagerFromMap(modules)
+    basicModuleManager := module.NewBasicManagerFromManager(moduleManager, nil)
+    basicModuleManager.RegisterInterfaces(interfaceRegistry)
+
+    txConfig := authtx.NewTxConfig(
+        codec.NewProtoCodec(interfaceRegistry), 
+        authtx.DefaultSignModes,
+    )
+    bApp := baseapp.NewBaseApp(
+        appName, 
+        logger, 
+        db, 
+        txConfig.TxDecoder(), 
+        baseAppOptions...,
+    )
+    bApp.MountKVStores(keys)
+
+    bApp.SetInitChainer(func(_ sdk.Context, _ *cmtabcitypes.RequestInitChain) (
+        *cmtabcitypes.ResponseInitChain, error,
+    ) {
+        for _, mod := range modules {
+            if m, ok := mod.(module.HasGenesis); ok {
+                m.InitGenesis(sdkCtx, appCodec, m.DefaultGenesis(appCodec))
+            }
+        }
+        return &cmtabcitypes.ResponseInitChain{}, nil
+    })
+
+    router := baseapp.NewMsgServiceRouter()
+    router.SetInterfaceRegistry(interfaceRegistry)
+    bApp.SetMsgServiceRouter(router)
+
+    if err := bApp.LoadLatestVersion(); err != nil {
+        panic(err)
+    }
+
+    ctx := sdkCtx.WithBlockHeader(cmtproto.Header{ChainID: appName}).WithIsCheckTx(true)
+
+    return &App{
+        BaseApp:       bApp,
+        logger:        logger,
+        ctx:           ctx,
+        moduleManager: *moduleManager,
+        queryHelper:   baseapp.NewQueryServerTestHelper(ctx, interfaceRegistry),
+    }
+}
+```
+
+### Running Messages in Tests
+
+From `testutil/integration/router.go:128-169`:
+
+```go
+func (app *App) RunMsg(msg sdk.Msg, option ...Option) (*codectypes.Any, error) {
+    // Set options
+    cfg := &Config{}
+    for _, opt := range option {
+        opt(cfg)
+    }
+
+    if cfg.AutomaticCommit {
+        defer app.Commit()
+    }
+
+    if cfg.AutomaticFinalizeBlock {
+        height := app.LastBlockHeight() + 1
+        if _, err := app.FinalizeBlock(
+            &cmtabcitypes.RequestFinalizeBlock{Height: height},
+        ); err != nil {
+            return nil, fmt.Errorf("failed to run finalize block: %w", err)
+        }
+    }
+
+    app.logger.Info("Running msg", "msg", msg.String())
+
+    handler := app.MsgServiceRouter().Handler(msg)
+    if handler == nil {
+        return nil, fmt.Errorf(
+            "handler is nil, can't route message %s: %+v", 
+            sdk.MsgTypeURL(msg), 
+            msg,
+        )
+    }
+
+    msgResult, err := handler(app.ctx, msg)
+    if err != nil {
+        return nil, fmt.Errorf("failed to execute message %s: %w", 
+            sdk.MsgTypeURL(msg), err)
+    }
+
+    var response *codectypes.Any
+    if len(msgResult.MsgResponses) > 0 {
+        response = msgResult.MsgResponses[0]
+    }
+
+    return response, nil
+}
+```
+
+### Integration Test Example
+
+From `testutil/integration/example_test.go:30-116`:
+
+```go
+func Example() {
+    // Setup encoding config for testing modules
+    encodingCfg := moduletestutil.MakeTestEncodingConfig(
+        auth.AppModuleBasic{}, 
+        mint.AppModuleBasic{},
+    )
+    keys := storetypes.NewKVStoreKeys(authtypes.StoreKey, minttypes.StoreKey)
+    authority := authtypes.NewModuleAddress("gov").String()
+
+    logger := log.NewNopLogger()
+
+    cms := integration.CreateMultiStore(keys, logger)
+    newCtx := sdk.NewContext(cms, cmtproto.Header{}, true, logger)
+
+    // Create account keeper
+    accountKeeper := authkeeper.NewAccountKeeper(
+        encodingCfg.Codec,
+        runtime.NewKVStoreService(keys[authtypes.StoreKey]),
+        authtypes.ProtoBaseAccount,
+        map[string][]string{minttypes.ModuleName: {authtypes.Minter}},
+        addresscodec.NewBech32Codec("cosmos"),
+        "cosmos",
+        authority,
+    )
+
+    authModule := auth.NewAppModule(
+        encodingCfg.Codec, 
+        accountKeeper, 
+        authsims.RandomGenesisAccounts, 
+        nil,
+    )
+
+    // Create mint keeper
+    mintKeeper := mintkeeper.NewKeeper(
+        encodingCfg.Codec, 
+        runtime.NewKVStoreService(keys[minttypes.StoreKey]), 
+        nil, 
+        accountKeeper, 
+        nil, 
+        authtypes.FeeCollectorName, 
+        authority,
+    )
+    mintModule := mint.NewAppModule(
+        encodingCfg.Codec, 
+        mintKeeper, 
+        accountKeeper, 
+        nil, 
+        nil,
+    )
+
+    // Create integration app
+    integrationApp := integration.NewIntegrationApp(
+        newCtx,
+        logger,
+        keys,
+        encodingCfg.Codec,
+        map[string]appmodule.AppModule{
+            authtypes.ModuleName: authModule,
+            minttypes.ModuleName: mintModule,
+        },
+    )
+
+    // Register message servers
+    authtypes.RegisterMsgServer(
+        integrationApp.MsgServiceRouter(), 
+        authkeeper.NewMsgServerImpl(accountKeeper),
+    )
+    minttypes.RegisterMsgServer(
+        integrationApp.MsgServiceRouter(), 
+        mintkeeper.NewMsgServerImpl(mintKeeper),
+    )
+    minttypes.RegisterQueryServer(
+        integrationApp.QueryHelper(), 
+        mintkeeper.NewQueryServerImpl(mintKeeper),
+    )
+
+    // Run test message
+    params := minttypes.DefaultParams()
+    params.BlocksPerYear = 10000
+
+    result, err := integrationApp.RunMsg(&minttypes.MsgUpdateParams{
+        Authority: authority,
+        Params:    params,
+    })
+    if err != nil {
+        panic(err)
+    }
+
+    // Verify result
+    resp := minttypes.MsgUpdateParamsResponse{}
+    err = encodingCfg.Codec.Unmarshal(result.Value, &resp)
+    if err != nil {
+        panic(err)
+    }
+
+    // Check state
+    sdkCtx := sdk.UnwrapSDKContext(integrationApp.Context())
+    got, err := mintKeeper.Params.Get(sdkCtx)
+    if err != nil {
+        panic(err)
+    }
+
+    fmt.Println(got.BlocksPerYear)
+    // Output: 10000
+}
+```
+
+## Helper Functions for Testing
+
+### Adding Test Addresses
+
+From `simapp/test_helpers.go:185-203`:
+
+```go
+func AddTestAddrsIncremental(
+    app *SimApp, 
+    ctx sdk.Context, 
+    accNum int, 
+    accAmt sdkmath.Int,
+) []sdk.AccAddress {
+    return addTestAddrs(app, ctx, accNum, accAmt, simtestutil.CreateIncrementalAccounts)
+}
+
+func addTestAddrs(
+    app *SimApp, 
+    ctx sdk.Context, 
+    accNum int, 
+    accAmt sdkmath.Int, 
+    strategy simtestutil.GenerateAccountStrategy,
+) []sdk.AccAddress {
+    testAddrs := strategy(accNum)
+    bondDenom, err := app.StakingKeeper.BondDenom(ctx)
+    if err != nil {
+        panic(err)
+    }
+
+    initCoins := sdk.NewCoins(sdk.NewCoin(bondDenom, accAmt))
+
+    for _, addr := range testAddrs {
+        initAccountWithCoins(app, ctx, addr, initCoins)
+    }
+
+    return testAddrs
+}
+```
+
+### Initializing Test Accounts
+
+From `simapp/test_helpers.go:205-215`:
+
+```go
+func initAccountWithCoins(
+    app *SimApp, 
+    ctx sdk.Context, 
+    addr sdk.AccAddress, 
+    coins sdk.Coins,
+) {
+    err := app.BankKeeper.MintCoins(ctx, minttypes.ModuleName, coins)
+    if err != nil {
+        panic(err)
+    }
+
+    err = app.BankKeeper.SendCoinsFromModuleToAccount(
+        ctx, 
+        minttypes.ModuleName, 
+        addr, 
+        coins,
+    )
+    if err != nil {
+        panic(err)
+    }
+}
+```
+
+## Testing Genesis States
+
+From `simapp/test_helpers.go:155-181`:
+
+```go
+func GenesisStateWithSingleValidator(
+    t *testing.T, 
+    app *SimApp,
+) GenesisState {
+    t.Helper()
+
+    privVal := mock.NewPV()
+    pubKey, err := privVal.GetPubKey()
+    require.NoError(t, err)
+
+    validator := cmttypes.NewValidator(pubKey, 1)
+    valSet := cmttypes.NewValidatorSet([]*cmttypes.Validator{validator})
+
+    senderPrivKey := secp256k1.GenPrivKey()
+    acc := authtypes.NewBaseAccount(
+        senderPrivKey.PubKey().Address().Bytes(), 
+        senderPrivKey.PubKey(), 
+        0, 
+        0,
+    )
+    balances := []banktypes.Balance{
+        {
+            Address: acc.GetAddress().String(),
+            Coins:   sdk.NewCoins(
+                sdk.NewCoin(sdk.DefaultBondDenom, sdkmath.NewInt(100000000000000)),
+            ),
+        },
+    }
+
+    genesisState := app.DefaultGenesis()
+    genesisState, err = simtestutil.GenesisStateWithValSet(
+        app.AppCodec(), 
+        genesisState, 
+        valSet, 
+        []authtypes.GenesisAccount{acc}, 
+        balances...,
+    )
+    require.NoError(t, err)
+
+    return genesisState
+}
+```
+
+## Network Testing
+
+Create test networks for end-to-end testing from `simapp/test_helpers.go:218-247`:
+
+```go
+func NewTestNetworkFixture() network.TestFixture {
+    dir, err := os.MkdirTemp("", "simapp")
+    if err != nil {
+        panic(fmt.Sprintf("failed creating temporary directory: %v", err))
+    }
+    defer os.RemoveAll(dir)
+
+    app := NewSimApp(
+        log.NewNopLogger(), 
+        dbm.NewMemDB(), 
+        nil, 
+        true, 
+        simtestutil.NewAppOptionsWithFlagHome(dir),
+    )
+
+    appCtr := func(val network.ValidatorI) servertypes.Application {
+        return NewSimApp(
+            val.GetCtx().Logger, 
+            dbm.NewMemDB(), 
+            nil, 
+            true,
+            simtestutil.NewAppOptionsWithFlagHome(
+                val.GetCtx().Config.RootDir,
+            ),
+            bam.SetPruning(pruningtypes.NewPruningOptionsFromString(
+                val.GetAppConfig().Pruning,
+            )),
+            bam.SetMinGasPrices(val.GetAppConfig().MinGasPrices),
+            bam.SetChainID(val.GetCtx().Viper.GetString(flags.FlagChainID)),
+        )
+    }
+
+    return network.TestFixture{
+        AppConstructor: appCtr,
+        GenesisState:   app.DefaultGenesis(),
+        EncodingConfig: testutil.TestEncodingConfig{
+            InterfaceRegistry: app.InterfaceRegistry(),
+            Codec:             app.AppCodec(),
+            TxConfig:          app.TxConfig(),
+            Amino:             app.LegacyAmino(),
+        },
+    }
+}
+```
+
+## Best Practices
+
+### Use Table-Driven Tests
+
+```go
+func TestKeeper(t *testing.T) {
+    tests := []struct {
+        name    string
+        setup   func(*SimApp, sdk.Context)
+        check   func(*SimApp, sdk.Context)
+        wantErr bool
+    }{
+        {
+            name: "valid case",
+            setup: func(app *SimApp, ctx sdk.Context) {
+                // Setup test state
+            },
+            check: func(app *SimApp, ctx sdk.Context) {
+                // Verify state
+            },
+            wantErr: false,
+        },
+    }
+
+    for _, tt := range tests {
+        t.Run(tt.name, func(t *testing.T) {
+            app := Setup(t, false)
+            ctx := app.BaseApp.NewContext(false)
+            
+            if tt.setup != nil {
+                tt.setup(app, ctx)
+            }
+            
+            // Run test
+            
+            if tt.check != nil {
+                tt.check(app, ctx)
+            }
+        })
+    }
+}
+```
+
+### Isolate Tests
+
+- Create new app instances for each test
+- Don't share state between tests
+- Use `t.Helper()` in helper functions
+- Clean up resources with `defer`
+
+### Test Edge Cases
+
+- Test with zero values
+- Test with maximum values
+- Test invalid inputs
+- Test error paths
+
+### Mock External Dependencies
+
+- Use interfaces for keepers
+- Create mock implementations for testing
+- Use `gomock` for automatic mock generation
+
+## Next Steps
+
+- Learn about [Simulation Testing](/building/simulation) for advanced testing
+- Review [App Creation](/building/app-creation) patterns
+- Explore [Genesis Configuration](/building/genesis)
+- Study [Module Development](/modules/overview) testing

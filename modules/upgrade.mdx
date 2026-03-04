@@ -1,0 +1,476 @@
+---
+title: Upgrade Module
+description: Coordinated blockchain upgrades without hard forks
+---
+
+# Upgrade Module (x/upgrade)
+
+## Overview
+
+The `x/upgrade` module facilitates smooth upgrades of live Cosmos chains to new software versions by coordinating the upgrade process across all validators.
+
+**Purpose**: Enable coordinated blockchain upgrades without requiring manual coordination or risking state inconsistencies.
+
+## Key Concepts
+
+### Plan
+
+A scheduled upgrade at a specific block height:
+
+```go
+type Plan struct {
+    Name   string       // Upgrade name
+    Height int64        // Block height to upgrade
+    Info   string       // Additional upgrade info (e.g., git commit, binaries)
+}
+```
+
+**Metadata Format** (recommended):
+```json
+{
+  "binaries": {
+    "linux/amd64": "https://example.com/binary?checksum=sha256:abc123..."
+  }
+}
+```
+
+### Handler
+
+Logic executed during upgrade:
+
+```go
+type UpgradeHandler func(
+    ctx context.Context,
+    plan Plan,
+    fromVM module.VersionMap,
+) (module.VersionMap, error)
+```
+
+**Registration**:
+```go
+app.UpgradeKeeper.SetUpgradeHandler(
+    "v2-upgrade",
+    func(ctx context.Context, plan upgradetypes.Plan, fromVM module.VersionMap) (module.VersionMap, error) {
+        // Perform state migrations
+        return app.ModuleManager.RunMigrations(ctx, app.Configurator(), fromVM)
+    },
+)
+```
+
+### StoreLoader
+
+Configures store upgrades:
+
+```go
+func UpgradeStoreLoader(
+    upgradeHeight int64,
+    storeUpgrades *store.StoreUpgrades,
+) baseapp.StoreLoader
+```
+
+**Store Upgrades**:
+```go
+storeUpgrades := &store.StoreUpgrades{
+    Added: []string{"newmodule"},
+    Deleted: []string{"oldmodule"},
+}
+```
+
+### Cosmovisor Integration
+
+Cosmovisor automates binary upgrades:
+- Monitors for upgrade plans
+- Downloads new binary from `Info` field
+- Switches to new binary at upgrade height
+- Restarts node with new version
+
+## State
+
+The module maintains minimal state:
+
+```
+0x0 -> ProtocolBuffer(Plan)           // Current upgrade plan
+0x1 | byte(plan name) -> BigEndian(Height)  // Completed upgrades
+0x2 | byte(module name) -> BigEndian(Version)  // Module versions
+0x3 -> BigEndian(ProtocolVersion)     // Protocol version
+```
+
+## Messages
+
+### MsgSoftwareUpgrade
+
+Schedule a software upgrade:
+
+```protobuf
+message MsgSoftwareUpgrade {
+    string authority = 1;  // gov module address
+    Plan plan = 2;
+}
+```
+
+**Usage via Governance**:
+```bash
+simd tx gov submit-proposal \
+    --title="Upgrade to v2" \
+    --summary="Upgrade chain to v2" \
+    --deposit=10000000stake \
+    --upgrade-height=1000000 \
+    --upgrade-info='{"binaries":{"linux/amd64":"https://example.com/binary"}}' \
+    --from=mykey
+```
+
+### MsgCancelUpgrade
+
+Cancel a scheduled upgrade:
+
+```protobuf
+message MsgCancelUpgrade {
+    string authority = 1;
+}
+```
+
+**Usage**:
+```bash
+simd tx gov submit-proposal \
+    --title="Cancel Upgrade" \
+    --summary="Cancel v2 upgrade" \
+    --deposit=10000000stake \
+    --type=cancel-software-upgrade \
+    --from=mykey
+```
+
+## PreBlocker
+
+Upgrade execution happens in PreBlocker:
+
+```go
+func (app *App) PreBlocker(ctx sdk.Context, req abci.RequestBeginBlock) (abci.ResponseBeginBlock, error) {
+    // Check if upgrade height reached
+    plan, found := app.UpgradeKeeper.GetUpgradePlan(ctx)
+    if found && plan.ShouldExecute(ctx) {
+        // Get upgrade handler
+        handler := app.UpgradeKeeper.GetUpgradeHandler(plan.Name)
+        if handler == nil {
+            // No handler registered - panic to prevent chain progression
+            panic(fmt.Sprintf("no handler for upgrade %s", plan.Name))
+        }
+        
+        // Execute upgrade
+        _, err := handler(ctx, plan, app.ModuleManager.GetVersionMap())
+        if err != nil {
+            panic(err)
+        }
+        
+        // Mark upgrade as done
+        app.UpgradeKeeper.SetUpgradeHeight(ctx, plan.Name, plan.Height)
+        app.UpgradeKeeper.ClearUpgradePlan(ctx)
+    }
+    
+    return abci.ResponseBeginBlock{}, nil
+}
+```
+
+## Queries
+
+### Query Current Plan
+
+```bash
+simd query upgrade plan
+```
+
+Example output:
+```yaml
+height: "1000000"
+info: '{"binaries":{"linux/amd64":"https://example.com/binary"}}'
+name: v2-upgrade
+time: "0001-01-01T00:00:00Z"
+```
+
+### Query Applied Plan
+
+Check if upgrade was applied:
+
+```bash
+simd query upgrade applied v2-upgrade
+```
+
+Returns the block height where upgrade was applied.
+
+### Query Module Versions
+
+```bash
+simd query upgrade module_versions
+```
+
+Example output:
+```yaml
+module_versions:
+- name: auth
+  version: "2"
+- name: bank
+  version: "2"
+- name: staking
+  version: "2"
+```
+
+## gRPC Endpoints
+
+### CurrentPlan
+
+```bash
+grpcurl -plaintext \
+    localhost:9090 \
+    cosmos.upgrade.v1beta1.Query/CurrentPlan
+```
+
+### AppliedPlan
+
+```bash
+grpcurl -plaintext \
+    -d '{"name":"v2-upgrade"}' \
+    localhost:9090 \
+    cosmos.upgrade.v1beta1.Query/AppliedPlan
+```
+
+### ModuleVersions
+
+```bash
+grpcurl -plaintext \
+    localhost:9090 \
+    cosmos.upgrade.v1beta1.Query/ModuleVersions
+```
+
+## Code Examples
+
+### Register Upgrade Handler
+
+```go
+// In app.go
+app.UpgradeKeeper.SetUpgradeHandler(
+    "v2-upgrade",
+    func(ctx context.Context, plan upgradetypes.Plan, fromVM module.VersionMap) (module.VersionMap, error) {
+        // Log upgrade start
+        ctx.Logger().Info("starting upgrade", "name", plan.Name)
+        
+        // Run migrations
+        toVM, err := app.ModuleManager.RunMigrations(ctx, app.Configurator(), fromVM)
+        if err != nil {
+            return nil, err
+        }
+        
+        // Custom migration logic
+        if err := migrateCustomState(ctx); err != nil {
+            return nil, err
+        }
+        
+        ctx.Logger().Info("upgrade complete", "name", plan.Name)
+        return toVM, nil
+    },
+)
+```
+
+### Configure Store Upgrades
+
+```go
+// In app.go
+upgradeInfo, err := app.UpgradeKeeper.ReadUpgradeInfoFromDisk()
+if err != nil {
+    panic(err)
+}
+
+if upgradeInfo.Name == "v2-upgrade" && !app.UpgradeKeeper.IsSkipHeight(upgradeInfo.Height) {
+    storeUpgrades := store.StoreUpgrades{
+        Added: []string{
+            "newmodule",
+        },
+        Deleted: []string{
+            "oldmodule",
+        },
+    }
+    
+    app.SetStoreLoader(
+        upgradetypes.UpgradeStoreLoader(upgradeInfo.Height, &storeUpgrades),
+    )
+}
+```
+
+### Custom State Migration
+
+```go
+func migrateCustomState(ctx sdk.Context) error {
+    // Example: Migrate account format
+    accountKeeper := app.AccountKeeper
+    
+    accountKeeper.IterateAccounts(ctx, func(acc authtypes.AccountI) bool {
+        // Perform migration on each account
+        if err := migrateAccount(acc); err != nil {
+            return true // stop iteration
+        }
+        accountKeeper.SetAccount(ctx, acc)
+        return false // continue
+    })
+    
+    return nil
+}
+```
+
+### Module Migration Example
+
+```go
+// In module's module.go
+func (am AppModule) ConsensusVersion() uint64 {
+    return 2  // Increment when migration needed
+}
+
+// In module's keeper/migrations.go
+type Migrator struct {
+    keeper Keeper
+}
+
+func NewMigrator(keeper Keeper) Migrator {
+    return Migrator{keeper: keeper}
+}
+
+func (m Migrator) Migrate1to2(ctx sdk.Context) error {
+    // Perform migration from version 1 to 2
+    return migrateParams(ctx, m.keeper)
+}
+
+// Register in configurator
+func (am AppModule) RegisterServices(cfg module.Configurator) {
+    // Register msg server
+    types.RegisterMsgServer(cfg.MsgServer(), keeper.NewMsgServerImpl(am.keeper))
+    
+    // Register migrations
+    migrator := keeper.NewMigrator(am.keeper)
+    if err := cfg.RegisterMigration(types.ModuleName, 1, migrator.Migrate1to2); err != nil {
+        panic(err)
+    }
+}
+```
+
+### Cosmovisor Configuration
+
+**Directory Structure**:
+```
+$DAEMON_HOME/
+├── cosmovisor/
+│   ├── genesis/
+│   │   └── bin/
+│   │       └── simd
+│   └── upgrades/
+│       └── v2-upgrade/
+│           └── bin/
+│               └── simd
+└── data/
+```
+
+**Environment Variables**:
+```bash
+export DAEMON_NAME=simd
+export DAEMON_HOME=$HOME/.simapp
+export DAEMON_ALLOW_DOWNLOAD_BINARIES=true
+export DAEMON_RESTART_AFTER_UPGRADE=true
+```
+
+**Start with Cosmovisor**:
+```bash
+cosmovisor run start
+```
+
+## Upgrade Workflow
+
+### 1. Prepare New Binary
+
+```bash
+# Build new version
+git checkout v2.0.0
+make install
+
+# Verify binary
+simd version
+```
+
+### 2. Submit Upgrade Proposal
+
+```bash
+simd tx gov submit-proposal software-upgrade v2-upgrade \
+    --title="Upgrade to v2" \
+    --summary="Major upgrade with new features" \
+    --deposit=10000000stake \
+    --upgrade-height=1000000 \
+    --upgrade-info='{"binaries":{"linux/amd64":"https://github.com/org/repo/releases/download/v2.0.0/simd-linux-amd64?checksum=sha256:abc123"}}' \
+    --from=mykey
+```
+
+### 3. Vote on Proposal
+
+```bash
+simd tx gov vote 1 yes --from=validator
+```
+
+### 4. Install New Binary (Manual)
+
+```bash
+# Stop node before upgrade height
+systemctl stop simd
+
+# Replace binary
+mv simd simd.old
+cp simd-v2 simd
+
+# Restart at upgrade height
+systemctl start simd
+```
+
+### 5. Or Use Cosmovisor (Automatic)
+
+Cosmovisor handles upgrade automatically:
+- Detects upgrade plan
+- Downloads binary from URL
+- Switches binary at upgrade height
+- Restarts node
+
+## CLI Commands Reference
+
+| Command | Description |
+|---------|-------------|
+| `simd query upgrade plan` | Query current upgrade plan |
+| `simd query upgrade applied [name]` | Check if upgrade was applied |
+| `simd query upgrade module_versions` | Query module versions |
+| `simd tx gov submit-proposal software-upgrade` | Submit upgrade proposal |
+| `simd tx gov submit-proposal cancel-software-upgrade` | Cancel upgrade proposal |
+
+## Integration Guide
+
+```go
+// Initialize upgrade keeper
+app.UpgradeKeeper = upgradekeeper.NewKeeper(
+    skipUpgradeHeights,
+    runtime.NewKVStoreService(keys[upgradetypes.StoreKey]),
+    appCodec,
+    homePath,
+    app.BaseApp,
+    authtypes.NewModuleAddress(govtypes.ModuleName).String(),
+)
+
+// Register module
+app.ModuleManager = module.NewManager(
+    upgrade.NewAppModule(app.UpgradeKeeper),
+    // other modules...
+)
+
+// Set PreBlocker
+app.SetPreBlocker(app.PreBlocker)
+```
+
+## Best Practices
+
+1. **Test Thoroughly**: Test upgrades on testnet first
+2. **Communicate Early**: Announce upgrades well in advance
+3. **Provide Binaries**: Host binaries with checksums
+4. **Document Changes**: Clear upgrade documentation
+5. **Use Cosmovisor**: Automate upgrade process
+6. **Monitor Network**: Watch validator participation
+7. **Plan Rollback**: Have contingency plans
+8. **Version Consensus**: Coordinate with validators

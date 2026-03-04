@@ -1,0 +1,544 @@
+---
+title: Module System
+description: Understanding Cosmos SDK's modular architecture and module lifecycle
+---
+
+## Overview
+
+The Cosmos SDK uses a modular architecture where applications are composed of independent, reusable modules. Each module encapsulates specific functionality, state, and business logic while interacting with other modules through well-defined interfaces.
+
+## Module Interface
+
+```go
+// Location: core/appmodule/module.go:15
+package appmodule
+
+// AppModule is a tag interface for app module implementations
+type AppModule interface {
+    depinject.OnePerModuleType
+    
+    // IsAppModule is a dummy method to tag a struct as implementing an AppModule
+    IsAppModule()
+}
+
+// HasServices extends AppModule for service registration
+type HasServices interface {
+    AppModule
+    
+    // RegisterServices registers the module's services
+    RegisterServices(grpc.ServiceRegistrar) error
+}
+```
+
+## Module Lifecycle Hooks
+
+Modules can implement optional lifecycle interfaces:
+
+### PreBlocker
+
+```go
+// Location: core/appmodule/module.go:59
+type HasPreBlocker interface {
+    AppModule
+    
+    // PreBlock runs before BeginBlock
+    PreBlock(context.Context) (ResponsePreBlock, error)
+}
+```
+
+Used for operations that must occur before transaction processing, such as:
+- Processing vote extensions
+- Updating consensus parameters
+
+### BeginBlocker
+
+```go
+// Location: core/appmodule/module.go:73
+type HasBeginBlocker interface {
+    AppModule
+    
+    // BeginBlock runs before transactions are processed
+    BeginBlock(context.Context) error
+}
+```
+
+Executes at the start of each block:
+- Mint inflation rewards
+- Distribute staking rewards
+- Update validator set
+
+### EndBlocker
+
+```go
+// Location: core/appmodule/module.go:83
+type HasEndBlocker interface {
+    AppModule
+    
+    // EndBlock runs after transactions are processed
+    EndBlock(context.Context) error
+}
+```
+
+Executes at the end of each block:
+- Process validator updates
+- Mature unbonding delegations
+- Execute governance proposals
+
+### Additional Hooks
+
+```go
+type HasPrepareCheckState interface {
+    AppModule
+    PrepareCheckState(context.Context) error
+}
+
+type HasPrecommit interface {
+    AppModule
+    Precommit(context.Context) error
+}
+```
+
+## Module Structure
+
+A typical module contains:
+
+```
+x/mymodule/
+├── keeper/
+│   ├── keeper.go      # State management
+│   ├── msg_server.go  # Message handlers
+│   └── query_server.go # Query handlers
+├── types/
+│   ├── keys.go        # State prefixes
+│   ├── msgs.go        # Message types
+│   └── genesis.go     # Genesis state
+├── module/
+│   └── module.go      # Module definition
+└── README.md
+```
+
+## Keeper Pattern
+
+Keepers manage module state and provide controlled access to other modules:
+
+```go
+// Example bank keeper
+type Keeper struct {
+    storeService store.KVStoreService
+    cdc          codec.BinaryCodec
+    
+    // State collections
+    Balances     collections.Map[collections.Pair[sdk.AccAddress, string], math.Int]
+    Supply       collections.Map[string, math.Int]
+    DenomMetadata collections.Map[string, banktypes.Metadata]
+    
+    // Dependencies
+    authKeeper   types.AccountKeeper
+}
+```
+
+### Keeper Constructor
+
+```go
+func NewKeeper(
+    cdc codec.BinaryCodec,
+    storeService store.KVStoreService,
+    accountKeeper types.AccountKeeper,
+) Keeper {
+    sb := collections.NewSchemaBuilder(storeService)
+    
+    return Keeper{
+        cdc:          cdc,
+        storeService: storeService,
+        authKeeper:   accountKeeper,
+        Balances: collections.NewMap(
+            sb,
+            collections.NewPrefix(0),
+            "balances",
+            collections.PairKeyCodec(sdk.AccAddressKey, collections.StringKey),
+            sdk.IntValue,
+        ),
+    }
+}
+```
+
+## Dependency Injection
+
+Modules use depinject for wiring dependencies.
+
+### Module Configuration
+
+Define a protobuf configuration message:
+
+```protobuf
+// cosmos.bank.module.v1
+package cosmos.bank.module.v1;
+
+import "cosmos/app/v1alpha1/module.proto";
+
+message Module {
+  option (cosmos.app.v1alpha1.module) = {
+    go_import: "github.com/cosmos/cosmos-sdk/x/bank"
+  };
+  
+  // Blocked addresses that cannot receive funds
+  repeated string blocked_module_accounts_override = 1;
+}
+```
+
+### Provider Functions
+
+```go
+// Location: x/bank/module.go
+func init() {
+    appmodule.Register(
+        &modulev1.Module{},
+        appmodule.Provide(ProvideModule),
+    )
+}
+
+type ModuleInputs struct {
+    depinject.In
+    
+    Config           *modulev1.Module
+    Cdc              codec.Codec
+    StoreService     store.KVStoreService
+    AccountKeeper    types.AccountKeeper
+}
+
+type ModuleOutputs struct {
+    depinject.Out
+    
+    BankKeeper keeper.Keeper
+    Module     appmodule.AppModule
+}
+
+func ProvideModule(in ModuleInputs) ModuleOutputs {
+    keeper := keeper.NewKeeper(
+        in.Cdc,
+        in.StoreService,
+        in.AccountKeeper,
+    )
+    
+    m := NewAppModule(in.Cdc, keeper, in.AccountKeeper)
+    
+    return ModuleOutputs{
+        BankKeeper: keeper,
+        Module:     m,
+    }
+}
+```
+
+## Service Registration
+
+Modules register message and query services:
+
+```go
+func (am AppModule) RegisterServices(registrar grpc.ServiceRegistrar) error {
+    // Register message server
+    banktypes.RegisterMsgServer(registrar, keeper.NewMsgServerImpl(am.keeper))
+    
+    // Register query server
+    banktypes.RegisterQueryServer(registrar, keeper.NewQueryServerImpl(am.keeper))
+    
+    return nil
+}
+```
+
+### Message Server
+
+```go
+type msgServer struct {
+    keeper Keeper
+}
+
+func NewMsgServerImpl(keeper Keeper) banktypes.MsgServer {
+    return &msgServer{keeper: keeper}
+}
+
+func (s msgServer) Send(
+    ctx context.Context,
+    msg *banktypes.MsgSend,
+) (*banktypes.MsgSendResponse, error) {
+    // Validate
+    if err := msg.ValidateBasic(); err != nil {
+        return nil, err
+    }
+    
+    // Execute state change
+    if err := s.keeper.SendCoins(ctx, msg.FromAddress, msg.ToAddress, msg.Amount); err != nil {
+        return nil, err
+    }
+    
+    return &banktypes.MsgSendResponse{}, nil
+}
+```
+
+### Query Server
+
+```go
+type queryServer struct {
+    keeper Keeper
+}
+
+func NewQueryServerImpl(keeper Keeper) banktypes.QueryServer {
+    return &queryServer{keeper: keeper}
+}
+
+func (q queryServer) Balance(
+    ctx context.Context,
+    req *banktypes.QueryBalanceRequest,
+) (*banktypes.QueryBalanceResponse, error) {
+    balance, err := q.keeper.Balances.Get(
+        ctx,
+        collections.Join(req.Address, req.Denom),
+    )
+    if err != nil {
+        return nil, err
+    }
+    
+    return &banktypes.QueryBalanceResponse{
+        Balance: &sdk.Coin{
+            Denom:  req.Denom,
+            Amount: balance,
+        },
+    }, nil
+}
+```
+
+## Module Manager
+
+The ModuleManager coordinates all modules:
+
+```go
+type Manager struct {
+    Modules map[string]interface{}
+    OrderBeginBlockers []string
+    OrderEndBlockers   []string
+    OrderPreBlockers   []string
+}
+```
+
+### Module Ordering
+
+Modules execute in specified order:
+
+```go
+// Example from simapp
+app.ModuleManager.SetOrderBeginBlockers(
+    upgradetypes.ModuleName,
+    minttypes.ModuleName,
+    distrtypes.ModuleName,
+    slashingtypes.ModuleName,
+    stakingtypes.ModuleName,
+)
+
+app.ModuleManager.SetOrderEndBlockers(
+    crisistypes.ModuleName,
+    govtypes.ModuleName,
+    stakingtypes.ModuleName,
+)
+```
+
+## Common Module Patterns
+
+### Account Management
+
+Modules can hold tokens through module accounts:
+
+```go
+// Module account interface
+type ModuleAccount interface {
+    auth.Account
+    
+    GetName() string           // module name
+    GetPermissions() []string  // permissions (mint, burn, etc.)
+    HasPermission(string) bool
+}
+```
+
+### Permissions
+
+```go
+const (
+    Minter  = "minter"   // Can mint new tokens
+    Burner  = "burner"   // Can burn tokens
+    Staking = "staking"  // Can delegate/undelegate
+)
+```
+
+### Hooks
+
+Modules can define hooks for other modules to implement:
+
+```go
+// Staking hooks example
+type StakingHooks interface {
+    AfterValidatorCreated(ctx context.Context, valAddr sdk.ValAddress) error
+    AfterDelegationModified(ctx context.Context, delAddr sdk.AccAddress, valAddr sdk.ValAddress) error
+    BeforeValidatorSlashed(ctx context.Context, valAddr sdk.ValAddress, fraction sdk.Dec) error
+}
+```
+
+## Genesis
+
+Modules define their genesis state:
+
+```go
+type GenesisState struct {
+    Params   Params
+    Balances []Balance
+    Supply   sdk.Coins
+}
+
+func (am AppModule) InitGenesis(ctx context.Context, data json.RawMessage) error {
+    var genesisState GenesisState
+    am.cdc.MustUnmarshalJSON(data, &genesisState)
+    
+    return am.keeper.InitGenesis(ctx, &genesisState)
+}
+
+func (am AppModule) ExportGenesis(ctx context.Context) (json.RawMessage, error) {
+    gs := am.keeper.ExportGenesis(ctx)
+    return am.cdc.MarshalJSON(gs)
+}
+```
+
+## Module Communication
+
+### Keeper Interfaces
+
+Modules depend on interfaces, not concrete keepers:
+
+```go
+// Expected keeper interface
+type BankKeeper interface {
+    SendCoins(ctx context.Context, from, to sdk.AccAddress, amt sdk.Coins) error
+    GetBalance(ctx context.Context, addr sdk.AccAddress, denom string) sdk.Coin
+}
+
+// Staking keeper uses bank keeper
+type Keeper struct {
+    bankKeeper BankKeeper  // Interface, not concrete type
+}
+```
+
+### Object Capability Model
+
+Modules receive only the capabilities they need:
+
+```go
+// Distribution keeper needs limited bank access
+type DistributionKeeper struct {
+    bankKeeper types.BankKeeper  // Only send/query operations
+}
+
+// Staking keeper needs more access
+type StakingKeeper struct {
+    bankKeeper types.BankKeeper
+    authKeeper types.AccountKeeper  // Can create module accounts
+}
+```
+
+## Example Module: Counter
+
+A minimal example module:
+
+```go
+package counter
+
+import (
+    "cosmossdk.io/collections"
+    "cosmossdk.io/core/appmodule"
+    "cosmossdk.io/core/store"
+)
+
+// Keeper
+type Keeper struct {
+    Count collections.Item[uint64]
+}
+
+func NewKeeper(storeService store.KVStoreService) Keeper {
+    sb := collections.NewSchemaBuilder(storeService)
+    return Keeper{
+        Count: collections.NewItem(
+            sb,
+            collections.NewPrefix(0),
+            "count",
+            collections.Uint64Value,
+        ),
+    }
+}
+
+func (k Keeper) Increment(ctx context.Context) error {
+    count, err := k.Count.Get(ctx)
+    if err != nil {
+        count = 0
+    }
+    return k.Count.Set(ctx, count+1)
+}
+
+// Module
+type AppModule struct {
+    keeper Keeper
+}
+
+func (AppModule) IsAppModule() {}
+
+func (am AppModule) BeginBlock(ctx context.Context) error {
+    return am.keeper.Increment(ctx)
+}
+```
+
+## Built-in Modules
+
+<CardGroup cols={2}>
+  <Card title="x/auth" icon="user" href="/modules/auth">
+    Account authentication and management
+  </Card>
+  <Card title="x/bank" icon="coins" href="/modules/bank">
+    Token transfers and balances
+  </Card>
+  <Card title="x/staking" icon="layer-group" href="/modules/staking">
+    Proof-of-Stake staking logic
+  </Card>
+  <Card title="x/gov" icon="vote-yea" href="/modules/governance">
+    On-chain governance
+  </Card>
+  <Card title="x/distribution" icon="hand-holding-usd" href="/modules/distribution">
+    Fee distribution to stakers
+  </Card>
+  <Card title="x/slashing" icon="gavel" href="/modules/slashing">
+    Validator slashing penalties
+  </Card>
+</CardGroup>
+
+## Best Practices
+
+<AccordionGroup>
+  <Accordion title="Use Collections for State">
+    Use the `collections` package for type-safe state management instead of raw KVStore access.
+  </Accordion>
+  
+  <Accordion title="Define Expected Keepers">
+    Depend on interfaces (expected keepers) rather than concrete keeper types.
+  </Accordion>
+  
+  <Accordion title="Implement Only Needed Hooks">
+    Don't implement lifecycle hooks your module doesn't need.
+  </Accordion>
+  
+  <Accordion title="Use Module Accounts">
+    Store module-owned tokens in module accounts, not regular accounts.
+  </Accordion>
+  
+  <Accordion title="Document Dependencies">
+    Clearly document which modules yours depends on in the README.
+  </Accordion>
+</AccordionGroup>
+
+## Related Documentation
+
+- [State Management](/architecture/state-management) - Using Collections for module state
+- [BaseApp](/architecture/baseapp) - How modules integrate with BaseApp
+- [Building Modules](/modules/building) - Detailed module development guide

@@ -1,0 +1,517 @@
+---
+title: Encoding
+description: Understanding Protocol Buffer encoding, codecs, and interface handling in Cosmos SDK
+---
+
+# Encoding
+
+Cosmos SDK uses Protocol Buffers (protobuf) for encoding and decoding data structures. This provides efficient serialization, type safety, and language interoperability.
+
+## Protocol Buffers
+
+### Why Protobuf?
+
+- **Efficient**: Compact binary encoding
+- **Type-safe**: Strongly typed messages
+- **Versioned**: Supports schema evolution
+- **Cross-language**: Works with multiple programming languages
+- **Deterministic**: Same input produces same output
+
+### Protobuf Messages
+
+```protobuf
+syntax = "proto3";
+
+package cosmos.bank.v1beta1;
+
+import "gogoproto/gogo.proto";
+import "cosmos/base/v1beta1/coin.proto";
+
+// Coin message definition
+message Coin {
+    option (gogoproto.equal) = true;
+    
+    string denom = 1;
+    string amount = 2 [
+        (gogoproto.customtype) = "cosmossdk.io/math.Int",
+        (gogoproto.nullable) = false
+    ];
+}
+
+// Send message
+message MsgSend {
+    option (gogoproto.equal) = false;
+    
+    string from_address = 1;
+    string to_address = 2;
+    repeated cosmos.base.v1beta1.Coin amount = 3 [
+        (gogoproto.nullable) = false,
+        (gogoproto.castrepeated) = "github.com/cosmos/cosmos-sdk/types.Coins"
+    ];
+}
+```
+
+## Codecs
+
+### ProtoCodec
+
+The main codec implementation using Protocol Buffers:
+
+```go codec/proto_codec.go
+type ProtoCodec struct {
+    interfaceRegistry types.InterfaceRegistry
+}
+
+func NewProtoCodec(interfaceRegistry types.InterfaceRegistry) *ProtoCodec {
+    return &ProtoCodec{
+        interfaceRegistry: interfaceRegistry,
+    }
+}
+```
+
+### Codec Interface
+
+```go codec/codec.go
+type Codec interface {
+    BinaryCodec
+    JSONCodec
+}
+
+type BinaryCodec interface {
+    Marshal(o proto.Message) ([]byte, error)
+    MustMarshal(o proto.Message) []byte
+    Unmarshal(bz []byte, ptr proto.Message) error
+    MustUnmarshal(bz []byte, ptr proto.Message)
+    
+    MarshalLengthPrefixed(o proto.Message) ([]byte, error)
+    UnmarshalLengthPrefixed(bz []byte, ptr proto.Message) error
+}
+
+type JSONCodec interface {
+    MarshalJSON(o proto.Message) ([]byte, error)
+    MustMarshalJSON(o proto.Message) []byte
+    UnmarshalJSON(bz []byte, ptr proto.Message) error
+    MustUnmarshalJSON(bz []byte, ptr proto.Message)
+}
+```
+
+## Binary Encoding
+
+### Basic Marshaling
+
+```go codec/proto_codec.go
+// Marshal to binary
+func (pc *ProtoCodec) Marshal(o proto.Message) ([]byte, error) {
+    if o == nil || proto.Size(o) == 0 {
+        return []byte{}, nil
+    }
+    return proto.Marshal(o)
+}
+
+// Unmarshal from binary
+func (pc *ProtoCodec) Unmarshal(bz []byte, ptr proto.Message) error {
+    err := proto.Unmarshal(bz, ptr)
+    if err != nil {
+        return err
+    }
+    
+    // Unpack interfaces if needed
+    return types.UnpackInterfaces(ptr, pc.interfaceRegistry)
+}
+```
+
+### Usage Example
+
+```go
+import (
+    "github.com/cosmos/cosmos-sdk/codec"
+    "github.com/cosmos/cosmos-sdk/codec/types"
+    sdk "github.com/cosmos/cosmos-sdk/types"
+)
+
+// Create codec
+interfaceRegistry := types.NewInterfaceRegistry()
+cdc := codec.NewProtoCodec(interfaceRegistry)
+
+// Marshal message
+msg := &banktypes.MsgSend{
+    FromAddress: "cosmos1...",
+    ToAddress:   "cosmos1...",
+    Amount:      sdk.NewCoins(sdk.NewInt64Coin("uatom", 1000)),
+}
+
+bz, err := cdc.Marshal(msg)
+if err != nil {
+    return err
+}
+
+// Unmarshal message
+var decodedMsg banktypes.MsgSend
+err = cdc.Unmarshal(bz, &decodedMsg)
+if err != nil {
+    return err
+}
+```
+
+### Length-Prefixed Encoding
+
+Useful for encoding multiple messages in sequence:
+
+```go codec/proto_codec.go
+// Marshal with length prefix
+func (pc *ProtoCodec) MarshalLengthPrefixed(o proto.Message) ([]byte, error) {
+    bz, err := pc.Marshal(o)
+    if err != nil {
+        return nil, err
+    }
+    
+    var sizeBuf [binary.MaxVarintLen64]byte
+    n := binary.PutUvarint(sizeBuf[:], uint64(len(bz)))
+    return append(sizeBuf[:n], bz...), nil
+}
+
+// Unmarshal with length prefix
+func (pc *ProtoCodec) UnmarshalLengthPrefixed(bz []byte, ptr proto.Message) error {
+    size, n := binary.Uvarint(bz)
+    if n < 0 {
+        return errors.New("invalid varint")
+    }
+    
+    if size > uint64(len(bz)-n) {
+        return errors.New("not enough bytes")
+    }
+    
+    return pc.Unmarshal(bz[n:n+int(size)], ptr)
+}
+```
+
+## JSON Encoding
+
+### JSON Marshaling
+
+```go codec/proto_codec.go
+// Marshal to JSON
+func (pc *ProtoCodec) MarshalJSON(o proto.Message) ([]byte, error) {
+    if o == nil {
+        return nil, errors.New("cannot marshal nil")
+    }
+    return ProtoMarshalJSON(o, pc.interfaceRegistry)
+}
+
+// Unmarshal from JSON
+func (pc *ProtoCodec) UnmarshalJSON(bz []byte, ptr proto.Message) error {
+    if ptr == nil {
+        return errors.New("cannot unmarshal into nil")
+    }
+    
+    unmarshaler := jsonpb.Unmarshaler{
+        AnyResolver: pc.interfaceRegistry,
+    }
+    
+    err := unmarshaler.Unmarshal(strings.NewReader(string(bz)), ptr)
+    if err != nil {
+        return err
+    }
+    
+    return types.UnpackInterfaces(ptr, pc.interfaceRegistry)
+}
+```
+
+### JSON Usage
+
+```go
+// Marshal to JSON
+jsonBz, err := cdc.MarshalJSON(msg)
+if err != nil {
+    return err
+}
+
+// Output: {"from_address":"cosmos1...","to_address":"cosmos1...","amount":[{"denom":"uatom","amount":"1000"}]}
+
+// Unmarshal from JSON
+var decodedMsg banktypes.MsgSend
+err = cdc.UnmarshalJSON(jsonBz, &decodedMsg)
+```
+
+## Interface Handling
+
+### Interface Registry
+
+Register interface implementations for proper encoding/decoding:
+
+```go codec/types/interface_registry.go
+type InterfaceRegistry interface {
+    RegisterInterface(protoName string, iface interface{})
+    RegisterImplementations(iface interface{}, impls ...proto.Message)
+    UnpackAny(any *Any, iface interface{}) error
+}
+
+// Create registry
+interfaceRegistry := types.NewInterfaceRegistry()
+
+// Register account interface
+interfaceRegistry.RegisterInterface(
+    "cosmos.auth.v1beta1.AccountI",
+    (*sdk.AccountI)(nil),
+)
+
+// Register implementations
+interfaceRegistry.RegisterImplementations(
+    (*sdk.AccountI)(nil),
+    &authtypes.BaseAccount{},
+    &authtypes.ModuleAccount{},
+    &vestingtypes.ContinuousVestingAccount{},
+)
+```
+
+### Any Type
+
+Protobuf `Any` wraps interface types:
+
+```protobuf
+message BaseAccount {
+    string address = 1;
+    google.protobuf.Any pub_key = 2;  // Can be any public key type
+    uint64 account_number = 3;
+    uint64 sequence = 4;
+}
+```
+
+### Working with Any
+
+```go
+import "github.com/cosmos/cosmos-sdk/codec/types"
+
+// Pack interface into Any
+pubKey := &secp256k1.PubKey{Key: keyBytes}
+any, err := types.NewAnyWithValue(pubKey)
+if err != nil {
+    return err
+}
+
+account := &authtypes.BaseAccount{
+    Address: "cosmos1...",
+    PubKey:  any,
+}
+
+// Unpack Any back to interface
+var unpackedPubKey cryptotypes.PubKey
+err = cdc.UnpackAny(account.PubKey, &unpackedPubKey)
+if err != nil {
+    return err
+}
+```
+
+## GoGo Protobuf Extensions
+
+Cosmos SDK uses gogoproto for additional features:
+
+### Custom Types
+
+```protobuf
+import "gogoproto/gogo.proto";
+
+message Coin {
+    string denom = 1;
+    // Use custom Int type instead of string
+    string amount = 2 [
+        (gogoproto.customtype) = "cosmossdk.io/math.Int",
+        (gogoproto.nullable) = false
+    ];
+}
+```
+
+### Repeated Casts
+
+```protobuf
+message MsgSend {
+    string from_address = 1;
+    string to_address = 2;
+    // Cast to sdk.Coins type
+    repeated cosmos.base.v1beta1.Coin amount = 3 [
+        (gogoproto.nullable) = false,
+        (gogoproto.castrepeated) = "github.com/cosmos/cosmos-sdk/types.Coins"
+    ];
+}
+```
+
+### Common Options
+
+```protobuf
+// Make structs comparable with ==
+option (gogoproto.equal) = true;
+
+// Don't generate getters
+option (gogoproto.goproto_getters) = false;
+
+// Use standard library types
+option (gogoproto.goproto_stringer) = false;
+
+// Embed message instead of pointer
+option (gogoproto.embed) = true;
+
+// Don't allow nil pointer
+option (gogoproto.nullable) = false;
+```
+
+## Amino Compatibility
+
+For backwards compatibility with Amino encoding:
+
+```go
+import "github.com/cosmos/cosmos-sdk/codec/legacy"
+
+// Register legacy amino codec
+legacy.Cdc.RegisterInterface((*sdk.Msg)(nil), nil)
+legacy.Cdc.RegisterConcrete(&banktypes.MsgSend{}, "cosmos-sdk/MsgSend", nil)
+```
+
+## Store Encoding
+
+### Encoding for Storage
+
+```go
+// Store encoded message
+store := ctx.KVStore(storeKey)
+key := []byte("balance")
+
+coin := sdk.NewInt64Coin("uatom", 1000)
+bz := cdc.MustMarshal(&coin)
+store.Set(key, bz)
+
+// Retrieve and decode
+bz = store.Get(key)
+var decodedCoin sdk.Coin
+cdc.MustUnmarshal(bz, &decodedCoin)
+```
+
+### Key Encoding
+
+```go
+// Use deterministic key encoding
+func BalanceKey(addr sdk.AccAddress, denom string) []byte {
+    key := make([]byte, 0)
+    key = append(key, BalancePrefix...)
+    key = append(key, address.MustLengthPrefix(addr)...)
+    key = append(key, []byte(denom)...)
+    return key
+}
+```
+
+## Transaction Encoding
+
+### Tx Encoding
+
+```go
+import "github.com/cosmos/cosmos-sdk/client"
+
+// Get tx config
+txConfig := clientCtx.TxConfig
+
+// Build transaction
+txBuilder := txConfig.NewTxBuilder()
+txBuilder.SetMsgs(msg)
+txBuilder.SetGasLimit(200000)
+txBuilder.SetFeeAmount(fees)
+
+// Sign transaction
+err = tx.Sign(txBuilder, "my-key", clientCtx)
+
+// Encode to bytes
+txBytes, err := txConfig.TxEncoder()(txBuilder.GetTx())
+if err != nil {
+    return err
+}
+
+// Broadcast
+res, err := clientCtx.BroadcastTx(txBytes)
+```
+
+### Decoding Transactions
+
+```go
+// Decode transaction bytes
+tx, err := txConfig.TxDecoder()(txBytes)
+if err != nil {
+    return err
+}
+
+// Get messages
+msgs := tx.GetMsgs()
+for _, msg := range msgs {
+    // Process message
+}
+```
+
+## Best Practices
+
+1. **Use ProtoCodec** - it's the standard codec
+2. **Register interfaces** - always register interface implementations
+3. **Handle Any types** - properly pack/unpack interface types
+4. **Use gogoproto options** - customize generated code
+5. **Version proto files** - use v1beta1, v1, etc.
+6. **Import shared types** - reuse common message definitions
+7. **Make encoding deterministic** - same input must produce same output
+8. **Use length prefixes** - when encoding multiple messages
+9. **Validate after unmarshal** - check data integrity
+10. **Cache codecs** - don't create new codecs repeatedly
+
+## Common Pitfalls
+
+### Nil Pointers
+
+```go
+// Wrong - can cause panic
+var msg *banktypes.MsgSend
+bz, _ := cdc.Marshal(msg) // Panic!
+
+// Correct - check for nil
+if msg != nil {
+    bz, err := cdc.Marshal(msg)
+}
+```
+
+### Interface Registration
+
+```go
+// Wrong - interface not registered
+var account sdk.AccountI = &authtypes.BaseAccount{}
+any, _ := types.NewAnyWithValue(account) // Error!
+
+// Correct - register first
+interfaceRegistry.RegisterInterface(
+    "cosmos.auth.v1beta1.AccountI",
+    (*sdk.AccountI)(nil),
+)
+interfaceRegistry.RegisterImplementations(
+    (*sdk.AccountI)(nil),
+    &authtypes.BaseAccount{},
+)
+```
+
+### Non-determinism
+
+```go
+// Wrong - map iteration is non-deterministic
+data := make(map[string]int)
+for k, v := range data {
+    // Encoding order varies!
+}
+
+// Correct - sort keys first
+keys := make([]string, 0, len(data))
+for k := range data {
+    keys = append(keys, k)
+}
+sort.Strings(keys)
+for _, k := range keys {
+    v := data[k]
+    // Now deterministic
+}
+```
+
+## Related Concepts
+
+- [Queries](/concepts/queries) - Using encoding in queries
+- [Transactions](/essentials/transactions) - Transaction encoding
+- [Storage](/concepts/storage) - Encoding data for storage

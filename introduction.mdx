@@ -1,0 +1,299 @@
+---
+title: Welcome to Cosmos SDK
+description: Build secure, high-performance Layer 1 blockchains with full customizability
+mode: custom
+---
+
+<div className="relative overflow-hidden dark:bg-[#000000] bg-white">
+  {/* Hero Section */}
+  <div className="py-20 px-6 sm:px-8 lg:px-12">
+    <div className="max-w-7xl mx-auto">
+      <div className="grid grid-cols-1 lg:grid-cols-12 gap-12 items-center">
+        <div className="lg:col-span-7">
+          <h1 className="text-4xl sm:text-5xl lg:text-6xl font-bold dark:text-white text-gray-900 mb-6">
+            Build high-performance blockchains with Cosmos SDK
+          </h1>
+          <p className="text-lg sm:text-xl dark:text-gray-400 text-gray-600 mb-8 max-w-2xl">
+            A modular, open-source framework for building secure, sovereign Layer 1 chains. Used by 200+ production blockchains with native interoperability through IBC.
+          </p>
+          <div className="flex flex-wrap gap-4">
+            <a
+              href="/quickstart"
+              className="inline-flex items-center justify-center px-6 py-3 text-base font-semibold rounded-full bg-white text-black border border-gray-200 hover:bg-gray-100 dark:bg-white dark:text-black dark:hover:bg-gray-100 transition-colors"
+            >
+              Get Started
+            </a>
+            <a
+              href="/architecture/overview"
+              className="inline-flex items-center justify-center px-6 py-3 text-base font-semibold rounded-full border dark:border-white/30 border-gray-300 dark:bg-white/10 bg-gray-50 dark:text-white text-gray-900 dark:hover:bg-white/20 hover:bg-gray-100 transition-colors"
+            >
+              Learn Architecture
+            </a>
+          </div>
+        </div>
+        <div className="lg:col-span-5 hidden lg:block">
+          <div className="relative">
+            <div className="dark:bg-[#1a1d27] bg-gray-100 rounded-2xl p-8 dark:border dark:border-[#27272a] border-gray-200">
+              <pre className="text-sm dark:text-gray-300 text-gray-700 overflow-x-auto">
+{`package main
+
+import (
+  "github.com/cosmos/cosmos-sdk/baseapp"
+  sdk "github.com/cosmos/cosmos-sdk/types"
+)
+
+func NewApp() *baseapp.BaseApp {
+  return baseapp.NewBaseApp(
+    "mychain",
+    logger,
+    db,
+    txDecoder,
+  )
+}`}
+              </pre>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+{/* Quick Start Section */}
+<div className="mt-16 mb-16 max-w-5xl mx-auto px-6">
+  <h2 className="text-3xl font-semibold dark:text-white text-gray-900 mb-4">Quick start</h2>
+  <p className="text-base dark:text-gray-400 text-gray-600 mb-8">
+    Get up and running with Cosmos SDK in minutes
+  </p>
+
+  <Steps>
+    <Step title="Install Go and dependencies">
+      Cosmos SDK requires Go 1.21 or later. Install Go and set up your development environment.
+
+      ```bash
+      # Install Go 1.21+
+      go version
+
+      # Verify installation
+      go version
+      ```
+    </Step>
+
+    <Step title="Clone and explore simapp">
+      The SDK includes a reference application called `simapp` that demonstrates a complete blockchain implementation.
+
+      ```bash
+      git clone https://github.com/cosmos/cosmos-sdk
+      cd cosmos-sdk/simapp
+      go mod download
+      ```
+    </Step>
+
+    <Step title="Initialize and start a chain">
+      Initialize the chain configuration and start the blockchain node.
+
+      ```bash
+      # Initialize chain
+      simd init mynode --chain-id my-test-chain
+
+      # Add a key
+      simd keys add mykey
+
+      # Add genesis account
+      simd genesis add-genesis-account mykey 100000000stake
+
+      # Create genesis transaction
+      simd genesis gentx mykey 1000000stake --chain-id my-test-chain
+
+      # Collect genesis transactions
+      simd genesis collect-gentxs
+
+      # Start the node
+      simd start
+      ```
+
+      <Accordion title="Expected output">
+        Your node will start producing blocks and you'll see output similar to:
+        ```
+        8:37PM INF starting node with ABCI CometBFT in-process
+        8:37PM INF service start impl=multiAppConn module=proxy
+        8:37PM INF service start impl=Node module=server
+        8:37PM INF starting P2P client module=p2p
+        ```
+      </Accordion>
+    </Step>
+
+    <Step title="Query the chain">
+      Use the CLI to interact with your running blockchain.
+
+      ```bash
+      # Check account balance
+      simd query bank balances $(simd keys show mykey -a)
+
+      # Send tokens
+      simd tx bank send mykey <recipient-address> 1000stake --chain-id my-test-chain
+      ```
+    </Step>
+  </Steps>
+</div>
+
+{/* Key Features Section */}
+<div className="mt-16 mb-16 max-w-5xl mx-auto px-6">
+  <h2 className="text-3xl font-semibold dark:text-white text-gray-900 mb-4">Key features</h2>
+  <p className="text-base dark:text-gray-400 text-gray-600 mb-8">
+    Everything you need to build production-ready blockchains
+  </p>
+
+  <CardGroup cols={2}>
+    <Card title="Modular architecture" icon="cubes" href="/architecture/modules">
+      Composable modules for auth, staking, governance, and more. Build custom modules or use battle-tested SDK modules.
+    </Card>
+    <Card title="Proof-of-Stake consensus" icon="shield-halved" href="/modules/staking">
+      Built-in integration with CometBFT for fast, secure Byzantine Fault Tolerant consensus with up to 10,000+ TPS.
+    </Card>
+    <Card title="IBC protocol" icon="link" href="/architecture/overview">
+      Native interoperability with 200+ chains through the Inter-Blockchain Communication protocol.
+    </Card>
+    <Card title="Advanced state management" icon="database" href="/architecture/state-management">
+      Efficient state storage with IAVL trees, supporting proofs and historical queries.
+    </Card>
+    <Card title="Governance system" icon="landmark" href="/modules/governance">
+      On-chain governance for protocol upgrades, parameter changes, and community coordination.
+    </Card>
+    <Card title="Upgrade coordination" icon="arrow-up-from-bracket" href="/modules/upgrade">
+      Safe, coordinated software upgrades without hard forks or chain halts.
+    </Card>
+  </CardGroup>
+</div>
+
+{/* Explore by Topic Section */}
+<div className="mt-16 mb-16 max-w-5xl mx-auto px-6">
+  <h2 className="text-3xl font-semibold dark:text-white text-gray-900 mb-4">Explore documentation</h2>
+  <p className="text-base dark:text-gray-400 text-gray-600 mb-8">
+    Dive deep into architecture, modules, and APIs
+  </p>
+
+  <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+    <a
+      href="/architecture/overview"
+      className="group block rounded-2xl dark:border dark:border-[#27272a] border border-gray-200 overflow-hidden no-underline dark:hover:border-[#7c7c7c] hover:border-[#7c7c7c] transition-colors"
+    >
+      <div className="h-48 dark:bg-[#1a1d27] bg-gray-50 flex items-center justify-center overflow-hidden">
+        <div className="text-6xl">🏗️</div>
+      </div>
+      <div className="p-6 dark:bg-[#1a1d27] bg-white">
+        <h3 className="text-base font-semibold dark:text-white text-gray-900 mb-2">Architecture</h3>
+        <p className="text-sm dark:text-gray-400 text-gray-600 mb-3">
+          Understand BaseApp, modules, transactions, and the state machine architecture
+        </p>
+        <div className="flex items-center text-sm dark:text-gray-400 text-gray-600 dark:group-hover:text-[#7c7c7c] group-hover:text-[#7c7c7c]">
+          <span>Explore architecture</span>
+          <svg className="ml-1 w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 5l7 7-7 7" />
+          </svg>
+        </div>
+      </div>
+    </a>
+
+    <a
+      href="/modules/index"
+      className="group block rounded-2xl dark:border dark:border-[#27272a] border border-gray-200 overflow-hidden no-underline dark:hover:border-[#7c7c7c] hover:border-[#7c7c7c] transition-colors"
+    >
+      <div className="h-48 dark:bg-[#1a1d27] bg-gray-50 flex items-center justify-center overflow-hidden">
+        <div className="text-6xl">📦</div>
+      </div>
+      <div className="p-6 dark:bg-[#1a1d27] bg-white">
+        <h3 className="text-base font-semibold dark:text-white text-gray-900 mb-2">Modules</h3>
+        <p className="text-sm dark:text-gray-400 text-gray-600 mb-3">
+          Explore essential, supplementary, and enterprise modules for building chains
+        </p>
+        <div className="flex items-center text-sm dark:text-gray-400 text-gray-600 dark:group-hover:text-[#7c7c7c] group-hover:text-[#7c7c7c]">
+          <span>Browse modules</span>
+          <svg className="ml-1 w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 5l7 7-7 7" />
+          </svg>
+        </div>
+      </div>
+    </a>
+
+    <a
+      href="/building/app-creation"
+      className="group block rounded-2xl dark:border dark:border-[#27272a] border border-gray-200 overflow-hidden no-underline dark:hover:border-[#7c7c7c] hover:border-[#7c7c7c] transition-colors"
+    >
+      <div className="h-48 dark:bg-[#1a1d27] bg-gray-50 flex items-center justify-center overflow-hidden">
+        <div className="text-6xl">⚙️</div>
+      </div>
+      <div className="p-6 dark:bg-[#1a1d27] bg-white">
+        <h3 className="text-base font-semibold dark:text-white text-gray-900 mb-2">Building chains</h3>
+        <p className="text-sm dark:text-gray-400 text-gray-600 mb-3">
+          Learn how to create, configure, test, and deploy your blockchain application
+        </p>
+        <div className="flex items-center text-sm dark:text-gray-400 text-gray-600 dark:group-hover:text-[#7c7c7c] group-hover:text-[#7c7c7c]">
+          <span>Start building</span>
+          <svg className="ml-1 w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 5l7 7-7 7" />
+          </svg>
+        </div>
+      </div>
+    </a>
+
+    <a
+      href="/api/baseapp"
+      className="group block rounded-2xl dark:border dark:border-[#27272a] border border-gray-200 overflow-hidden no-underline dark:hover:border-[#7c7c7c] hover:border-[#7c7c7c] transition-colors"
+    >
+      <div className="h-48 dark:bg-[#1a1d27] bg-gray-50 flex items-center justify-center overflow-hidden">
+        <div className="text-6xl">📚</div>
+      </div>
+      <div className="p-6 dark:bg-[#1a1d27] bg-white">
+        <h3 className="text-base font-semibold dark:text-white text-gray-900 mb-2">API reference</h3>
+        <p className="text-sm dark:text-gray-400 text-gray-600 mb-3">
+          Complete API documentation for core types, client interfaces, and module patterns
+        </p>
+        <div className="flex items-center text-sm dark:text-gray-400 text-gray-600 dark:group-hover:text-[#7c7c7c] group-hover:text-[#7c7c7c]">
+          <span>View API docs</span>
+          <svg className="ml-1 w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 5l7 7-7 7" />
+          </svg>
+        </div>
+      </div>
+    </a>
+  </div>
+</div>
+
+{/* Community Section */}
+<div className="mt-16 mb-16 max-w-5xl mx-auto px-6">
+  <h2 className="text-3xl font-semibold dark:text-white text-gray-900 mb-4">Community & support</h2>
+  <p className="text-base dark:text-gray-400 text-gray-600 mb-8">
+    Join the Cosmos developer community
+  </p>
+
+  <CardGroup cols={3}>
+    <Card title="Discord" icon="discord" href="https://discord.com/invite/interchain">
+      Join our Discord server for real-time discussions and support
+    </Card>
+    <Card title="GitHub" icon="github" href="https://github.com/cosmos/cosmos-sdk">
+      Explore the source code, report issues, and contribute to the SDK
+    </Card>
+    <Card title="Forum" icon="comments" href="https://forum.cosmos.network">
+      Participate in long-form discussions and governance proposals
+    </Card>
+  </CardGroup>
+</div>
+
+{/* CTA Banner */}
+<div className="mt-16 mb-16 max-w-5xl mx-auto px-6">
+  <div className="dark:bg-[#1a1d27] bg-gray-50 dark:border dark:border-[#27272a] border border-gray-200 rounded-2xl p-8 sm:p-12 text-center">
+    <h2 className="text-2xl sm:text-3xl font-semibold dark:text-white text-gray-900 mb-4">
+      Ready to build your blockchain?
+    </h2>
+    <p className="text-base dark:text-gray-400 text-gray-600 mb-6 max-w-2xl mx-auto">
+      Start building with Cosmos SDK today and join 200+ production blockchains in the interchain ecosystem
+    </p>
+    <a
+      href="/quickstart"
+      className="inline-flex items-center justify-center px-6 py-3 text-base font-semibold rounded-full bg-white text-black border border-gray-200 hover:bg-gray-100 dark:bg-white dark:text-black dark:hover:bg-gray-100 transition-colors"
+    >
+      Start Building
+    </a>
+  </div>
+</div>

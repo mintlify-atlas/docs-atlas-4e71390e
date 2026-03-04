@@ -1,0 +1,520 @@
+---
+title: Fee Grant Module (x/feegrant)
+description: Learn about the x/feegrant module for delegating transaction fee payments in Cosmos SDK.
+---
+
+# Fee Grant Module (x/feegrant)
+
+The `x/feegrant` module allows one account (the **granter**) to pay transaction fees on behalf of another account (the **grantee**). This enables use cases like onboarding new users without requiring them to acquire gas tokens first, or allowing services to sponsor transactions for their users.
+
+## Overview
+
+`x/feegrant` implements [ADR 029](https://github.com/cosmos/cosmos-sdk/blob/main/docs/architecture/adr-029-fee-grant-module.md) to provide a framework where accounts can grant fee allowances to other accounts. Fee allowances can be limited by spending caps, time periods, or specific message types.
+
+## Key Concepts
+
+### FeeAllowanceI Interface
+
+All fee allowance types implement the `FeeAllowanceI` interface:
+
+```go
+type FeeAllowanceI interface {
+    // Accept determines if the fee payment is allowed
+    // Returns remove=true if the allowance should be deleted after use
+    Accept(ctx context.Context, fee sdk.Coins, msgs []sdk.Msg) (remove bool, err error)
+
+    // ValidateBasic performs basic validation
+    ValidateBasic() error
+
+    // ExpiresAt returns the expiry time of the allowance
+    ExpiresAt() (*time.Time, error)
+}
+```
+
+### Grant Structure
+
+Fee allowance grants are stored with a composite key:
+
+```
+0x00 | grantee_addr_len (1 byte) | grantee_addr_bytes | granter_addr_len (1 byte) | granter_addr_bytes -> Grant
+```
+
+Each grant contains:
+- **Granter**: The account paying the fees
+- **Grantee**: The account whose fees are being paid
+- **Allowance**: The specific fee allowance logic
+
+## Fee Allowance Types
+
+### BasicAllowance
+
+Provides a simple spending limit and optional expiration:
+
+```go
+import "github.com/cosmos/cosmos-sdk/x/feegrant"
+
+// Grant unlimited fees until expiration
+expiration := time.Now().Add(365 * 24 * time.Hour)
+allowance := &feegrant.BasicAllowance{
+    SpendLimit: nil, // nil means unlimited
+    Expiration: &expiration,
+}
+
+// Grant 1000 tokens with no expiration
+spendLimit := sdk.NewCoins(sdk.NewInt64Coin("stake", 1000))
+allowance := &feegrant.BasicAllowance{
+    SpendLimit: spendLimit,
+    Expiration: nil,
+}
+
+k.GrantAllowance(ctx, granterAddr, granteeAddr, allowance)
+```
+
+**Properties:**
+- `spend_limit`: Maximum coins that can be spent (nil = unlimited)
+- `expiration`: When the allowance expires (nil = never)
+
+**Usage:**
+
+```go
+func (a *BasicAllowance) Accept(ctx context.Context, fee sdk.Coins, msgs []sdk.Msg) (bool, error) {
+    if a.Expiration != nil && a.Expiration.Before(sdk.UnwrapSDKContext(ctx).BlockTime()) {
+        return true, sdkerrors.ErrInvalidRequest.Wrap("allowance expired")
+    }
+
+    if a.SpendLimit != nil {
+        left, hasNeg := a.SpendLimit.SafeSub(fee...)
+        if hasNeg {
+            return false, sdkerrors.ErrInsufficientFunds.Wrap("allowance exceeded")
+        }
+
+        if left.IsZero() {
+            return true, nil // Remove allowance when spent
+        }
+
+        a.SpendLimit = left
+    }
+
+    return false, nil
+}
+```
+
+### PeriodicAllowance
+
+Provides a recurring spending limit that resets after each period:
+
+```go
+// Allow spending 100 tokens every 24 hours, with a total cap of 1000 tokens
+basic := &feegrant.BasicAllowance{
+    SpendLimit: sdk.NewCoins(sdk.NewInt64Coin("stake", 1000)),
+    Expiration: &expiration,
+}
+
+periodic := &feegrant.PeriodicAllowance{
+    Basic:            basic,
+    Period:           time.Hour * 24,
+    PeriodSpendLimit: sdk.NewCoins(sdk.NewInt64Coin("stake", 100)),
+    PeriodCanSpend:   sdk.NewCoins(sdk.NewInt64Coin("stake", 100)),
+    PeriodReset:      time.Now().Add(24 * time.Hour),
+}
+
+k.GrantAllowance(ctx, granterAddr, granteeAddr, periodic)
+```
+
+**Properties:**
+- `basic`: Optional BasicAllowance for overall limits
+- `period`: Duration of each spending period
+- `period_spend_limit`: Maximum coins per period
+- `period_can_spend`: Remaining coins in current period
+- `period_reset`: When the next period starts
+
+**Usage:**
+
+```go
+func (a *PeriodicAllowance) Accept(ctx context.Context, fee sdk.Coins, msgs []sdk.Msg) (bool, error) {
+    blockTime := sdk.UnwrapSDKContext(ctx).BlockTime()
+
+    // Reset period if needed
+    if blockTime.After(a.PeriodReset) {
+        a.PeriodReset = blockTime.Add(a.Period)
+        a.PeriodCanSpend = a.PeriodSpendLimit
+    }
+
+    // Check period limit
+    left, hasNeg := a.PeriodCanSpend.SafeSub(fee...)
+    if hasNeg {
+        return false, sdkerrors.ErrInsufficientFunds.Wrap("period allowance exceeded")
+    }
+    a.PeriodCanSpend = left
+
+    // Check overall limit if basic allowance is set
+    if a.Basic != nil {
+        return a.Basic.Accept(ctx, fee, msgs)
+    }
+
+    return false, nil
+}
+```
+
+### AllowedMsgAllowance
+
+Restricts a fee allowance to specific message types:
+
+```go
+// Only allow fees for bank send and governance vote messages
+basic := &feegrant.BasicAllowance{
+    SpendLimit: sdk.NewCoins(sdk.NewInt64Coin("stake", 500)),
+}
+
+allowed := &feegrant.AllowedMsgAllowance{
+    Allowance: basic,
+    AllowedMessages: []string{
+        "/cosmos.bank.v1beta1.MsgSend",
+        "/cosmos.gov.v1.MsgVote",
+    },
+}
+
+k.GrantAllowance(ctx, granterAddr, granteeAddr, allowed)
+```
+
+**Validation:**
+
+```go
+func (a *AllowedMsgAllowance) Accept(ctx context.Context, fee sdk.Coins, msgs []sdk.Msg) (bool, error) {
+    // Check that all messages are in the allowed list
+    for _, msg := range msgs {
+        found := false
+        for _, allowed := range a.AllowedMessages {
+            if sdk.MsgTypeURL(msg) == allowed {
+                found = true
+                break
+            }
+        }
+        if !found {
+            return false, sdkerrors.ErrUnauthorized.Wrapf(
+                "message type %s not allowed",
+                sdk.MsgTypeURL(msg),
+            )
+        }
+    }
+
+    // Delegate to underlying allowance
+    return a.Allowance.Accept(ctx, fee, msgs)
+}
+```
+
+## Message Handlers
+
+### MsgGrantAllowance
+
+Create a new fee allowance grant:
+
+```go
+type MsgGrantAllowance struct {
+    Granter   string
+    Grantee   string
+    Allowance *codectypes.Any // Must implement FeeAllowanceI
+}
+```
+
+**Processing:**
+
+```go
+func (k Keeper) GrantAllowance(ctx context.Context, granter, grantee sdk.AccAddress, feeAllowance feegrant.FeeAllowanceI) error {
+    // Check for duplicate
+    if existing, _ := k.GetAllowance(ctx, granter, grantee); existing != nil {
+        return sdkerrors.ErrInvalidRequest.Wrap("fee allowance already exists")
+    }
+
+    // Create grantee account if it doesn't exist
+    granteeAcc := k.authKeeper.GetAccount(ctx, grantee)
+    if granteeAcc == nil {
+        if k.bankKeeper.BlockedAddr(grantee) {
+            return sdkerrors.ErrUnauthorized.Wrapf("%s is not allowed to receive funds", grantee)
+        }
+        granteeAcc = k.authKeeper.NewAccountWithAddress(ctx, grantee)
+        k.authKeeper.SetAccount(ctx, granteeAcc)
+    }
+
+    // Validate expiration
+    exp, _ := feeAllowance.ExpiresAt()
+    if exp != nil && exp.Before(sdk.UnwrapSDKContext(ctx).BlockTime()) {
+        return sdkerrors.ErrInvalidRequest.Wrap("expiration is before current block time")
+    }
+
+    // Add to expiration queue
+    if exp != nil {
+        k.FeeAllowanceQueue.Set(ctx, collections.Join3(*exp, grantee, granter), true)
+    }
+
+    // Save grant
+    grant, _ := feegrant.NewGrant(granter, grantee, feeAllowance)
+    return k.FeeAllowance.Set(ctx, collections.Join(grantee, granter), grant)
+}
+```
+
+### MsgRevokeAllowance
+
+Revoke an existing fee allowance:
+
+```go
+msg := &feegrant.MsgRevokeAllowance{
+    Granter: granterAddr.String(),
+    Grantee: granteeAddr.String(),
+}
+```
+
+### Using Fee Allowances
+
+Fee allowances are automatically checked in the `DeductFeeDecorator` ante handler:
+
+```go
+func (dfd DeductFeeDecorator) AnteHandle(ctx sdk.Context, tx sdk.Tx, simulate bool, next sdk.AnteHandler) (sdk.Context, error) {
+    feeTx, ok := tx.(sdk.FeeTx)
+    if !ok {
+        return ctx, sdkerrors.ErrTxDecode.Wrap("Tx must be a FeeTx")
+    }
+
+    // Check for fee granter
+    feeGranter := feeTx.FeeGranter()
+    feePayer := feeTx.FeePayer()
+
+    if feeGranter != nil {
+        // Use fee allowance
+        if err := dfd.feeGrantKeeper.UseGrantedFees(ctx, feeGranter, feePayer, feeTx.GetFee(), tx.GetMsgs()); err != nil {
+            return ctx, err
+        }
+    } else {
+        // Deduct from fee payer
+        if err := DeductFees(dfd.bankKeeper, ctx, feePayer, feeTx.GetFee()); err != nil {
+            return ctx, err
+        }
+    }
+
+    return next(ctx, tx, simulate)
+}
+```
+
+## Fee Allowance Pruning
+
+Expired allowances are automatically removed in `EndBlock`:
+
+```go
+func (k Keeper) RemoveExpiredAllowances(ctx context.Context, limit int32) error {
+    exp := sdk.UnwrapSDKContext(ctx).BlockTime()
+    rng := collections.NewPrefixUntilTripleRange[time.Time, sdk.AccAddress, sdk.AccAddress](exp)
+    count := int32(0)
+
+    keysToRemove := []collections.Triple[time.Time, sdk.AccAddress, sdk.AccAddress]{}
+    k.FeeAllowanceQueue.Walk(ctx, rng, func(key collections.Triple[time.Time, sdk.AccAddress, sdk.AccAddress], value bool) (stop bool, err error) {
+        grantee, granter := key.K2(), key.K3()
+
+        // Remove allowance
+        if err := k.FeeAllowance.Remove(ctx, collections.Join(grantee, granter)); err != nil {
+            return true, err
+        }
+
+        keysToRemove = append(keysToRemove, key)
+        count++
+
+        return count == limit, nil
+    })
+
+    // Remove from queue
+    for _, key := range keysToRemove {
+        k.FeeAllowanceQueue.Remove(ctx, key)
+    }
+
+    return nil
+}
+```
+
+## Query Endpoints
+
+### Allowance
+
+Query a specific fee allowance:
+
+```bash
+grpcurl -plaintext \
+    -d '{"grantee":"cosmos1...","granter":"cosmos1..."}' \
+    localhost:9090 \
+    cosmos.feegrant.v1beta1.Query/Allowance
+```
+
+**Response:**
+
+```json
+{
+  "allowance": {
+    "granter": "cosmos1...",
+    "grantee": "cosmos1...",
+    "allowance": {
+      "@type":"/cosmos.feegrant.v1beta1.BasicAllowance",
+      "spendLimit":[{"denom":"stake","amount":"100"}]
+    }
+  }
+}
+```
+
+### Allowances
+
+Query all allowances for a grantee:
+
+```bash
+simd query feegrant grants-by-grantee cosmos1...
+```
+
+## Gas Considerations
+
+Filtered allowances (AllowedMsgAllowance) consume gas during validation:
+
+```go
+const gasPerIteration = uint64(10)
+
+// Charge gas for iterating allowed messages
+for _, msg := range msgs {
+    ctx.GasMeter().ConsumeGas(gasPerIteration, "feegrant filter")
+    // ... validation logic
+}
+```
+
+Ensure your transactions conform to filters to avoid wasting the granter's allowance on gas.
+
+## CLI Examples
+
+### Grant Basic Allowance
+
+```bash
+# Grant 100 tokens with no expiration
+simd tx feegrant grant cosmos1granter cosmos1grantee \
+    --spend-limit=100stake \
+    --from=cosmos1granter
+
+# Grant unlimited fees for 1 year
+simd tx feegrant grant cosmos1granter cosmos1grantee \
+    --expiration=1735689599 \
+    --from=cosmos1granter
+```
+
+### Grant Periodic Allowance
+
+```bash
+# Grant 10 tokens per hour
+simd tx feegrant grant cosmos1granter cosmos1grantee \
+    --period=3600 \
+    --period-limit=10stake \
+    --from=cosmos1granter
+```
+
+### Use Fee Allowance
+
+```bash
+# Execute transaction with fee granter
+simd tx bank send cosmos1grantee cosmos1recipient 50stake \
+    --from=cosmos1grantee \
+    --fee-granter=cosmos1granter \
+    --fees=1stake
+```
+
+### Revoke Allowance
+
+```bash
+simd tx feegrant revoke cosmos1granter cosmos1grantee \
+    --from=cosmos1granter
+```
+
+### Query Allowances
+
+```bash
+# Query specific allowance
+simd query feegrant grant cosmos1granter cosmos1grantee
+
+# Query all allowances for grantee
+simd query feegrant grants-by-grantee cosmos1grantee
+```
+
+## Use Cases
+
+### User Onboarding
+
+```go
+// Service grants new users 100 transactions worth of fees
+basic := &feegrant.BasicAllowance{
+    SpendLimit: sdk.NewCoins(sdk.NewInt64Coin("stake", 1000)),
+    Expiration: ptr(time.Now().Add(30 * 24 * time.Hour)),
+}
+
+allowed := &feegrant.AllowedMsgAllowance{
+    Allowance: basic,
+    AllowedMessages: []string{
+        "/cosmos.bank.v1beta1.MsgSend",
+        "/myapp.mymodule.v1.MsgAction",
+    },
+}
+
+k.GrantAllowance(ctx, serviceAddr, newUserAddr, allowed)
+```
+
+### Subscription Service
+
+```go
+// User pays monthly subscription fees
+expiration := time.Now().Add(365 * 24 * time.Hour)
+periodic := &feegrant.PeriodicAllowance{
+    Basic: &feegrant.BasicAllowance{
+        SpendLimit: sdk.NewCoins(sdk.NewInt64Coin("usdc", 120_000000)), // $120/year
+        Expiration: &expiration,
+    },
+    Period:           30 * 24 * time.Hour,
+    PeriodSpendLimit: sdk.NewCoins(sdk.NewInt64Coin("usdc", 10_000000)), // $10/month
+    PeriodCanSpend:   sdk.NewCoins(sdk.NewInt64Coin("usdc", 10_000000)),
+    PeriodReset:      time.Now().Add(30 * 24 * time.Hour),
+}
+
+k.GrantAllowance(ctx, userAddr, subscriptionServiceAddr, periodic)
+```
+
+### Enterprise API Access
+
+```go
+// Grant API service unlimited fees for specific operations
+basic := &feegrant.BasicAllowance{
+    SpendLimit: nil, // unlimited
+    Expiration: nil, // never expires
+}
+
+allowed := &feegrant.AllowedMsgAllowance{
+    Allowance: basic,
+    AllowedMessages: []string{
+        "/myapp.api.v1.MsgQuery",
+        "/myapp.api.v1.MsgWrite",
+    },
+}
+
+k.GrantAllowance(ctx, enterpriseAddr, apiServiceAddr, allowed)
+```
+
+## Best Practices
+
+1. **Set spending limits** to prevent abuse of fee allowances
+2. **Use AllowedMsgAllowance** to restrict what actions can be performed
+3. **Set expiration times** to automatically revoke unused allowances
+4. **Monitor usage** through events to detect anomalies
+5. **Use PeriodicAllowance** for recurring payments or subscriptions
+6. **Test fee deduction logic** thoroughly in your application
+
+## Security Considerations
+
+- Fee allowances give the grantee the ability to spend the granter's tokens on fees
+- Always set reasonable spending limits
+- Monitor for unexpected fee usage patterns
+- Revoke allowances when they're no longer needed
+- Be cautious with unlimited allowances (nil SpendLimit)
+- Validate that grantee addresses are trusted before creating grants
+
+## References
+
+- [ADR 029: Fee Grant Module](https://github.com/cosmos/cosmos-sdk/blob/main/docs/architecture/adr-029-fee-grant-module.md)
+- [Source Code: x/feegrant/keeper/keeper.go](/home/daytona/workspace/source/x/feegrant/keeper/keeper.go:74-129)
+- [Source Code: x/feegrant/fees.go](/home/daytona/workspace/source/x/feegrant/fees.go:9-32)

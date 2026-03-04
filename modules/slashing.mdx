@@ -1,0 +1,539 @@
+---
+title: Slashing Module
+description: Validator penalties for misbehavior and liveness issues
+---
+
+# Slashing Module (x/slashing)
+
+## Overview
+
+The `x/slashing` module implements functionality to disincentivize validator misbehavior by penalizing (slashing) their stake and removing their ability to vote on blocks temporarily or permanently.
+
+**Purpose**: Maintain network security and liveness by penalizing validators who commit protocol faults or fail to participate in consensus.
+
+## Key Concepts
+
+### Validator States
+
+At any time, validators can be:
+- **Bonded**: Active set, signing blocks, earning rewards
+- **Unbonding**: Leaving active set
+- **Unbonded**: Not in active set
+- **Jailed**: Temporarily banned from active set
+- **Tombstoned**: Permanently banned (cannot unjail)
+
+### Penalties
+
+Two main types of misbehavior are penalized:
+
+1. **Liveness Faults**: Missing too many blocks
+   - Slash percentage: ~0.01%
+   - Jail duration: Configurable (e.g., 10 minutes)
+   - Can unjail after period expires
+   - Not tombstoned
+
+2. **Byzantine Faults**: Double signing
+   - Slash percentage: ~5%
+   - Permanently tombstoned
+   - Cannot rejoin validator set
+   - Consensus key permanently banned
+
+### Tombstone Caps
+
+Validators are tombstoned on first double-sign to prevent multiple slashes for same type of fault. Prevents excessive punishment from configuration errors.
+
+## State
+
+### ValidatorSigningInfo
+
+Tracks liveness and infraction information:
+
+**Storage**: `0x01 | ConsAddr -> ProtocolBuffer(ValidatorSigningInfo)`
+
+```protobuf
+message ValidatorSigningInfo {
+    string address = 1;
+    int64 start_height = 2;
+    int64 index_offset = 3;
+    google.protobuf.Timestamp jailed_until = 4;
+    bool tombstoned = 5;
+    int64 missed_blocks_counter = 6;
+}
+```
+
+### MissedBlocksBitArray
+
+Tracks which blocks validator missed:
+
+**Storage**: `0x02 | ConsAddr | LittleEndianUint64(index) -> VarInt(didMiss)`
+
+- `0` = validator signed block
+- `1` = validator missed block
+- Size = `SignedBlocksWindow` parameter
+
+### Parameters
+
+**Storage**: `0x00 -> ProtocolBuffer(Params)`
+
+```protobuf
+message Params {
+    int64 signed_blocks_window = 1;
+    bytes min_signed_per_window = 2;
+    google.protobuf.Duration downtime_jail_duration = 3;
+    bytes slash_fraction_double_sign = 4;
+    bytes slash_fraction_downtime = 5;
+}
+```
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| SignedBlocksWindow | int64 | 100 | Blocks in sliding window |
+| MinSignedPerWindow | Dec | 0.500000000000000000 | Minimum % blocks to sign |
+| DowntimeJailDuration | Duration | 600s | Jail time for downtime |
+| SlashFractionDoubleSign | Dec | 0.050000000000000000 | 5% slash for double sign |
+| SlashFractionDowntime | Dec | 0.010000000000000000 | 0.01% slash for downtime |
+
+## Messages
+
+### MsgUnjail
+
+Validator requests to unjail after downtime:
+
+```protobuf
+message MsgUnjail {
+    string validator_addr = 1;
+}
+```
+
+**Validation**:
+- Validator must exist
+- Validator must be jailed
+- Validator must not be tombstoned
+- Current time must be after `JailedUntil`
+- Validator must have self-delegation
+
+**Usage**:
+```bash
+simd tx slashing unjail --from=mykey
+```
+
+## BeginBlock Liveness Tracking
+
+At each block, the module:
+
+1. **Update Signing Info**: Increment `IndexOffset` for each validator
+2. **Track Missed Blocks**: Update `MissedBlocksBitArray` based on votes
+3. **Check Liveness**: If validator exceeded `maxMissed`, slash and jail
+
+### Liveness Algorithm
+
+```go
+height := block.Height
+
+for vote in block.LastCommitInfo.Votes {
+    signInfo := GetValidatorSigningInfo(vote.Validator.Address)
+    
+    // Calculate relative index in sliding window
+    index := signInfo.IndexOffset % SignedBlocksWindow()
+    signInfo.IndexOffset++
+    
+    // Update missed blocks tracking
+    missedPrevious := GetValidatorMissedBlockBitArray(vote.Validator.Address, index)
+    missed := !vote.SignedLastBlock
+    
+    if !missedPrevious && missed {
+        SetValidatorMissedBlockBitArray(vote.Validator.Address, index, true)
+        signInfo.MissedBlocksCounter++
+    } else if missedPrevious && !missed {
+        SetValidatorMissedBlockBitArray(vote.Validator.Address, index, false)
+        signInfo.MissedBlocksCounter--
+    }
+    
+    // Check if validator should be slashed
+    minHeight := signInfo.StartHeight + SignedBlocksWindow()
+    maxMissed := SignedBlocksWindow() - MinSignedPerWindow()
+    
+    if height > minHeight && signInfo.MissedBlocksCounter > maxMissed {
+        // Slash for downtime
+        distributionHeight := height - sdk.ValidatorUpdateDelay - 1
+        SlashWithInfractionReason(
+            vote.Validator.Address,
+            distributionHeight,
+            vote.Validator.Power,
+            SlashFractionDowntime(),
+            stakingtypes.Downtime,
+        )
+        
+        // Jail validator
+        Jail(vote.Validator.Address)
+        signInfo.JailedUntil = block.Time.Add(DowntimeJailDuration())
+        
+        // Reset counters
+        signInfo.MissedBlocksCounter = 0
+        signInfo.IndexOffset = 0
+        ClearValidatorMissedBlockBitArray(vote.Validator.Address)
+    }
+    
+    SetValidatorSigningInfo(vote.Validator.Address, signInfo)
+}
+```
+
+### Max Missed Blocks Calculation
+
+```
+maxMissed = SignedBlocksWindow - (MinSignedPerWindow * SignedBlocksWindow)
+```
+
+Example with defaults:
+```
+window = 100 blocks
+minSigned = 0.5 (50%)
+maxMissed = 100 - (0.5 * 100) = 50 blocks
+```
+
+## Slashing for Double Sign
+
+When CometBFT detects double signing:
+
+1. **Slash Validator**: Apply `SlashFractionDoubleSign` to tokens
+2. **Slash Delegations**: Slash unbonding delegations and redelegations
+3. **Jail Validator**: Permanently jail
+4. **Tombstone**: Mark as tombstoned (cannot unjail)
+
+```go
+func HandleEquivocationEvidence(
+    ctx sdk.Context,
+    evidence *types.Equivocation,
+) {
+    // Get validator
+    validator := stakingKeeper.ValidatorByConsAddr(ctx, evidence.GetConsensusAddress())
+    if validator == nil {
+        return
+    }
+    
+    // Check if already tombstoned
+    signInfo := GetValidatorSigningInfo(ctx, consAddr)
+    if signInfo.Tombstoned {
+        return
+    }
+    
+    // Slash at infraction height
+    slashFraction := SlashFractionDoubleSign()
+    stakingKeeper.SlashWithInfractionReason(
+        ctx,
+        consAddr,
+        evidence.GetHeight(),
+        evidence.GetValidatorPower(),
+        slashFraction,
+        stakingtypes.DoubleSign,
+    )
+    
+    // Jail permanently
+    stakingKeeper.Jail(ctx, consAddr)
+    
+    // Tombstone
+    signInfo.Tombstoned = true
+    signInfo.JailedUntil = time.Unix(63113904000, 0) // Forever
+    SetValidatorSigningInfo(ctx, consAddr, signInfo)
+}
+```
+
+## Queries
+
+### Query Signing Info
+
+```bash
+simd query slashing signing-info cosmosvalcons1...
+```
+
+Example output:
+```yaml
+address: cosmosvalcons1...
+index_offset: "1000"
+jailed_until: "1970-01-01T00:00:00Z"
+missed_blocks_counter: "5"
+start_height: "0"
+tombstoned: false
+```
+
+### Query Signing Infos
+
+```bash
+simd query slashing signing-infos
+```
+
+### Query Parameters
+
+```bash
+simd query slashing params
+```
+
+Example output:
+```yaml
+downtime_jail_duration: 600s
+min_signed_per_window: "0.500000000000000000"
+slash_fraction_double_sign: "0.050000000000000000"
+slash_fraction_downtime: "0.010000000000000000"
+signed_blocks_window: "100"
+```
+
+## gRPC Endpoints
+
+### SigningInfo
+
+```bash
+grpcurl -plaintext \
+    -d '{"cons_address":"cosmosvalcons1.."}' \
+    localhost:9090 \
+    cosmos.slashing.v1beta1.Query/SigningInfo
+```
+
+### SigningInfos
+
+```bash
+grpcurl -plaintext \
+    localhost:9090 \
+    cosmos.slashing.v1beta1.Query/SigningInfos
+```
+
+### Params
+
+```bash
+grpcurl -plaintext \
+    localhost:9090 \
+    cosmos.slashing.v1beta1.Query/Params
+```
+
+## Events
+
+### MsgUnjail
+
+| Type | Attribute Key | Attribute Value |
+|------|---------------|----------------|
+| message | module | slashing |
+| message | sender | {validatorAddress} |
+
+### Slash Event
+
+| Type | Attribute Key | Attribute Value |
+|------|---------------|----------------|
+| slash | address | {validatorConsensusAddress} |
+| slash | power | {validatorPower} |
+| slash | reason | {slashReason} |
+| slash | jailed | {validatorConsensusAddress} |
+| slash | burned_coins | {amount} |
+
+### Liveness Event
+
+| Type | Attribute Key | Attribute Value |
+|------|---------------|----------------|
+| liveness | address | {validatorConsensusAddress} |
+| liveness | missed_blocks | {missedBlocksCounter} |
+| liveness | height | {blockHeight} |
+
+## Code Examples
+
+### Unjail Validator
+
+```go
+// Unjail after downtime
+func UnjailValidator(
+    ctx sdk.Context,
+    k keeper.Keeper,
+    valAddr sdk.ValAddress,
+) error {
+    // Get validator
+    validator := stakingKeeper.Validator(ctx, valAddr)
+    if validator == nil {
+        return types.ErrNoValidatorForAddress
+    }
+    
+    // Check if jailed
+    if !validator.IsJailed() {
+        return types.ErrValidatorNotJailed
+    }
+    
+    // Get signing info
+    consAddr := validator.GetConsAddr()
+    signInfo, found := k.GetValidatorSigningInfo(ctx, consAddr)
+    if !found {
+        return types.ErrNoValidatorForAddress
+    }
+    
+    // Check if tombstoned
+    if signInfo.Tombstoned {
+        return types.ErrValidatorJailed
+    }
+    
+    // Check if jail period expired
+    if ctx.BlockHeader().Time.Before(signInfo.JailedUntil) {
+        return types.ErrValidatorJailed
+    }
+    
+    // Unjail
+    stakingKeeper.Unjail(ctx, consAddr)
+    
+    return nil
+}
+```
+
+### Query Missed Blocks
+
+```go
+// Get missed blocks for validator
+func GetMissedBlocks(
+    ctx sdk.Context,
+    k keeper.Keeper,
+    consAddr sdk.ConsAddress,
+) (int64, error) {
+    signInfo, found := k.GetValidatorSigningInfo(ctx, consAddr)
+    if !found {
+        return 0, fmt.Errorf("validator not found")
+    }
+    
+    return signInfo.MissedBlocksCounter, nil
+}
+```
+
+### Check Liveness
+
+```go
+// Check if validator is meeting liveness requirements
+func CheckLiveness(
+    ctx sdk.Context,
+    k keeper.Keeper,
+    consAddr sdk.ConsAddress,
+) (bool, error) {
+    params := k.GetParams(ctx)
+    signInfo, found := k.GetValidatorSigningInfo(ctx, consAddr)
+    if !found {
+        return false, fmt.Errorf("validator not found")
+    }
+    
+    maxMissed := params.SignedBlocksWindow - 
+        (params.MinSignedPerWindow.MulInt64(params.SignedBlocksWindow).TruncateInt64())
+    
+    return signInfo.MissedBlocksCounter <= maxMissed, nil
+}
+```
+
+### Slash Validator
+
+```go
+// Slash validator for infraction
+func SlashValidator(
+    ctx sdk.Context,
+    k keeper.Keeper,
+    consAddr sdk.ConsAddress,
+    infractionHeight int64,
+    power int64,
+    slashFraction sdk.Dec,
+) {
+    // Get validator
+    validator := stakingKeeper.ValidatorByConsAddr(ctx, consAddr)
+    if validator == nil {
+        return
+    }
+    
+    // Slash tokens
+    stakingKeeper.Slash(
+        ctx,
+        consAddr,
+        infractionHeight,
+        power,
+        slashFraction,
+    )
+    
+    // Emit event
+    ctx.EventManager().EmitEvent(
+        sdk.NewEvent(
+            types.EventTypeSlash,
+            sdk.NewAttribute(types.AttributeKeyAddress, consAddr.String()),
+            sdk.NewAttribute(types.AttributeKeyPower, fmt.Sprintf("%d", power)),
+            sdk.NewAttribute(types.AttributeKeyReason, "downtime"),
+        ),
+    )
+}
+```
+
+## Hooks
+
+### AfterValidatorBonded
+
+Initialize signing info when validator bonds:
+
+```go
+func (h Hooks) AfterValidatorBonded(
+    ctx context.Context,
+    consAddr sdk.ConsAddress,
+    valAddr sdk.ValAddress,
+) error {
+    signingInfo, found := h.k.GetValidatorSigningInfo(ctx, consAddr)
+    if !found {
+        signingInfo = types.ValidatorSigningInfo{
+            Address:             consAddr.String(),
+            StartHeight:         ctx.BlockHeight(),
+            IndexOffset:         0,
+            JailedUntil:         time.Unix(0, 0),
+            Tombstoned:          false,
+            MissedBlocksCounter: 0,
+        }
+    } else {
+        signingInfo.StartHeight = ctx.BlockHeight()
+    }
+    
+    h.k.SetValidatorSigningInfo(ctx, consAddr, signingInfo)
+    return nil
+}
+```
+
+## CLI Commands Reference
+
+| Command | Description |
+|---------|-------------|
+| `simd query slashing signing-info [cons-addr]` | Query signing info |
+| `simd query slashing signing-infos` | Query all signing infos |
+| `simd query slashing params` | Query slashing parameters |
+| `simd tx slashing unjail` | Unjail validator |
+
+## Integration Guide
+
+```go
+// Initialize slashing keeper
+app.SlashingKeeper = slashingkeeper.NewKeeper(
+    appCodec,
+    legacyAmino,
+    runtime.NewKVStoreService(keys[slashingtypes.StoreKey]),
+    app.StakingKeeper,
+    authtypes.NewModuleAddress(govtypes.ModuleName).String(),
+)
+
+// Register module
+app.ModuleManager = module.NewManager(
+    slashing.NewAppModule(
+        appCodec,
+        app.SlashingKeeper,
+        app.AccountKeeper,
+        app.BankKeeper,
+        app.StakingKeeper,
+    ),
+    // other modules...
+)
+
+// Register hooks
+app.StakingKeeper.SetHooks(
+    stakingtypes.NewMultiStakingHooks(
+        app.DistrKeeper.Hooks(),
+        app.SlashingKeeper.Hooks(),
+    ),
+)
+```
+
+## Best Practices
+
+1. **Monitor Uptime**: Track validator signing percentage
+2. **Set Alerts**: Alert before reaching missed blocks threshold
+3. **Backup Infrastructure**: Maintain redundant signing nodes
+4. **Test Unjailing**: Practice unjail process on testnet
+5. **Avoid Double Signing**: Never run duplicate validators with same key
+6. **Key Management**: Secure consensus keys properly

@@ -1,0 +1,439 @@
+---
+title: Enterprise Modules Overview
+description: Learn about Cosmos SDK enterprise modules for permissioned networks and specialized blockchain use cases.
+---
+
+# Enterprise Modules Overview
+
+Enterprise modules are production-ready extensions to the Cosmos SDK designed for **permissioned networks**, **consortium chains**, and **enterprise deployments** that require features beyond traditional public blockchain architectures.
+
+## What Are Enterprise Modules?
+
+Enterprise modules are located in the `enterprise/` directory of the Cosmos SDK repository, separate from the core `x/` modules. They provide specialized functionality for use cases such as:
+
+- Proof of Authority (PoA) consensus
+- Permissioned validator sets
+- On-chain multisig governance
+- Enterprise-grade access control
+
+## Key Differences from Core Modules
+
+| Aspect | Core Modules (x/) | Enterprise Modules (enterprise/) |
+|--------|------------------|----------------------------------|
+| **License** | Apache-2.0 | Source Available Evaluation License |
+| **Maintenance** | Cosmos Labs | Cosmos Labs |
+| **Production Ready** | Yes | Yes |
+| **Commercial Use** | Permitted | Requires separate license |
+| **Use Cases** | Public blockchains | Permissioned/consortium chains |
+
+## Licensing
+
+**IMPORTANT:** Enterprise modules use different licenses than the Apache-2.0 core Cosmos SDK modules.
+
+While the core Cosmos SDK is licensed under Apache-2.0, enterprise modules use the **Source Available Evaluation License**, which:
+
+- ✅ Allows non-commercial evaluation
+- ✅ Allows testing and development
+- ✅ Allows educational use
+- ❌ **Prohibits commercial use**
+- ❌ **Prohibits production deployment**
+- ❌ **Prohibits redistribution**
+
+### License Files
+
+Always review the LICENSE file in each enterprise module directory:
+
+```bash
+# Example license paths
+enterprise/poa/LICENSE
+enterprise/group/LICENSE
+```
+
+### Commercial Licensing
+
+For commercial use, production deployment, or consortium chains, contact:
+
+**Cosmos Labs Institutions Team**  
+Email: [institutions@cosmoslabs.io](mailto:institutions@cosmoslabs.io)
+
+## Available Enterprise Modules
+
+### Proof of Authority (x/poa)
+
+**License:** [Source Available Evaluation License](https://github.com/cosmos/cosmos-sdk/blob/main/enterprise/poa/LICENSE)
+
+A Cosmos SDK module that implements Proof of Authority consensus, allowing a designated admin to manage a permissioned validator set.
+
+**Key Features:**
+- Admin-controlled validator set management
+- Fee distribution proportional to validator power
+- Governance integration restricted to validators
+- Custom vote tallying based on validator power
+
+**Use Cases:**
+- Consortium blockchains
+- Private enterprise networks
+- Testing environments
+- Regulated financial applications
+
+**Documentation:**
+- [PoA Module Guide](/modules/poa)
+- [Source Code](https://github.com/cosmos/cosmos-sdk/tree/main/enterprise/poa)
+
+**Example:**
+
+```go
+import (
+    "github.com/cosmos/cosmos-sdk/enterprise/poa/x/poa"
+    poakeeper "github.com/cosmos/cosmos-sdk/enterprise/poa/x/poa/keeper"
+    poatypes "github.com/cosmos/cosmos-sdk/enterprise/poa/x/poa/types"
+)
+
+// Initialize PoA keeper
+poaKeeper := poakeeper.NewKeeper(
+    appCodec,
+    storeService,
+    transientStoreService,
+    app.AccountKeeper,
+    app.BankKeeper,
+)
+
+// Add module to module manager
+app.ModuleManager = module.NewManager(
+    // ... other modules
+    poa.NewAppModule(appCodec, poaKeeper),
+)
+```
+
+### Group (x/group)
+
+**License:** [Source Available Evaluation License](https://github.com/cosmos/cosmos-sdk/blob/main/enterprise/group/LICENSE)
+
+A Cosmos SDK module for on-chain multisig accounts and group-based governance with configurable decision policies.
+
+**Key Features:**
+- Groups with weighted members
+- Group policy accounts
+- Threshold-based decision policies
+- Percentage-based decision policies
+- Proposal submission and voting
+
+**Use Cases:**
+- On-chain multisig wallets
+- Committee-based governance
+- Treasury management
+- Multi-party authorization
+
+**Documentation:**
+- [Group Module README](https://github.com/cosmos/cosmos-sdk/blob/main/enterprise/group/README.md)
+- [Source Code](https://github.com/cosmos/cosmos-sdk/tree/main/enterprise/group)
+
+**Example:**
+
+```go
+import (
+    "github.com/cosmos/cosmos-sdk/enterprise/group/x/group"
+    groupkeeper "github.com/cosmos/cosmos-sdk/enterprise/group/x/group/keeper"
+)
+
+// Create a group with weighted members
+members := []group.MemberRequest{
+    {Address: member1.String(), Weight: "3"},
+    {Address: member2.String(), Weight: "2"},
+    {Address: member3.String(), Weight: "1"},
+}
+
+msgCreateGroup := &group.MsgCreateGroup{
+    Admin:   admin.String(),
+    Members: members,
+    Metadata: "Treasury Committee",
+}
+
+// Create group policy with threshold
+policy := group.NewThresholdDecisionPolicy(
+    "4", // 4 out of 6 votes required
+    time.Hour * 24 * 7, // 7 day voting period
+    time.Hour * 24, // 1 day min execution period
+)
+
+msgCreateGroupPolicy := &group.MsgCreateGroupPolicy{
+    Admin:          admin.String(),
+    GroupId:        groupId,
+    Metadata:       "Treasury Spending Policy",
+    DecisionPolicy: policy,
+}
+```
+
+## Integration with Core SDK
+
+Enterprise modules follow the same architectural patterns as core modules and integrate seamlessly:
+
+### Module Manager
+
+```go
+app.ModuleManager = module.NewManager(
+    // Core modules
+    auth.NewAppModule(appCodec, app.AccountKeeper),
+    bank.NewAppModule(appCodec, app.BankKeeper),
+    gov.NewAppModule(appCodec, app.GovKeeper),
+
+    // Enterprise modules
+    poa.NewAppModule(appCodec, app.PoaKeeper),
+    group.NewAppModule(appCodec, app.GroupKeeper),
+)
+```
+
+### Genesis Initialization
+
+```go
+app.ModuleManager.SetOrderInitGenesis(
+    authtypes.ModuleName,
+    banktypes.ModuleName,
+    poatypes.ModuleName,      // Enterprise module
+    grouptypes.ModuleName,    // Enterprise module
+    govtypes.ModuleName,
+    // ... other modules
+)
+```
+
+### Begin/End Blockers
+
+```go
+app.ModuleManager.SetOrderBeginBlockers(
+    poatypes.ModuleName,      // Enterprise module runs first
+    distrtypes.ModuleName,
+    // ... other modules
+)
+```
+
+## Adding Enterprise Modules to Your Chain
+
+### 1. Review License
+
+First, carefully review the module's LICENSE file to ensure compliance with your use case:
+
+```bash
+cat enterprise/poa/LICENSE
+```
+
+### 2. Add to go.mod
+
+Enterprise modules are part of the main Cosmos SDK repository:
+
+```go
+require (
+    github.com/cosmos/cosmos-sdk v0.53.0
+)
+```
+
+### 3. Import Module
+
+```go
+import (
+    "github.com/cosmos/cosmos-sdk/enterprise/poa/x/poa"
+    poakeeper "github.com/cosmos/cosmos-sdk/enterprise/poa/x/poa/keeper"
+    poatypes "github.com/cosmos/cosmos-sdk/enterprise/poa/x/poa/types"
+)
+```
+
+### 4. Initialize Keeper
+
+```go
+app.PoaKeeper = poakeeper.NewKeeper(
+    appCodec,
+    runtime.NewKVStoreService(keys[poatypes.StoreKey]),
+    runtime.NewTransientStoreService(tkeys[poatypes.TransientStoreKey]),
+    app.AccountKeeper,
+    app.BankKeeper,
+)
+```
+
+### 5. Register Module
+
+```go
+app.ModuleManager = module.NewManager(
+    // ... core modules
+    poa.NewAppModule(appCodec, app.PoaKeeper),
+)
+```
+
+### 6. Configure Genesis
+
+```json
+{
+  "poa": {
+    "params": {
+      "admin": "cosmos1..."
+    },
+    "validators": [
+      {
+        "pub_key": {
+          "@type": "/cosmos.crypto.ed25519.PubKey",
+          "key": "base64-encoded-pubkey"
+        },
+        "power": 10000000,
+        "metadata": {
+          "operator_address": "cosmos1...",
+          "moniker": "validator1"
+        }
+      }
+    ]
+  }
+}
+```
+
+### 7. Test Thoroughly
+
+```bash
+# Run unit tests
+go test ./enterprise/poa/...
+
+# Run integration tests
+make test-integration
+
+# Start local testnet
+make localnet
+```
+
+## Comparison: Public vs Permissioned
+
+### Public Blockchain (Core Modules)
+
+```go
+// Anyone can become a validator by staking
+app.ModuleManager = module.NewManager(
+    staking.NewAppModule(appCodec, app.StakingKeeper),
+    slashing.NewAppModule(appCodec, app.SlashingKeeper),
+    distribution.NewAppModule(appCodec, app.DistrKeeper),
+    // ... other modules
+)
+```
+
+**Characteristics:**
+- Permissionless validator entry
+- Token-based governance
+- Slashing for misbehavior
+- Public participation
+
+### Permissioned Blockchain (Enterprise Modules)
+
+```go
+// Only admin-approved validators can participate
+app.ModuleManager = module.NewManager(
+    poa.NewAppModule(appCodec, app.PoaKeeper),
+    group.NewAppModule(appCodec, app.GroupKeeper),
+    // ... other modules
+)
+```
+
+**Characteristics:**
+- Admin-controlled validator set
+- Committee-based governance
+- No slashing (validators are trusted)
+- Restricted participation
+
+## Use Case: Consortium Chain
+
+A consortium of 5 companies wants to run a shared blockchain:
+
+```go
+// 1. Initialize PoA with company admin account
+params := poatypes.Params{
+    Admin: consortiumMultisigAddr.String(),
+}
+
+// 2. Add validators (one per company)
+validators := []poatypes.Validator{
+    {PubKey: company1PubKey, Power: 1000000, Metadata: ...},
+    {PubKey: company2PubKey, Power: 1000000, Metadata: ...},
+    {PubKey: company3PubKey, Power: 1000000, Metadata: ...},
+    {PubKey: company4PubKey, Power: 1000000, Metadata: ...},
+    {PubKey: company5PubKey, Power: 1000000, Metadata: ...},
+}
+
+// 3. Create group for consortium decisions
+members := []group.MemberRequest{
+    {Address: company1.String(), Weight: "1"},
+    {Address: company2.String(), Weight: "1"},
+    {Address: company3.String(), Weight: "1"},
+    {Address: company4.String(), Weight: "1"},
+    {Address: company5.String(), Weight: "1"},
+}
+
+// 4. Require 3/5 approval for changes
+policy := group.NewThresholdDecisionPolicy(
+    "3",
+    time.Hour * 24 * 7,
+    time.Hour * 24,
+)
+```
+
+## Support and Resources
+
+### Technical Support
+
+- [Cosmos SDK Documentation](https://docs.cosmos.network)
+- [Cosmos Discord](https://discord.com/invite/interchain)
+- [GitHub Issues](https://github.com/cosmos/cosmos-sdk/issues)
+
+### Licensing Questions
+
+For commercial licensing, production deployment, or questions about the evaluation license:
+
+**Cosmos Labs Institutions Team**  
+Email: [institutions@cosmoslabs.io](mailto:institutions@cosmoslabs.io)
+
+### Contributing
+
+Contributions to enterprise modules follow the same process as core SDK:
+
+1. Fork the repository
+2. Create a feature branch
+3. Submit a pull request
+4. Ensure tests pass
+5. Get code review approval
+
+## Best Practices
+
+1. **Review licenses** before using enterprise modules
+2. **Test extensively** in development environments
+3. **Understand limitations** of permissioned networks
+4. **Plan governance** structure carefully
+5. **Document access control** policies
+6. **Monitor validator performance** regularly
+7. **Keep modules updated** with SDK releases
+
+## Security Considerations
+
+- **Admin keys** in PoA have significant power - use multisig
+- **Validator collusion** is possible in small validator sets
+- **No slashing** means misbehavior must be handled off-chain
+- **Access control** is critical in permissioned networks
+- **Backup strategies** for admin key recovery
+
+## Migration Path
+
+Moving from public to permissioned (or vice versa) requires careful planning:
+
+### Public → Permissioned
+
+1. Decide on initial validator set
+2. Create PoA genesis with selected validators
+3. Migrate state from public chain
+4. Disable staking/slashing modules
+5. Enable PoA module
+
+### Permissioned → Public
+
+1. Plan validator onboarding strategy
+2. Create staking genesis with initial delegations
+3. Migrate state from permissioned chain
+4. Disable PoA module
+5. Enable staking/slashing modules
+
+## References
+
+- [Enterprise README](/home/daytona/workspace/source/enterprise/README.md)
+- [PoA Module](/modules/poa)
+- [Core Modules Documentation](https://docs.cosmos.network/main/build/modules)
+- [Cosmos SDK Main README](https://github.com/cosmos/cosmos-sdk/blob/main/README.md)

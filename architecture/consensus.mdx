@@ -1,0 +1,658 @@
+---
+title: Consensus Integration
+description: How Cosmos SDK integrates with CometBFT consensus through ABCI
+---
+
+## Overview
+
+Cosmos SDK applications integrate with the CometBFT (formerly Tendermint) consensus engine through the Application Blockchain Interface (ABCI). This separation allows the consensus layer and application layer to evolve independently.
+
+## ABCI Architecture
+
+```
+┌─────────────────────────────────────────┐
+│         CometBFT Consensus              │
+│  (Block Production, P2P, Consensus)     │
+└────────────────┬────────────────────────┘
+                 │
+                 │ ABCI Interface
+                 │
+┌────────────────▼────────────────────────┐
+│         Cosmos SDK Application          │
+│  (State Machine, Business Logic)        │
+└─────────────────────────────────────────┘
+```
+
+### ABCI Methods
+
+BaseApp implements all ABCI methods:
+
+```go
+// Location: baseapp/abci.go
+
+// Initialization
+func (app *BaseApp) InitChain(*abci.RequestInitChain) (*abci.ResponseInitChain, error)
+
+// Information
+func (app *BaseApp) Info(*abci.RequestInfo) (*abci.ResponseInfo, error)
+func (app *BaseApp) Query(context.Context, *abci.RequestQuery) (*abci.ResponseQuery, error)
+
+// Mempool
+func (app *BaseApp) CheckTx(*abci.RequestCheckTx) (*abci.ResponseCheckTx, error)
+
+// Block Execution
+func (app *BaseApp) PrepareProposal(*abci.RequestPrepareProposal) (*abci.ResponsePrepareProposal, error)
+func (app *BaseApp) ProcessProposal(*abci.RequestProcessProposal) (*abci.ResponseProcessProposal, error)
+func (app *BaseApp) FinalizeBlock(*abci.RequestFinalizeBlock) (*abci.ResponseFinalizeBlock, error)
+func (app *BaseApp) Commit() (*abci.ResponseCommit, error)
+```
+
+## Execution Modes
+
+The SDK supports different execution contexts:
+
+```go
+// Location: baseapp/baseapp.go:53
+const (
+    execModeCheck               = sdk.ExecModeCheck               // Validate tx for mempool
+    execModeReCheck             = sdk.ExecModeReCheck             // Recheck pending tx
+    execModeSimulate            = sdk.ExecModeSimulate            // Estimate gas
+    execModePrepareProposal     = sdk.ExecModePrepareProposal     // Proposer prepares block
+    execModeProcessProposal     = sdk.ExecModeProcessProposal     // Validators verify block
+    execModeVoteExtension       = sdk.ExecModeVoteExtension       // Create vote extension
+    execModeVerifyVoteExtension = sdk.ExecModeVerifyVoteExtension // Verify vote extension
+    execModeFinalize            = sdk.ExecModeFinalize            // Execute block
+)
+```
+
+## Block Lifecycle
+
+<Steps>
+  <Step title="Block Proposal">
+    Proposer calls `PrepareProposal` to select and order transactions
+  </Step>
+  
+  <Step title="Block Verification">
+    Validators call `ProcessProposal` to verify the proposed block
+  </Step>
+  
+  <Step title="Vote Extensions (Optional)">
+    Validators can attach additional data to their prevotes
+  </Step>
+  
+  <Step title="Consensus">
+    CometBFT runs Byzantine Fault Tolerant consensus
+  </Step>
+  
+  <Step title="Block Finalization">
+    All nodes call `FinalizeBlock` to execute transactions
+  </Step>
+  
+  <Step title="Commit">
+    State changes are committed and app hash is computed
+  </Step>
+</Steps>
+
+## InitChain
+
+Called once when the chain starts:
+
+```go
+// Location: baseapp/abci.go:53
+func (app *BaseApp) InitChain(req *abci.RequestInitChain) (*abci.ResponseInitChain, error) {
+    // Validate chain ID
+    if req.ChainId != app.chainID {
+        return nil, fmt.Errorf("invalid chain-id on InitChain")
+    }
+    
+    // Set initial height
+    app.initialHeight = req.InitialHeight
+    if app.initialHeight == 0 {
+        app.initialHeight = 1
+    }
+    
+    // Initialize states
+    initHeader := cmtproto.Header{ChainID: req.ChainId, Time: req.Time}
+    app.stateManager.SetState(execModeFinalize, app.cms, initHeader, app.logger, app.streamingManager)
+    app.stateManager.SetState(execModeCheck, app.cms, initHeader, app.logger, app.streamingManager)
+    
+    finalizeState := app.stateManager.GetState(execModeFinalize)
+    
+    // Store consensus params
+    if req.ConsensusParams != nil {
+        err := app.StoreConsensusParams(finalizeState.Context(), *req.ConsensusParams)
+        if err != nil {
+            return nil, err
+        }
+    }
+    
+    // Call app's InitChain handler
+    if app.abciHandlers.InitChainer != nil {
+        res, err := app.abciHandlers.InitChainer(finalizeState.Context(), req)
+        if err != nil {
+            return nil, err
+        }
+    }
+    
+    return &abci.ResponseInitChain{
+        ConsensusParams: res.ConsensusParams,
+        Validators:      res.Validators,
+        AppHash:         app.LastCommitID().Hash,
+    }, nil
+}
+```
+
+## CheckTx (Mempool)
+
+Validates transactions before mempool inclusion:
+
+```go
+func (app *BaseApp) CheckTx(req *abci.RequestCheckTx) (*abci.ResponseCheckTx, error) {
+    // Decode transaction
+    tx, err := app.txDecoder(req.Tx)
+    if err != nil {
+        return sdkerrors.ResponseCheckTxWithEvents(err, 0, 0, nil, false), nil
+    }
+    
+    // Get check state
+    checkState := app.stateManager.GetState(execModeCheck)
+    ctx := checkState.Context()
+    
+    // Run transaction in check mode
+    gInfo, result, _, err := app.runTx(ctx, tx, execModeCheck)
+    if err != nil {
+        return sdkerrors.ResponseCheckTxWithEvents(
+            err,
+            gInfo.GasWanted,
+            gInfo.GasUsed,
+            nil,
+            false,
+        ), nil
+    }
+    
+    return &abci.ResponseCheckTx{
+        Code:      abci.CodeTypeOK,
+        GasWanted: int64(gInfo.GasWanted),
+        GasUsed:   int64(gInfo.GasUsed),
+        Priority:  result.Priority,
+    }, nil
+}
+```
+
+### CheckTx Types
+
+```go
+// New transaction
+abci.CheckTxType_New
+
+// Recheck after block (mempool maintenance)
+abci.CheckTxType_Recheck
+```
+
+## PrepareProposal
+
+Proposer constructs a block:
+
+```go
+func (app *BaseApp) PrepareProposal(
+    req *abci.RequestPrepareProposal,
+) (*abci.ResponsePrepareProposal, error) {
+    if app.abciHandlers.PrepareProposal == nil {
+        // Default: include all transactions up to MaxTxBytes
+        return app.defaultPrepareProposal(req)
+    }
+    
+    // Custom prepare proposal logic
+    return app.abciHandlers.PrepareProposal(req)
+}
+```
+
+### Default Behavior
+
+```go
+func (app *BaseApp) defaultPrepareProposal(
+    req *abci.RequestPrepareProposal,
+) (*abci.ResponsePrepareProposal, error) {
+    var txs [][]byte
+    var totalBytes int64
+    
+    // Select transactions from mempool
+    for _, txBytes := range req.Txs {
+        // Check size limit
+        if totalBytes+int64(len(txBytes)) > req.MaxTxBytes {
+            break
+        }
+        
+        txs = append(txs, txBytes)
+        totalBytes += int64(len(txBytes))
+    }
+    
+    return &abci.ResponsePrepareProposal{
+        Txs: txs,
+    }, nil
+}
+```
+
+## ProcessProposal
+
+Validators verify proposed blocks:
+
+```go
+func (app *BaseApp) ProcessProposal(
+    req *abci.RequestProcessProposal,
+) (*abci.ResponseProcessProposal, error) {
+    if app.abciHandlers.ProcessProposal == nil {
+        // Default: accept if all transactions are valid
+        return app.defaultProcessProposal(req)
+    }
+    
+    // Custom verification logic
+    return app.abciHandlers.ProcessProposal(req)
+}
+```
+
+### Validation Checks
+
+<AccordionGroup>
+  <Accordion title="Transaction Validity">
+    All transactions decode successfully and pass basic validation
+  </Accordion>
+  
+  <Accordion title="Gas Limits">
+    Total gas wanted doesn't exceed block gas limit
+  </Accordion>
+  
+  <Accordion title="Deterministic Ordering">
+    Transactions are in expected order (if required)
+  </Accordion>
+  
+  <Accordion title="Custom Rules">
+    Application-specific validation (e.g., minimum fees)
+  </Accordion>
+</AccordionGroup>
+
+## FinalizeBlock
+
+Executes the agreed-upon block:
+
+```go
+func (app *BaseApp) FinalizeBlock(
+    req *abci.RequestFinalizeBlock,
+) (*abci.ResponseFinalizeBlock, error) {
+    // Get finalize state
+    finalizeState := app.stateManager.GetState(execModeFinalize)
+    ctx := finalizeState.Context()
+    
+    // Update context with block info
+    ctx = ctx.WithBlockHeader(cmtproto.Header{
+        ChainID: app.chainID,
+        Height:  req.Height,
+        Time:    req.Time,
+        // ...
+    })
+    
+    // PreBlock (optional)
+    if app.abciHandlers.PreBlocker != nil {
+        ctx, err := app.abciHandlers.PreBlocker(ctx)
+        if err != nil {
+            return nil, err
+        }
+    }
+    
+    // BeginBlock
+    if app.abciHandlers.BeginBlocker != nil {
+        err := app.abciHandlers.BeginBlocker(ctx)
+        if err != nil {
+            return nil, err
+        }
+    }
+    
+    // Execute transactions
+    txResults := make([]*abci.ExecTxResult, len(req.Txs))
+    for i, txBytes := range req.Txs {
+        tx, err := app.txDecoder(txBytes)
+        if err != nil {
+            txResults[i] = &abci.ExecTxResult{
+                Code: 1,
+                Log:  err.Error(),
+            }
+            continue
+        }
+        
+        gInfo, result, _, err := app.runTx(ctx, tx, execModeFinalize)
+        txResults[i] = &abci.ExecTxResult{
+            Code:      codeFromErr(err),
+            GasWanted: int64(gInfo.GasWanted),
+            GasUsed:   int64(gInfo.GasUsed),
+            Events:    result.Events,
+        }
+    }
+    
+    // EndBlock
+    if app.abciHandlers.EndBlocker != nil {
+        err := app.abciHandlers.EndBlocker(ctx)
+        if err != nil {
+            return nil, err
+        }
+    }
+    
+    return &abci.ResponseFinalizeBlock{
+        TxResults:             txResults,
+        ValidatorUpdates:      validatorUpdates,
+        ConsensusParamUpdates: consensusParamUpdates,
+    }, nil
+}
+```
+
+### Execution Order
+
+1. **PreBlock**: Process vote extensions, update consensus params
+2. **BeginBlock**: Mint rewards, distribute fees, update validators
+3. **Transactions**: Execute each transaction in order
+4. **EndBlock**: Finalize validator updates, execute governance
+
+## Commit
+
+Persists state changes:
+
+```go
+func (app *BaseApp) Commit() (*abci.ResponseCommit, error) {
+    // Get finalize state
+    finalizeState := app.stateManager.GetState(execModeFinalize)
+    
+    // Write changes from cache to CommitMultiStore
+    finalizeState.MultiStore.Write()
+    
+    // Commit to disk and get commit ID
+    commitID := app.cms.Commit()
+    
+    // Determine retain height for pruning
+    retainHeight := app.GetBlockRetentionHeight(commitID.Version)
+    
+    return &abci.ResponseCommit{
+        RetainHeight: retainHeight,
+    }, nil
+}
+```
+
+### Commit ID
+
+```go
+type CommitID struct {
+    Version int64  // Block height
+    Hash    []byte // App hash (state root)
+}
+```
+
+The app hash proves state integrity across all nodes.
+
+## Vote Extensions
+
+Validators can attach additional signed data to votes:
+
+### Extend Vote
+
+```go
+func (app *BaseApp) ExtendVote(
+    ctx context.Context,
+    req *abci.RequestExtendVote,
+) (*abci.ResponseExtendVote, error) {
+    // Generate vote extension
+    voteExt, err := app.abciHandlers.ExtendVoteHandler(ctx, req)
+    if err != nil {
+        return nil, err
+    }
+    
+    return &abci.ResponseExtendVote{
+        VoteExtension: voteExt,
+    }, nil
+}
+```
+
+### Verify Vote Extension
+
+```go
+func (app *BaseApp) VerifyVoteExtension(
+    ctx context.Context,
+    req *abci.RequestVerifyVoteExtension,
+) (*abci.ResponseVerifyVoteExtension, error) {
+    // Verify vote extension
+    err := app.abciHandlers.VerifyVoteExtensionHandler(ctx, req)
+    
+    return &abci.ResponseVerifyVoteExtension{
+        Status: statusFromErr(err),
+    }, nil
+}
+```
+
+### Use Cases
+
+<CardGroup cols={2}>
+  <Card title="Oracle Prices" icon="chart-line">
+    Validators submit price feeds in vote extensions
+  </Card>
+  <Card title="Randomness" icon="dice">
+    Generate verifiable random numbers from validator contributions
+  </Card>
+  <Card title="Threshold Signatures" icon="signature">
+    Collect signature shares for multisig operations
+  </Card>
+  <Card title="MEV Prevention" icon="shield-alt">
+    Commit-reveal schemes for transaction ordering
+  </Card>
+</CardGroup>
+
+## Consensus Parameters
+
+```go
+type ConsensusParams struct {
+    Block     *BlockParams
+    Evidence  *EvidenceParams
+    Validator *ValidatorParams
+    Version   *VersionParams
+    ABCI      *ABCIParams
+}
+
+type BlockParams struct {
+    MaxBytes int64  // Max block size
+    MaxGas   int64  // Max total gas per block
+}
+```
+
+### Updating Consensus Params
+
+```go
+func (app *BaseApp) StoreConsensusParams(
+    ctx sdk.Context,
+    cp cmtproto.ConsensusParams,
+) error {
+    if app.paramStore == nil {
+        return nil
+    }
+    
+    return app.paramStore.Set(ctx, cp)
+}
+```
+
+## Info and Query
+
+### Info Method
+
+```go
+// Location: baseapp/abci.go:156
+func (app *BaseApp) Info(_ *abci.RequestInfo) (*abci.ResponseInfo, error) {
+    lastCommitID := app.cms.LastCommitID()
+    
+    return &abci.ResponseInfo{
+        Data:             app.name,
+        Version:          app.version,
+        AppVersion:       app.appVersion,
+        LastBlockHeight:  lastCommitID.Version,
+        LastBlockAppHash: lastCommitID.Hash,
+    }, nil
+}
+```
+
+### Query Method
+
+```go
+// Location: baseapp/abci.go:170
+func (app *BaseApp) Query(
+    ctx context.Context,
+    req *abci.RequestQuery,
+) (*abci.ResponseQuery, error) {
+    // Default to latest height
+    if req.Height == 0 {
+        req.Height = app.LastBlockHeight()
+    }
+    
+    // Route query
+    path := strings.Split(req.Path, "/")
+    switch path[0] {
+    case "app":
+        return handleAppQuery(app, path, req)
+    case "store":
+        return handleStoreQuery(app, path, req)
+    case "p2p":
+        return handleP2PQuery(app, path, req)
+    default:
+        // gRPC query
+        return app.grpcQueryRouter.Route(req.Path)(ctx, req)
+    }
+}
+```
+
+## State Synchronization
+
+CometBFT state sync enables fast bootstrapping:
+
+```go
+// List available snapshots
+func (app *BaseApp) ListSnapshots(
+    req *abci.RequestListSnapshots,
+) (*abci.ResponseListSnapshots, error) {
+    snapshots, err := app.snapshotManager.List()
+    return &abci.ResponseListSnapshots{
+        Snapshots: snapshots,
+    }, err
+}
+
+// Offer snapshot to node
+func (app *BaseApp) OfferSnapshot(
+    req *abci.RequestOfferSnapshot,
+) (*abci.ResponseOfferSnapshot, error) {
+    // Accept or reject snapshot
+    return app.snapshotManager.Offer(req.Snapshot)
+}
+
+// Load snapshot chunk
+func (app *BaseApp) LoadSnapshotChunk(
+    req *abci.RequestLoadSnapshotChunk,
+) (*abci.ResponseLoadSnapshotChunk, error) {
+    chunk, err := app.snapshotManager.LoadChunk(req.Height, req.Format, req.Chunk)
+    return &abci.ResponseLoadSnapshotChunk{
+        Chunk: chunk,
+    }, err
+}
+
+// Apply snapshot chunk
+func (app *BaseApp) ApplySnapshotChunk(
+    req *abci.RequestApplySnapshotChunk,
+) (*abci.ResponseApplySnapshotChunk, error) {
+    return app.snapshotManager.Apply(req.Index, req.Chunk)
+}
+```
+
+## ABCI++ Features
+
+ABCI++ (introduced in CometBFT v0.38) adds:
+
+### PrepareProposal & ProcessProposal
+
+Gives applications control over block construction:
+
+```go
+type ABCIHandlers struct {
+    PrepareProposal  func(*abci.RequestPrepareProposal) (*abci.ResponsePrepareProposal, error)
+    ProcessProposal  func(*abci.RequestProcessProposal) (*abci.ResponseProcessProposal, error)
+}
+```
+
+**Use cases:**
+- Enforce minimum fees
+- Require specific transactions (e.g., oracle updates)
+- Implement MEV protection
+- Custom transaction ordering
+
+### Vote Extensions
+
+Enables new consensus mechanisms:
+
+```go
+type ABCIHandlers struct {
+    ExtendVoteHandler       func(context.Context, *abci.RequestExtendVote) ([]byte, error)
+    VerifyVoteExtensionHandler func(context.Context, *abci.RequestVerifyVoteExtension) error
+}
+```
+
+## Best Practices
+
+<AccordionGroup>
+  <Accordion title="Keep ABCI Methods Fast">
+    ABCI methods block consensus. Avoid expensive operations.
+  </Accordion>
+  
+  <Accordion title="Deterministic Execution">
+    All nodes must produce identical results. Avoid randomness and timestamps.
+  </Accordion>
+  
+  <Accordion title="Validate in ProcessProposal">
+    Reject invalid blocks early to save execution costs.
+  </Accordion>
+  
+  <Accordion title="Graceful Error Handling">
+    Return appropriate ABCI response codes, don't panic.
+  </Accordion>
+  
+  <Accordion title="Monitor Gas Usage">
+    Track block gas to prevent DoS attacks.
+  </Accordion>
+</AccordionGroup>
+
+## CometBFT Configuration
+
+Key consensus parameters in `config.toml`:
+
+```toml
+[consensus]
+timeout_propose = "3s"
+timeout_propose_delta = "500ms"
+timeout_prevote = "1s"
+timeout_prevote_delta = "500ms"
+timeout_precommit = "1s"
+timeout_precommit_delta = "500ms"
+timeout_commit = "5s"
+
+[mempool]
+size = 5000
+cache_size = 10000
+max_tx_bytes = 1048576
+max_txs_bytes = 1073741824
+```
+
+## Related Topics
+
+<CardGroup cols={2}>
+  <Card title="BaseApp" icon="cubes" href="/architecture/baseapp">
+    BaseApp ABCI implementation
+  </Card>
+  <Card title="Transactions" icon="exchange-alt" href="/architecture/transactions">
+    Transaction lifecycle
+  </Card>
+  <Card title="CometBFT Docs" icon="external-link-alt" href="https://docs.cometbft.com">
+    CometBFT documentation
+  </Card>
+  <Card title="ABCI Spec" icon="file-alt" href="https://docs.cometbft.com/v0.38/spec/abci/">
+    ABCI specification
+  </Card>
+</CardGroup>

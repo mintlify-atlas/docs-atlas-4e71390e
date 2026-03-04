@@ -1,0 +1,483 @@
+---
+title: Security Best Practices
+description: Security guidelines and vulnerability disclosure policy for Cosmos SDK applications
+---
+
+Security is paramount when building blockchain applications with Cosmos SDK. This guide covers security best practices and the coordinated vulnerability disclosure policy.
+
+## Coordinated Vulnerability Disclosure
+
+**IMPORTANT**: Do NOT open public issues for security vulnerabilities.
+
+### Canonical Policies
+
+The Cosmos SDK follows these security policies:
+
+- **Security Policy**: Reporting process, scope, and disclosure standards  
+  https://github.com/cosmos/security/blob/main/SECURITY.md
+
+- **Release & Maintenance Policy**: Supported versions, lifecycle, and EOL  
+  https://github.com/cosmos/security/blob/main/POLICY.md
+
+- **HackerOne Bug Bounty Program**:  
+  https://hackerone.com/cosmos
+
+Source: [SECURITY.md](https://github.com/cosmos/cosmos-sdk/blob/main/SECURITY.md)
+
+### Reporting Vulnerabilities
+
+Security vulnerabilities must be reported via:
+
+**HackerOne**: https://hackerone.com/cosmos
+
+Refer to the [Security Policy](https://github.com/cosmos/security/blob/main/SECURITY.md) for full reporting and disclosure details.
+
+## Application Security
+
+### 1. Input Validation
+
+Always validate inputs in message handlers:
+
+```go
+func (k Keeper) Transfer(ctx context.Context, msg *types.MsgTransfer) error {
+    // Validate addresses
+    if _, err := k.accountKeeper.AddressCodec().StringToBytes(msg.FromAddress); err != nil {
+        return errorsmod.Wrap(sdkerrors.ErrInvalidAddress, "invalid from address")
+    }
+    
+    if _, err := k.accountKeeper.AddressCodec().StringToBytes(msg.ToAddress); err != nil {
+        return errorsmod.Wrap(sdkerrors.ErrInvalidAddress, "invalid to address")
+    }
+    
+    // Validate amounts
+    if !msg.Amount.IsValid() || !msg.Amount.IsPositive() {
+        return errorsmod.Wrap(sdkerrors.ErrInvalidCoins, "invalid transfer amount")
+    }
+    
+    // Prevent overflow
+    if msg.Amount.AmountOf("stake").GT(maxTransferAmount) {
+        return errorsmod.Wrap(sdkerrors.ErrInvalidRequest, "amount exceeds maximum")
+    }
+    
+    return k.transfer(ctx, msg.FromAddress, msg.ToAddress, msg.Amount)
+}
+```
+
+### 2. Access Control
+
+Implement proper authorization checks:
+
+```go
+func (k Keeper) UpdateParams(ctx context.Context, msg *types.MsgUpdateParams) error {
+    // Only governance can update params
+    if msg.Authority != k.authority {
+        return errorsmod.Wrapf(
+            govtypes.ErrInvalidSigner,
+            "expected %s, got %s",
+            k.authority,
+            msg.Authority,
+        )
+    }
+    
+    // Validate params before storing
+    if err := msg.Params.Validate(); err != nil {
+        return err
+    }
+    
+    return k.SetParams(ctx, msg.Params)
+}
+```
+
+### 3. Integer Overflow Protection
+
+Use safe math operations:
+
+```go
+import (
+    sdkmath "cosmossdk.io/math"
+)
+
+func (k Keeper) Mint(ctx context.Context, amount sdkmath.Int) error {
+    // Get current supply
+    supply := k.bankKeeper.GetSupply(ctx, "stake")
+    
+    // Safe addition - will panic on overflow
+    newSupply := supply.Amount.Add(amount)
+    
+    // Check against maximum supply
+    if newSupply.GT(k.GetMaxSupply(ctx)) {
+        return errorsmod.Wrap(sdkerrors.ErrInvalidRequest, "exceeds max supply")
+    }
+    
+    return k.bankKeeper.MintCoins(ctx, types.ModuleName, sdk.NewCoins(sdk.NewCoin("stake", amount)))
+}
+```
+
+### 4. Reentrancy Protection
+
+The SDK's module-based architecture provides natural reentrancy protection, but be careful with external calls:
+
+```go
+func (k Keeper) WithdrawRewards(ctx context.Context, delegator string) error {
+    // Calculate rewards FIRST
+    rewards := k.CalculateRewards(ctx, delegator)
+    
+    // Update state BEFORE external calls
+    k.SetLastWithdrawal(ctx, delegator, ctx.BlockHeight())
+    k.SetAccumulatedRewards(ctx, delegator, sdkmath.ZeroInt())
+    
+    // Send rewards LAST (checks-effects-interactions pattern)
+    return k.bankKeeper.SendCoinsFromModuleToAccount(
+        ctx,
+        types.ModuleName,
+        delegatorAddr,
+        rewards,
+    )
+}
+```
+
+### 5. Gas Limits
+
+Prevent denial of service through gas exhaustion:
+
+```go
+func (k Keeper) ProcessBatch(ctx context.Context, items []Item) error {
+    // Limit batch size
+    if len(items) > MaxBatchSize {
+        return errorsmod.Wrapf(
+            sdkerrors.ErrInvalidRequest,
+            "batch size %d exceeds maximum %d",
+            len(items),
+            MaxBatchSize,
+        )
+    }
+    
+    // Charge gas per item
+    for _, item := range items {
+        ctx.GasMeter().ConsumeGas(ItemProcessingGas, "process item")
+        if err := k.processItem(ctx, item); err != nil {
+            return err
+        }
+    }
+    
+    return nil
+}
+```
+
+## AnteHandler Security
+
+### Sequence Validation
+
+Properly validate transaction sequences to prevent replay attacks:
+
+```go
+func (svd SigVerificationDecorator) AnteHandle(ctx sdk.Context, tx sdk.Tx, simulate bool, next sdk.AnteHandler) (sdk.Context, error) {
+    // ... signature verification ...
+    
+    // Check account sequence number for ordered transactions
+    if !isUnordered {
+        if sig.Sequence != acc.GetSequence() {
+            return ctx, errorsmod.Wrapf(
+                sdkerrors.ErrWrongSequence,
+                "account sequence mismatch, expected %d, got %d",
+                acc.GetSequence(),
+                sig.Sequence,
+            )
+        }
+    }
+    
+    return next(ctx, tx, simulate)
+}
+```
+
+Source: [x/auth/ante/sigverify.go:362](https://github.com/cosmos/cosmos-sdk/blob/main/x/auth/ante/sigverify.go#L362)
+
+### Unordered Transaction Security
+
+For unordered transactions, verify TTL and nonce:
+
+```go
+func (svd SigVerificationDecorator) verifyUnorderedNonce(ctx sdk.Context, unorderedTx sdk.TxWithUnordered) error {
+    blockTime := ctx.BlockTime()
+    timeoutTimestamp := unorderedTx.GetTimeoutTimeStamp()
+    
+    // Require timeout
+    if timeoutTimestamp.IsZero() || timeoutTimestamp.Unix() == 0 {
+        return errorsmod.Wrap(
+            sdkerrors.ErrInvalidRequest,
+            "unordered transaction must have timeout_timestamp set",
+        )
+    }
+    
+    // Prevent expired transactions
+    if timeoutTimestamp.Before(blockTime) {
+        return errorsmod.Wrap(
+            sdkerrors.ErrInvalidRequest,
+            "unordered transaction has a timeout_timestamp that has already passed",
+        )
+    }
+    
+    // Prevent excessive TTL
+    if timeoutTimestamp.After(blockTime.Add(svd.maxTxTimeoutDuration)) {
+        return errorsmod.Wrapf(
+            sdkerrors.ErrInvalidRequest,
+            "unordered tx ttl exceeds %s",
+            svd.maxTxTimeoutDuration.String(),
+        )
+    }
+    
+    // Check nonce hasn't been used
+    ctx.GasMeter().ConsumeGas(svd.unorderedTxGasCost, "unordered tx")
+    
+    // ... nonce verification ...
+    
+    return nil
+}
+```
+
+Source: [x/auth/ante/sigverify.go:424](https://github.com/cosmos/cosmos-sdk/blob/main/x/auth/ante/sigverify.go#L424)
+
+## Keeper Security
+
+### 1. Authority Validation
+
+```go
+type Keeper struct {
+    authority string // the address capable of executing privileged operations
+}
+
+func NewKeeper(authority string, ...) Keeper {
+    // Validate authority address on construction
+    if _, err := sdk.AccAddressFromBech32(authority); err != nil {
+        panic(fmt.Sprintf("invalid authority address: %s", err))
+    }
+    
+    return Keeper{
+        authority: authority,
+    }
+}
+```
+
+### 2. Module Account Protection
+
+```go
+// Never expose module account private keys
+// Module accounts should only be controlled programmatically
+
+func (k Keeper) ModuleAccountInvariant(ctx context.Context) (string, bool) {
+    moduleAcc := k.accountKeeper.GetModuleAccount(ctx, types.ModuleName)
+    
+    // Verify module account exists
+    if moduleAcc == nil {
+        return "module account does not exist", true
+    }
+    
+    // Verify permissions
+    expectedPerms := []string{authtypes.Minter, authtypes.Burner}
+    if !moduleAcc.HasPermissions(expectedPerms...) {
+        return "module account has incorrect permissions", true
+    }
+    
+    return "", false
+}
+```
+
+### 3. Store Access Control
+
+```go
+func (k Keeper) SetValue(ctx context.Context, key string, value string) error {
+    // Validate key format to prevent injection
+    if !isValidKey(key) {
+        return errorsmod.Wrap(sdkerrors.ErrInvalidRequest, "invalid key format")
+    }
+    
+    // Use prefix stores to isolate data
+    store := runtime.KVStoreAdapter(k.storeService.OpenKVStore(ctx))
+    prefixStore := prefix.NewStore(store, types.KeyPrefix)
+    
+    // Store with proper namespacing
+    prefixStore.Set([]byte(key), []byte(value))
+    return nil
+}
+```
+
+## Parameter Validation
+
+```go
+type Params struct {
+    MaxSupply        sdkmath.Int
+    MinDeposit       sdk.Coins
+    VotingPeriod     time.Duration
+    WithdrawalPeriod uint64
+}
+
+func (p Params) Validate() error {
+    // Validate max supply
+    if !p.MaxSupply.IsPositive() {
+        return fmt.Errorf("max supply must be positive: %s", p.MaxSupply)
+    }
+    
+    // Validate min deposit
+    if !p.MinDeposit.IsValid() || !p.MinDeposit.IsPositive() {
+        return fmt.Errorf("min deposit must be valid and positive: %s", p.MinDeposit)
+    }
+    
+    // Validate durations
+    if p.VotingPeriod <= 0 {
+        return fmt.Errorf("voting period must be positive: %s", p.VotingPeriod)
+    }
+    
+    // Validate against reasonable limits
+    if p.VotingPeriod > 30*24*time.Hour {
+        return fmt.Errorf("voting period too long: %s", p.VotingPeriod)
+    }
+    
+    return nil
+}
+```
+
+## Cryptographic Security
+
+### 1. Signature Verification
+
+```go
+func (k Keeper) VerifySignature(msg []byte, signature []byte, pubKey cryptotypes.PubKey) error {
+    // Use constant-time comparison
+    if !pubKey.VerifySignature(msg, signature) {
+        return errorsmod.Wrap(sdkerrors.ErrUnauthorized, "signature verification failed")
+    }
+    return nil
+}
+```
+
+### 2. Random Number Generation
+
+```go
+import "crypto/rand"
+
+func (k Keeper) GenerateNonce(ctx context.Context) ([]byte, error) {
+    // Use crypto/rand for cryptographic randomness
+    nonce := make([]byte, 32)
+    if _, err := rand.Read(nonce); err != nil {
+        return nil, errorsmod.Wrap(err, "failed to generate nonce")
+    }
+    return nonce, nil
+}
+```
+
+## Testing Security
+
+### 1. Fuzzing
+
+```go
+func FuzzValidateBasic(f *testing.F) {
+    f.Add([]byte("normal input"))
+    f.Add([]byte("")) // empty
+    f.Add(make([]byte, 1000000)) // large input
+    
+    f.Fuzz(func(t *testing.T, data []byte) {
+        msg := &types.MsgTransfer{
+            Memo: string(data),
+        }
+        // Should never panic
+        _ = msg.ValidateBasic()
+    })
+}
+```
+
+### 2. Invariant Checks
+
+```go
+func (k Keeper) RegisterInvariants(ir sdk.InvariantRegistry) {
+    ir.RegisterRoute(types.ModuleName, "total-supply",
+        k.TotalSupplyInvariant)
+    ir.RegisterRoute(types.ModuleName, "non-negative-balances",
+        k.NonNegativeBalancesInvariant)
+}
+
+func (k Keeper) TotalSupplyInvariant(ctx context.Context) (string, bool) {
+    var msg string
+    var broken bool
+    
+    totalSupply := k.GetTotalSupply(ctx)
+    actualSupply := k.CalculateActualSupply(ctx)
+    
+    if !totalSupply.Equal(actualSupply) {
+        broken = true
+        msg = fmt.Sprintf("total supply mismatch: expected %s, got %s",
+            totalSupply, actualSupply)
+    }
+    
+    return msg, broken
+}
+```
+
+## Common Vulnerabilities
+
+### 1. Arithmetic Issues
+
+- Integer overflow/underflow
+- Division by zero
+- Precision loss
+
+**Mitigation**: Use `sdkmath.Int` and `sdkmath.LegacyDec` types
+
+### 2. Access Control
+
+- Missing authorization checks
+- Incorrect authority validation
+- Module account exposure
+
+**Mitigation**: Always validate caller authority
+
+### 3. Input Validation
+
+- Malformed addresses
+- Invalid coin amounts
+- Missing bounds checks
+
+**Mitigation**: Comprehensive validation in `ValidateBasic` and handlers
+
+### 4. State Inconsistency
+
+- Race conditions
+- Invariant violations
+- Incorrect state updates
+
+**Mitigation**: Use invariants and integration tests
+
+### 5. Gas Exhaustion
+
+- Unbounded loops
+- Excessive storage operations
+- Missing gas metering
+
+**Mitigation**: Add explicit gas charges and limits
+
+## Security Checklist
+
+- [ ] All inputs validated in `ValidateBasic` and handlers
+- [ ] Authority checked for privileged operations
+- [ ] Safe math operations used (no overflow/underflow)
+- [ ] Gas limits enforced for loops and batch operations
+- [ ] Module accounts properly protected
+- [ ] Invariants registered and tested
+- [ ] Integration tests cover security scenarios
+- [ ] Fuzz testing for input validation
+- [ ] No hardcoded credentials or keys
+- [ ] Proper error handling (no panics in msg handlers)
+- [ ] Store access properly namespaced
+- [ ] Parameters validated on update
+
+## Additional Resources
+
+- [Cosmos Security Repository](https://github.com/cosmos/security)
+- [HackerOne Program](https://hackerone.com/cosmos)
+- [Audit Reports](https://github.com/cosmos/cosmos-sdk/tree/main/docs/architecture/audits)
+- [Common Vulnerabilities](https://github.com/cosmos/cosmos-sdk/security/advisories)
+
+## See Also
+
+- [Testing](/building/testing) - Security testing strategies
+- [Modules](/building/modules) - Secure module development
+- [AnteHandler](/advanced/ante-handler) - Transaction validation security

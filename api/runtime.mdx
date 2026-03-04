@@ -1,0 +1,387 @@
+---
+title: Runtime
+description: Dependency injection and service registration for modules
+---
+
+## Overview
+
+The runtime package provides dependency injection capabilities and service registration for Cosmos SDK applications using the App Wiring pattern. It enables declarative application construction through configuration.
+
+## Core Types
+
+### App Structure
+
+```go
+type App struct {
+    storeKeys         []storetypes.StoreKey
+    interfaceRegistry codectypes.InterfaceRegistry
+    cdc               codec.Codec
+    amino             *codec.LegacyAmino
+    basicManager      module.BasicManager
+    msgServiceRouter  *baseapp.MsgServiceRouter
+    grpcQueryRouter   *baseapp.GRPCQueryRouter
+    config            *runtimev1alpha1.Module
+    appConfig         *appv1alpha1.Config
+    logger            log.Logger
+    ModuleManager     *module.Manager
+    baseAppOptions    []BaseAppOption
+}
+```
+
+**Location:** Runtime app structure (internal)
+
+### AppBuilder
+
+```go
+type AppBuilder struct {
+    app *App
+}
+```
+
+Builder pattern for constructing applications with runtime services.
+
+### BaseAppOption
+
+```go
+type BaseAppOption func(*baseapp.BaseApp)
+
+func (b BaseAppOption) IsManyPerContainerType() {}
+```
+
+Depinject type for passing BaseApp options into the container.
+
+**Location:** `runtime/module.go:58-61`
+
+## Dependency Injection Providers
+
+### ProvideApp
+
+```go
+func ProvideApp(interfaceRegistry codectypes.InterfaceRegistry) (
+    codec.Codec,
+    *codec.LegacyAmino,
+    *AppBuilder,
+    *baseapp.MsgServiceRouter,
+    *baseapp.GRPCQueryRouter,
+    appmodule.AppModule,
+    protodesc.Resolver,
+    protoregistry.MessageTypeResolver,
+    error,
+)
+```
+
+Provides core application dependencies including codec, amino, routers, and builders.
+
+**Location:** `runtime/module.go:86-127`
+
+**Returns:**
+- Protobuf codec
+- Legacy Amino codec
+- App builder
+- Message service router
+- gRPC query router
+- Runtime app module
+- Proto resolvers
+
+### ProvideInterfaceRegistry
+
+```go
+func ProvideInterfaceRegistry(
+    addressCodec address.Codec,
+    validatorAddressCodec ValidatorAddressCodec,
+    customGetSigners []signing.CustomGetSigner,
+) (codectypes.InterfaceRegistry, error)
+```
+
+Provides the interface registry with signing options configured.
+
+**Location:** `runtime/module.go:166-188`
+
+### Store Key Providers
+
+```go
+// Provides KV store keys
+func ProvideKVStoreKey(config *runtimev1alpha1.Module, key depinject.ModuleKey) *storetypes.KVStoreKey
+
+// Provides transient store keys
+func ProvideTransientStoreKey(key depinject.ModuleKey) *storetypes.TransientStoreKey
+
+// Provides memory store keys
+func ProvideMemoryStoreKey(key depinject.ModuleKey) *storetypes.MemoryStoreKey
+```
+
+Provide different types of store keys for modules.
+
+### Service Providers
+
+```go
+// Provides KV store service
+func ProvideKVStoreService(key *storetypes.KVStoreKey) store.KVStoreService
+
+// Provides memory store service
+func ProvideMemoryStoreService(key *storetypes.MemoryStoreKey) store.MemoryStoreService
+
+// Provides transient store service  
+func ProvideTransientStoreService(key *storetypes.TransientStoreKey) store.TransientStoreService
+
+// Provides event service
+func ProvideEventService() event.Service
+
+// Provides header info service
+func ProvideHeaderInfoService(config *runtimev1alpha1.Module) header.Service
+
+// Provides comet info service
+func ProvideCometInfoService() comet.Service
+```
+
+**Location:** `runtime/module.go:64-81`
+
+These providers inject core services into modules via dependency injection.
+
+## App Wiring
+
+### SetupAppBuilder
+
+```go
+type AppInputs struct {
+    depinject.In
+
+    AppConfig          *appv1alpha1.Config `optional:"true"`
+    Config             *runtimev1alpha1.Module
+    AppBuilder         *AppBuilder
+    Modules            map[string]appmodule.AppModule
+    CustomModuleBasics map[string]module.AppModuleBasic `optional:"true"`
+    BaseAppOptions     []BaseAppOption
+    InterfaceRegistry  codectypes.InterfaceRegistry
+    LegacyAmino        *codec.LegacyAmino
+    Logger             log.Logger
+}
+
+func SetupAppBuilder(inputs AppInputs)
+```
+
+Wires up the application with all provided modules and dependencies.
+
+**Location:** `runtime/module.go:129-164`
+
+## Usage Examples
+
+### App Configuration File (app.yaml)
+
+```yaml
+modules:
+  - name: runtime
+    config:
+      "@type": cosmos.app.runtime.v1alpha1.Module
+      app_name: mychain
+      begin_blockers: [staking, distribution, mint]
+      end_blockers: [staking, gov]
+      init_genesis: [auth, bank, staking, distribution]
+      
+  - name: auth
+    config:
+      "@type": cosmos.auth.module.v1.Module
+      bech32_prefix: cosmos
+      
+  - name: bank
+    config:
+      "@type": cosmos.bank.module.v1.Module
+      
+  - name: staking
+    config:
+      "@type": cosmos.staking.module.v1.Module
+```
+
+### Building an App with Runtime
+
+```go
+package app
+
+import (
+    "cosmossdk.io/depinject"
+    "github.com/cosmos/cosmos-sdk/runtime"
+    "github.com/cosmos/cosmos-sdk/types/module"
+)
+
+func NewApp(
+    logger log.Logger,
+    db dbm.DB,
+    appOpts servertypes.AppOptions,
+) *App {
+    var (
+        app        *App
+        appBuilder *runtime.AppBuilder
+    )
+    
+    // Load app configuration
+    if err := depinject.Inject(
+        depinject.Configs(
+            AppConfig,
+            depinject.Supply(
+                logger,
+                appOpts,
+            ),
+        ),
+        &appBuilder,
+        &app.AccountKeeper,
+        &app.BankKeeper,
+        &app.StakingKeeper,
+        // ... other keepers
+    ); err != nil {
+        panic(err)
+    }
+    
+    // Build the app
+    app.App = appBuilder.Build(
+        db,
+        traceStore,
+        baseAppOptions...,
+    )
+    
+    return app
+}
+```
+
+### Custom Module with Dependency Injection
+
+```go
+package mymodule
+
+import (
+    "cosmossdk.io/core/appmodule"
+    "cosmossdk.io/core/store"
+    "cosmossdk.io/depinject"
+)
+
+// Module inputs from DI container
+type ModuleInputs struct {
+    depinject.In
+    
+    Config        *modulev1.Module
+    StoreService  store.KVStoreService
+    Cdc           codec.Codec
+    BankKeeper    types.BankKeeper    `optional:"true"`
+}
+
+// Module outputs to DI container
+type ModuleOutputs struct {
+    depinject.Out
+    
+    Keeper Keeper
+    Module appmodule.AppModule
+}
+
+// Provide module via dependency injection
+func ProvideModule(in ModuleInputs) ModuleOutputs {
+    keeper := NewKeeper(
+        in.Cdc,
+        in.StoreService,
+        in.BankKeeper,
+    )
+    
+    m := NewModule(keeper)
+    
+    return ModuleOutputs{
+        Keeper: keeper,
+        Module: m,
+    }
+}
+
+func init() {
+    appmodule.Register(
+        &modulev1.Module{},
+        appmodule.Provide(ProvideModule),
+    )
+}
+```
+
+### Providing Custom Services
+
+```go
+package app
+
+import (
+    "cosmossdk.io/depinject"
+    "github.com/cosmos/cosmos-sdk/runtime"
+)
+
+// Custom service provider
+func ProvideCustomService() CustomService {
+    return NewCustomService()
+}
+
+// Register in app config
+var AppConfig = depinject.Configs(
+    AppConfigYAML,
+    depinject.Provide(
+        ProvideCustomService,
+    ),
+)
+```
+
+## Core Services
+
+### Store Services
+
+Modules receive store services injected by runtime:
+
+```go
+type KVStoreService interface {
+    OpenKVStore(context.Context) store.KVStore
+}
+
+type MemoryStoreService interface {
+    OpenMemoryStore(context.Context) store.KVStore
+}
+
+type TransientStoreService interface {
+    OpenTransientStore(context.Context) store.KVStore
+}
+```
+
+### Event Service
+
+```go
+type EventService interface {
+    EventManager(context.Context) event.Manager
+}
+```
+
+### Header Service
+
+```go
+type HeaderService interface {
+    GetHeaderInfo(context.Context) header.Info
+}
+```
+
+## Migration from Legacy Apps
+
+To migrate from constructor-based apps to runtime:
+
+1. **Create app.yaml configuration**
+2. **Convert keepers to use DI**
+3. **Register module providers**
+4. **Use AppBuilder instead of manual wiring**
+
+```go
+// Legacy approach
+app.AccountKeeper = authkeeper.NewAccountKeeper(
+    appCodec,
+    keys[authtypes.StoreKey],
+    authtypes.ProtoBaseAccount,
+    maccPerms,
+    authcodec.NewBech32Codec(sdk.Bech32MainPrefix),
+)
+
+// Runtime approach - automatic injection
+var app App
+depinject.Inject(AppConfig, &app.AccountKeeper)
+```
+
+## Related APIs
+
+- [BaseApp](/api/baseapp) - Core ABCI application
+- [Module Manager](/api/module-manager) - Module lifecycle
+- [Store](/api/store) - Storage interfaces
+- [Depinject Documentation](https://docs.cosmos.network/main/building-apps/depinject)

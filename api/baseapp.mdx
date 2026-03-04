@@ -1,0 +1,316 @@
+---
+title: BaseApp
+description: Core ABCI application implementation and lifecycle management
+---
+
+## Overview
+
+BaseApp is the foundational ABCI application implementation in Cosmos SDK. It implements the ABCI interface for communication with CometBFT consensus engine and manages the application lifecycle, including transaction execution, state management, and block processing.
+
+## Core Types
+
+### BaseApp Structure
+
+```go
+type BaseApp struct {
+    logger            log.Logger
+    name              string                      // application name
+    db                dbm.DB                      // common DB backend
+    cms               storetypes.CommitMultiStore // Main (uncached) state
+    storeLoader       StoreLoader                 // function to handle store loading
+    grpcQueryRouter   *GRPCQueryRouter            // router for redirecting gRPC query calls
+    msgServiceRouter  *MsgServiceRouter           // router for redirecting Msg service messages
+    interfaceRegistry codectypes.InterfaceRegistry
+    txDecoder         sdk.TxDecoder               // unmarshal []byte into sdk.Tx
+    txEncoder         sdk.TxEncoder               // marshal sdk.Tx into []byte
+    
+    mempool           mempool.Mempool             // application side mempool
+    anteHandler       sdk.AnteHandler             // ante handler for fee and auth
+    postHandler       sdk.PostHandler             // post handler, optional
+    
+    abciHandlers      sdk.ABCIHandlers
+    paramStore        ParamStore
+    initialHeight     int64
+    
+    // For transaction execution
+    txRunner          sdk.TxRunner
+}
+```
+
+**Location:** `baseapp/baseapp.go:86-190`
+
+### StoreLoader
+
+```go
+type StoreLoader func(ms storetypes.CommitMultiStore) error
+```
+
+Defines a customizable function to control how the CommitMultiStore is loaded from disk. Useful for state migration and upgrades.
+
+**Location:** `baseapp/baseapp.go:50`
+
+## Constructor
+
+### NewBaseApp
+
+```go
+func NewBaseApp(
+    name string,
+    logger log.Logger,
+    db dbm.DB,
+    txDecoder sdk.TxDecoder,
+    options ...func(*BaseApp),
+) *BaseApp
+```
+
+Creates a new BaseApp instance with the provided parameters and optional functional options.
+
+**Location:** `baseapp/baseapp.go:195-259`
+
+**Example:**
+
+```go
+import (
+    "github.com/cosmos/cosmos-sdk/baseapp"
+    storetypes "cosmossdk.io/store/types"
+)
+
+// Create a new BaseApp
+app := baseapp.NewBaseApp(
+    "myapp",
+    logger,
+    db,
+    txConfig.TxDecoder(),
+    baseapp.SetPruning(pruningOpts),
+    baseapp.SetMinGasPrices(minGasPrices),
+)
+
+// Mount stores
+app.MountStores(keys...)
+
+// Load latest version
+if err := app.LoadLatestVersion(); err != nil {
+    panic(err)
+}
+```
+
+## ABCI Lifecycle Methods
+
+### InitChain
+
+```go
+func (app *BaseApp) InitChain(req *abci.RequestInitChain) (*abci.ResponseInitChain, error)
+```
+
+Initializes the blockchain with validators and other info from CometBFT. Called once on chain start.
+
+**Location:** `baseapp/abci.go:53-154`
+
+**Key Operations:**
+- Sets initial height and chain ID
+- Initializes finalizeState and checkState
+- Stores consensus parameters
+- Calls application's InitChainer handler
+
+### Info
+
+```go
+func (app *BaseApp) Info(_ *abci.RequestInfo) (*abci.ResponseInfo, error)
+```
+
+Returns application info including name, version, and last block height/hash.
+
+**Location:** `baseapp/abci.go:156-166`
+
+### Query
+
+```go
+func (app *BaseApp) Query(
+    ctx context.Context,
+    req *abci.RequestQuery,
+) (resp *abci.ResponseQuery, err error)
+```
+
+Handles ABCI queries for application state at a given height.
+
+**Location:** `baseapp/abci.go:170-200`
+
+## Execution Modes
+
+```go
+const (
+    ExecModeCheck               ExecMode = iota // Check a transaction
+    ExecModeReCheck                             // Recheck a (pending) transaction
+    ExecModeSimulate                            // Simulate a transaction
+    ExecModePrepareProposal                     // Prepare a block proposal
+    ExecModeProcessProposal                     // Process a block proposal
+    ExecModeVoteExtension                       // Extend or verify a pre-commit vote
+    ExecModeVerifyVoteExtension                 // Verify a vote extension
+    ExecModeFinalize                            // Finalize a block proposal
+)
+```
+
+**Location:** `baseapp/baseapp.go:53-62`
+
+## Key Methods
+
+### MountStores
+
+```go
+func (app *BaseApp) MountStores(keys ...storetypes.StoreKey)
+```
+
+Mounts all IAVL or DB stores to the provided keys in the BaseApp multistore.
+
+**Location:** `baseapp/baseapp.go:292-300`
+
+### SetAnteHandler
+
+```go
+func (app *BaseApp) SetAnteHandler(ah sdk.AnteHandler)
+```
+
+Sets the AnteHandler for the app, which is run before transaction execution for validation.
+
+### SetPostHandler
+
+```go
+func (app *BaseApp) SetPostHandler(ph sdk.PostHandler)
+```
+
+Sets the PostHandler for the app, which is run after transaction execution.
+
+### MsgServiceRouter
+
+```go
+func (app *BaseApp) MsgServiceRouter() *MsgServiceRouter
+```
+
+Returns the MsgServiceRouter to allow modules to register message handlers.
+
+**Location:** `baseapp/baseapp.go:287`
+
+### GRPCQueryRouter
+
+```go
+func (app *BaseApp) GRPCQueryRouter() *GRPCQueryRouter
+```
+
+Returns the GRPCQueryRouter to allow modules to register query handlers.
+
+**Location:** `baseapp/baseapp.go:290`
+
+## Store Management
+
+### LoadLatestVersion
+
+```go
+func (app *BaseApp) LoadLatestVersion() error
+```
+
+Loads the latest application version from the database.
+
+### LoadVersion
+
+```go
+func (app *BaseApp) LoadVersion(version int64) error
+```
+
+Loads a specific application version from the database.
+
+### LastCommitID
+
+```go
+func (app *BaseApp) LastCommitID() storetypes.CommitID
+```
+
+Returns the last committed block height and hash.
+
+## Configuration Options
+
+BaseApp supports functional options for configuration:
+
+```go
+// Set pruning options
+func SetPruning(opts pruningtypes.PruningOptions) func(*BaseApp)
+
+// Set minimum gas prices
+func SetMinGasPrices(gasPrices string) func(*BaseApp)
+
+// Set halt height
+func SetHaltHeight(height uint64) func(*BaseApp)
+
+// Set mempool
+func SetMempool(mempool mempool.Mempool) func(*BaseApp)
+
+// Set snapshot store
+func SetSnapshot(snapshotStore *snapshots.Store, opts snapshottypes.SnapshotOptions) func(*BaseApp)
+```
+
+## Usage in Application
+
+```go
+package app
+
+import (
+    "github.com/cosmos/cosmos-sdk/baseapp"
+    storetypes "cosmossdk.io/store/types"
+)
+
+type App struct {
+    *baseapp.BaseApp
+    
+    // keepers
+    AccountKeeper  authkeeper.AccountKeeper
+    BankKeeper     bankkeeper.BaseKeeper
+    StakingKeeper  stakingkeeper.Keeper
+    
+    // store keys
+    keys map[string]*storetypes.KVStoreKey
+}
+
+func NewApp(
+    logger log.Logger,
+    db dbm.DB,
+    appOpts servertypes.AppOptions,
+) *App {
+    // Create BaseApp
+    bApp := baseapp.NewBaseApp(
+        "mychain",
+        logger,
+        db,
+        txConfig.TxDecoder(),
+        baseapp.SetPruning(pruningOpts),
+    )
+    
+    app := &App{
+        BaseApp: bApp,
+        keys:    make(map[string]*storetypes.KVStoreKey),
+    }
+    
+    // Initialize keepers
+    app.AccountKeeper = authkeeper.NewAccountKeeper(...)
+    app.BankKeeper = bankkeeper.NewBaseKeeper(...)
+    
+    // Set ABCI handlers
+    app.SetAnteHandler(anteHandler)
+    app.SetInitChainer(app.InitChainer)
+    app.SetBeginBlocker(app.BeginBlocker)
+    app.SetEndBlocker(app.EndBlocker)
+    
+    // Mount stores and load
+    app.MountStores(keys...)
+    if err := app.LoadLatestVersion(); err != nil {
+        panic(err)
+    }
+    
+    return app
+}
+```
+
+## Related Types
+
+- [Context](/api/types#context) - Request context passed through handlers
+- [Store](/api/store) - State storage interfaces
+- [MsgServiceRouter](/api/msg-service) - Message routing
+- [Module Manager](/api/module-manager) - Module lifecycle coordination

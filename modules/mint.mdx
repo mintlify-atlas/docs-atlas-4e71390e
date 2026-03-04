@@ -1,0 +1,464 @@
+---
+title: Mint Module
+description: Token minting and inflation control for Cosmos SDK
+---
+
+# Mint Module (x/mint)
+
+## Overview
+
+The `x/mint` module handles the regular minting of new tokens in a configurable manner, implementing a flexible inflation mechanism that targets a particular bonded-stake ratio.
+
+**Purpose**: Create new tokens according to a predefined inflation schedule to incentivize token staking and maintain network security.
+
+## Key Concepts
+
+### The Minting Mechanism
+
+The default minting mechanism:
+- **Flexible Inflation**: Market-driven rate targeting bonded-stake ratio
+- **Market Balance**: Balance between liquidity and staked supply
+- **Moving Rate**: Adjusts inflation based on actual vs goal bonded percentage
+
+### Inflation Logic
+
+```
+If bonded% < goal%:     inflation increases (up to max)
+If bonded% = goal%:     inflation stays constant
+If bonded% > goal%:     inflation decreases (down to min)
+```
+
+**Goal Bonded Percentage**: Typically 67% on Cosmos Hub
+
+### Custom Minters
+
+As of v0.53.0, developers can implement custom minting logic:
+
+```go
+type MintFn func(ctx sdk.Context, k *Keeper) error
+```
+
+## State
+
+### Minter
+
+Holds current inflation information:
+
+**Storage**: `0x00 -> ProtocolBuffer(minter)`
+
+```protobuf
+message Minter {
+    string inflation = 1;
+    string annual_provisions = 2;
+}
+```
+
+### Parameters
+
+**Storage**: `0x01 -> ProtocolBuffer(Params)`
+
+```protobuf
+message Params {
+    string mint_denom = 1;
+    string inflation_rate_change = 2;
+    string inflation_max = 3;
+    string inflation_min = 4;
+    string goal_bonded = 5;
+    uint64 blocks_per_year = 6;
+    string max_supply = 7;
+}
+```
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| MintDenom | string | "uatom" | Denomination of minted tokens |
+| InflationRateChange | string (dec) | "0.130000000000000000" | Max annual inflation change |
+| InflationMax | string (dec) | "0.200000000000000000" | Maximum inflation rate (20%) |
+| InflationMin | string (dec) | "0.070000000000000000" | Minimum inflation rate (7%) |
+| GoalBonded | string (dec) | "0.670000000000000000" | Target bonded ratio (67%) |
+| BlocksPerYear | uint64 | "6311520" | Expected blocks per year |
+| MaxSupply | string (int) | "0" | Maximum supply (0 = unlimited) |
+
+## BeginBlock
+
+Minting occurs at the beginning of each block:
+
+### NextInflationRate
+
+Calculate target annual inflation:
+
+```go
+NextInflationRate(params Params, bondedRatio math.LegacyDec) (inflation math.LegacyDec) {
+    inflationRateChangePerYear = (1 - bondedRatio/params.GoalBonded) * params.InflationRateChange
+    inflationRateChange = inflationRateChangePerYear/blocksPerYr
+    
+    inflation += inflationRateChange
+    if inflation > params.InflationMax {
+        inflation = params.InflationMax
+    }
+    if inflation < params.InflationMin {
+        inflation = params.InflationMin
+    }
+    
+    return inflation
+}
+```
+
+### NextAnnualProvisions
+
+Calculate annual provisions based on supply and inflation:
+
+```go
+NextAnnualProvisions(params Params, totalSupply math.LegacyDec) (provisions math.LegacyDec) {
+    return Inflation * totalSupply
+}
+```
+
+### BlockProvision
+
+Calculate provisions for current block:
+
+```go
+BlockProvision(params Params) sdk.Coin {
+    provisionAmt = AnnualProvisions / params.BlocksPerYear
+    return sdk.NewCoin(params.MintDenom, provisionAmt.Truncate())
+}
+```
+
+### Max Supply Control
+
+Optional feature to cap total supply:
+
+```go
+if params.MaxSupply.IsPositive() {
+    totalSupply := bankKeeper.GetSupply(ctx, params.MintDenom)
+    if totalSupply.Amount.GTE(params.MaxSupply) {
+        return nil // Stop minting
+    }
+    
+    // Limit provision to not exceed max supply
+    remaining := params.MaxSupply.Sub(totalSupply.Amount)
+    if provision.Amount.GT(remaining) {
+        provision.Amount = remaining
+    }
+}
+```
+
+## Queries
+
+### Query Inflation
+
+Get current inflation rate:
+
+```bash
+simd query mint inflation
+```
+
+Example output:
+```
+0.199200302563256955
+```
+
+### Query Annual Provisions
+
+Get current annual provisions:
+
+```bash
+simd query mint annual-provisions
+```
+
+Example output:
+```
+22268504368893.612100895088410693
+```
+
+### Query Parameters
+
+```bash
+simd query mint params
+```
+
+Example output:
+```yaml
+blocks_per_year: "4360000"
+goal_bonded: "0.670000000000000000"
+inflation_max: "0.200000000000000000"
+inflation_min: "0.070000000000000000"
+inflation_rate_change: "0.130000000000000000"
+mint_denom: stake
+max_supply: "0"
+```
+
+## gRPC Endpoints
+
+### Inflation
+
+```bash
+grpcurl -plaintext \
+    localhost:9090 \
+    cosmos.mint.v1beta1.Query/Inflation
+```
+
+Example output:
+```json
+{
+  "inflation": "130197115720711261"
+}
+```
+
+### AnnualProvisions
+
+```bash
+grpcurl -plaintext \
+    localhost:9090 \
+    cosmos.mint.v1beta1.Query/AnnualProvisions
+```
+
+### Params
+
+```bash
+grpcurl -plaintext \
+    localhost:9090 \
+    cosmos.mint.v1beta1.Query/Params
+```
+
+## Events
+
+### BeginBlocker
+
+| Type | Attribute Key | Attribute Value |
+|------|---------------|----------------|
+| mint | bonded_ratio | {bondedRatio} |
+| mint | inflation | {inflation} |
+| mint | annual_provisions | {annualProvisions} |
+| mint | amount | {amount} |
+
+## Code Examples
+
+### Custom Mint Function
+
+Implement custom minting logic:
+
+```go
+// Custom mint function that doubles supply of 'foo' coin
+func MyCustomMintFunction(bank bankkeeper.BaseKeeper) mintkeeper.MintFn {
+    return func(ctx sdk.Context, k *mintkeeper.Keeper) error {
+        supply := bank.GetSupply(ctx, "foo")
+        err := k.MintCoins(ctx, sdk.NewCoins(supply.Add(supply)))
+        if err != nil {
+            return err
+        }
+        return nil
+    }
+}
+
+// Initialize keeper with custom mint function
+app.MintKeeper = mintkeeper.NewKeeper(
+    appCodec,
+    runtime.NewKVStoreService(keys[minttypes.StoreKey]),
+    app.StakingKeeper,
+    app.AccountKeeper,
+    app.BankKeeper,
+    authtypes.FeeCollectorName,
+    authtypes.NewModuleAddress(govtypes.ModuleName).String(),
+    mintkeeper.WithMintFn(MyCustomMintFunction(app.BankKeeper)),
+)
+```
+
+### Custom Inflation Function
+
+Implement custom inflation calculation:
+
+```go
+type InflationCalculationFn func(
+    ctx context.Context,
+    minter Minter,
+    params Params,
+    bondedRatio math.LegacyDec,
+) math.LegacyDec
+
+// Example: Fixed inflation
+func FixedInflation(
+    ctx context.Context,
+    minter Minter,
+    params Params,
+    bondedRatio math.LegacyDec,
+) math.LegacyDec {
+    return sdk.NewDecWithPrec(10, 2) // 10% fixed
+}
+
+// Example: Step function inflation
+func StepInflation(
+    ctx context.Context,
+    minter Minter,
+    params Params,
+    bondedRatio math.LegacyDec,
+) math.LegacyDec {
+    if bondedRatio.LT(sdk.NewDecWithPrec(50, 2)) {
+        return sdk.NewDecWithPrec(20, 2) // 20% if <50% bonded
+    } else if bondedRatio.LT(sdk.NewDecWithPrec(67, 2)) {
+        return sdk.NewDecWithPrec(15, 2) // 15% if <67% bonded
+    }
+    return sdk.NewDecWithPrec(10, 2) // 10% otherwise
+}
+```
+
+### Query Minter State
+
+```go
+// Get current minter state
+minter := mintKeeper.GetMinter(ctx)
+fmt.Printf("Inflation: %s\n", minter.Inflation)
+fmt.Printf("Annual Provisions: %s\n", minter.AnnualProvisions)
+
+// Get bonded ratio
+bondedRatio := mintKeeper.BondedRatio(ctx)
+fmt.Printf("Bonded Ratio: %s\n", bondedRatio)
+```
+
+### Mint Coins
+
+```go
+// Mint coins to module account
+amount := sdk.NewCoins(sdk.NewInt64Coin("stake", 1000000))
+err := mintKeeper.MintCoins(ctx, amount)
+if err != nil {
+    return err
+}
+
+// Transfer to fee collector
+err = bankKeeper.SendCoinsFromModuleToModule(
+    ctx,
+    minttypes.ModuleName,
+    authtypes.FeeCollectorName,
+    amount,
+)
+if err != nil {
+    return err
+}
+```
+
+### Calculate Block Provision
+
+```go
+// Get current block provision
+params := mintKeeper.GetParams(ctx)
+minter := mintKeeper.GetMinter(ctx)
+
+bondedRatio := mintKeeper.BondedRatio(ctx)
+inflation := mintKeeper.NextInflation(ctx, minter, params, bondedRatio)
+
+totalSupply := bankKeeper.GetSupply(ctx, params.MintDenom)
+annualProvisions := inflation.MulInt(totalSupply.Amount)
+
+blockProvision := annualProvisions.QuoInt(
+    sdk.NewInt(int64(params.BlocksPerYear)),
+)
+
+fmt.Printf("Block Provision: %s\n", blockProvision)
+```
+
+## Max Supply Example
+
+Configure maximum supply:
+
+```go
+// Set max supply of 1 billion tokens
+params := minttypes.Params{
+    MintDenom:           "stake",
+    InflationRateChange: sdk.NewDecWithPrec(13, 2),
+    InflationMax:        sdk.NewDecWithPrec(20, 2),
+    InflationMin:        sdk.NewDecWithPrec(7, 2),
+    GoalBonded:          sdk.NewDecWithPrec(67, 2),
+    BlocksPerYear:       6311520,
+    MaxSupply:           sdk.NewInt(1_000_000_000_000000), // 1B tokens
+}
+
+mintKeeper.SetParams(ctx, params)
+```
+
+## CLI Commands Reference
+
+| Command | Description |
+|---------|-------------|
+| `simd query mint inflation` | Query current inflation rate |
+| `simd query mint annual-provisions` | Query annual provisions |
+| `simd query mint params` | Query mint module parameters |
+
+## REST Endpoints
+
+### Inflation
+
+```bash
+curl "localhost:1317/cosmos/mint/v1beta1/inflation"
+```
+
+### Annual Provisions
+
+```bash
+curl "localhost:1317/cosmos/mint/v1beta1/annual_provisions"
+```
+
+### Params
+
+```bash
+curl "localhost:1317/cosmos/mint/v1beta1/params"
+```
+
+## Integration Guide
+
+```go
+// Initialize mint keeper
+app.MintKeeper = mintkeeper.NewKeeper(
+    appCodec,
+    runtime.NewKVStoreService(keys[minttypes.StoreKey]),
+    app.StakingKeeper,
+    app.AccountKeeper,
+    app.BankKeeper,
+    authtypes.FeeCollectorName,
+    authtypes.NewModuleAddress(govtypes.ModuleName).String(),
+)
+
+// Register module
+app.ModuleManager = module.NewManager(
+    mint.NewAppModule(appCodec, app.MintKeeper, app.AccountKeeper, nil),
+    // other modules...
+)
+
+// Set begin blocker order
+app.ModuleManager.SetOrderBeginBlockers(
+    minttypes.ModuleName,
+    // other modules...
+)
+```
+
+## Inflation Schedule Examples
+
+### Example 1: Cosmos Hub Style
+
+- Goal Bonded: 67%
+- Min Inflation: 7%
+- Max Inflation: 20%
+- Rate Change: 13% per year
+
+### Example 2: Fixed Inflation
+
+```go
+inflation := sdk.NewDecWithPrec(5, 2) // 5% fixed
+```
+
+### Example 3: Deflationary Schedule
+
+```go
+// Halve inflation every year
+func DeflatinaryInflation(...) math.LegacyDec {
+    yearsPassed := ctx.BlockHeight() / params.BlocksPerYear
+    baseInflation := sdk.NewDecWithPrec(20, 2) // Start at 20%
+    
+    for i := 0; i < int(yearsPassed); i++ {
+        baseInflation = baseInflation.Quo(sdk.NewDec(2))
+    }
+    
+    return baseInflation
+}
+```

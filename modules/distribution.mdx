@@ -1,0 +1,500 @@
+---
+title: Distribution Module
+description: Fee distribution and reward management for validators and delegators
+---
+
+# Distribution Module (x/distribution)
+
+## Overview
+
+The `x/distribution` module implements a passive mechanism for distributing rewards between validators and delegators. It handles fee collection, validator commission, and delegator reward distribution using the F1 fee distribution algorithm.
+
+**Purpose**: Fairly distribute transaction fees and block rewards to validators and their delegators based on stake proportions.
+
+## Key Concepts
+
+### F1 Fee Distribution
+
+Rewards are calculated per period using the F1 algorithm:
+- **Period**: Updated each time a validator's delegation changes
+- **Commission**: Calculated and paid when validator withdraws or is removed
+- **Delegator Rewards**: Distributed when delegation changes or withdrawal is requested
+- **Slashing**: Applied before rewards distribution for infractions during delegation
+
+### Reward Pool
+
+All globally tracked parameters for distribution:
+
+```protobuf
+message FeePool {
+    repeated DecCoin community_pool = 1;
+}
+```
+
+**Storage**: `0x00 -> ProtocolBuffer(FeePool)`
+
+### Community Tax
+
+A percentage of rewards goes to the community pool:
+```
+community_pool_reward = total_rewards * community_tax
+validator_rewards = total_rewards - community_pool_reward
+```
+
+## State
+
+### FeePool
+
+Global reward pool storing decimal coins:
+- Rewards collected and added to pool
+- Distributed to validators/delegators
+- Truncated to `sdk.Coins` when distributed
+
+### Validator Distribution
+
+Updated when:
+1. Delegation amount changes
+2. Delegator withdraws from validator
+3. Validator withdraws commission
+
+**Storage Keys**:
+```
+0x02 | ValOperatorAddr -> ValidatorOutstandingRewards
+0x06 | ValOperatorAddr -> ValidatorCurrentRewards
+0x07 | ValOperatorAddr -> ValidatorAccumulatedCommission
+```
+
+```go
+type ValidatorCurrentRewards struct {
+    Rewards sdk.DecCoins
+    Period  uint64
+}
+
+type ValidatorAccumulatedCommission struct {
+    Commission sdk.DecCoins
+}
+```
+
+### Delegation Distribution
+
+Tracks starting information for calculating rewards:
+
+**Storage**: `0x04 | ValOperatorAddr | AccAddr -> DelegatorStartingInfo`
+
+```go
+type DelegatorStartingInfo struct {
+    PreviousPeriod uint64       // Period at delegation creation
+    Stake          math.LegacyDec // Amount delegated
+    Height         uint64       // Height at delegation creation
+}
+```
+
+## Parameters
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| community_tax | string (dec) | "0.020000000000000000" | % of fees sent to community pool |
+| withdraw_addr_enabled | bool | true | Allow setting custom withdraw addresses |
+
+**Note**: `community_tax` must be positive and cannot exceed 1.00 (100%)
+
+## Messages
+
+### MsgSetWithdrawAddress
+
+Set a custom address for receiving rewards:
+
+```protobuf
+message MsgSetWithdrawAddress {
+    string delegator_address = 1;
+    string withdraw_address = 2;
+}
+```
+
+**Validation**:
+- Withdraw address cannot be a module account
+- Feature must be enabled via `withdraw_addr_enabled` parameter
+- Delegator must own the account
+
+**Usage**:
+```bash
+simd tx distribution set-withdraw-addr cosmos1... --from mykey
+```
+
+### MsgWithdrawDelegatorReward
+
+Withdraw rewards from a specific validator:
+
+```protobuf
+message MsgWithdrawDelegatorReward {
+    string delegator_address = 1;
+    string validator_address = 2;
+}
+```
+
+**Process**:
+1. Calculate rewards using F1 algorithm
+2. Apply any slashing that occurred during delegation
+3. Send truncated integer amount to withdraw address
+4. Send remainder (decimals) to community pool
+5. Update `DelegatorStartingInfo` to current period
+6. Decrement `ValidatorOutstandingRewards`
+
+**Usage**:
+```bash
+simd tx distribution withdraw-rewards cosmosvaloper1... --from mykey
+```
+
+### MsgWithdrawValidatorCommission
+
+Validator withdraws accumulated commission:
+
+```protobuf
+message MsgWithdrawValidatorCommission {
+    string validator_address = 1;
+}
+```
+
+**Process**:
+1. Calculate commission from `ValidatorAccumulatedCommission`
+2. Truncate to integer amount
+3. Send to validator's self-delegation withdraw address
+4. Deduct from `ValidatorOutstandingRewards`
+
+**Usage**:
+```bash
+simd tx distribution withdraw-rewards cosmosvaloper1... --commission --from mykey
+```
+
+### MsgFundCommunityPool
+
+Directly fund the community pool:
+
+```protobuf
+message MsgFundCommunityPool {
+    repeated cosmos.base.v1beta1.Coin amount = 1;
+    string depositor = 2;
+}
+```
+
+**Usage**:
+```bash
+simd tx distribution fund-community-pool 100stake --from mykey
+```
+
+## BeginBlock Distribution
+
+At each block, rewards are distributed:
+
+```go
+func BeginBlocker(ctx sdk.Context, k keeper.Keeper) {
+    // 1. Charge community tax
+    communityTax := fees * params.CommunityTax
+    
+    // 2. Distribute remainder to validators by voting power
+    validatorRewards := fees - communityTax
+    
+    for validator := range bondedValidators {
+        reward := validatorRewards * (validator.Power / totalPower)
+        k.AllocateTokensToValidator(ctx, validator, reward)
+    }
+}
+```
+
+### Reward Calculation
+
+**For Validators**:
+```
+validatorReward = totalFees * (1 - communityTax) * (validatorPower / totalBondedPower)
+```
+
+**For Delegators**:
+```
+delegatorReward = validatorReward * (1 - commission) * (delegatorStake / totalValidatorStake)
+```
+
+## Queries
+
+### Query Validator Commission
+
+```bash
+simd query distribution commission cosmosvaloper1...
+```
+
+Example output:
+```yaml
+commission:
+- amount: "1000000.000000000000000000"
+  denom: stake
+```
+
+### Query Community Pool
+
+```bash
+simd query distribution community-pool
+```
+
+### Query Rewards
+
+```bash
+# All rewards for delegator
+simd query distribution rewards cosmos1...
+
+# Rewards from specific validator
+simd query distribution rewards cosmos1... cosmosvaloper1...
+```
+
+### Query Validator Slashes
+
+```bash
+simd query distribution slashes cosmosvaloper1... 1 1000
+```
+
+### Query Validator Outstanding Rewards
+
+```bash
+simd query distribution validator-outstanding-rewards cosmosvaloper1...
+```
+
+### Query Parameters
+
+```bash
+simd query distribution params
+```
+
+## Transactions
+
+### Withdraw All Rewards
+
+```bash
+simd tx distribution withdraw-all-rewards --from mykey
+```
+
+### Withdraw with Commission
+
+```bash
+simd tx distribution withdraw-rewards cosmosvaloper1... \
+    --commission \
+    --from mykey
+```
+
+### Set Withdraw Address
+
+```bash
+simd tx distribution set-withdraw-addr cosmos1... --from mykey
+```
+
+## gRPC Endpoints
+
+### ValidatorDistributionInfo
+
+```bash
+grpcurl -plaintext \
+    -d '{"validator_address":"cosmosvaloper1.."}' \
+    localhost:9090 \
+    cosmos.distribution.v1beta1.Query/ValidatorDistributionInfo
+```
+
+### DelegationRewards
+
+```bash
+grpcurl -plaintext \
+    -d '{"delegator_address":"cosmos1..","validator_address":"cosmosvaloper1.."}' \
+    localhost:9090 \
+    cosmos.distribution.v1beta1.Query/DelegationRewards
+```
+
+### CommunityPool
+
+```bash
+grpcurl -plaintext \
+    localhost:9090 \
+    cosmos.distribution.v1beta1.Query/CommunityPool
+```
+
+## Events
+
+### BeginBlocker Events
+
+| Type | Attribute Key | Attribute Value |
+|------|---------------|----------------|
+| proposer_reward | validator | {validatorAddress} |
+| proposer_reward | reward | {proposerReward} |
+| commission | amount | {commissionAmount} |
+| commission | validator | {validatorAddress} |
+| rewards | amount | {rewardAmount} |
+| rewards | validator | {validatorAddress} |
+
+### MsgWithdrawDelegatorReward Events
+
+| Type | Attribute Key | Attribute Value |
+|------|---------------|----------------|
+| withdraw_rewards | amount | {rewardAmount} |
+| withdraw_rewards | validator | {validatorAddress} |
+| message | module | distribution |
+| message | action | withdraw_delegator_reward |
+| message | sender | {senderAddress} |
+
+## Code Examples
+
+### Calculate Delegator Rewards
+
+```go
+// Get rewards for delegator from validator
+func GetDelegationRewards(
+    ctx sdk.Context,
+    k keeper.Keeper,
+    delAddr sdk.AccAddress,
+    valAddr sdk.ValAddress,
+) (sdk.DecCoins, error) {
+    // Get validator
+    val := k.stakingKeeper.Validator(ctx, valAddr)
+    if val == nil {
+        return nil, types.ErrNoValidatorExists
+    }
+    
+    // Get delegation
+    del := k.stakingKeeper.Delegation(ctx, delAddr, valAddr)
+    if del == nil {
+        return nil, types.ErrNoDelegationExists
+    }
+    
+    // Calculate rewards
+    endingPeriod := k.IncrementValidatorPeriod(ctx, val)
+    rewards := k.CalculateDelegationRewards(ctx, val, del, endingPeriod)
+    
+    return rewards, nil
+}
+```
+
+### Withdraw Rewards
+
+```go
+// Withdraw delegation rewards
+func WithdrawDelegationRewards(
+    ctx sdk.Context,
+    k keeper.Keeper,
+    delAddr sdk.AccAddress,
+    valAddr sdk.ValAddress,
+) (sdk.Coins, error) {
+    // Get validator
+    val := k.stakingKeeper.Validator(ctx, valAddr)
+    if val == nil {
+        return nil, types.ErrNoValidatorExists
+    }
+    
+    // Get delegation
+    del := k.stakingKeeper.Delegation(ctx, delAddr, valAddr)
+    if del == nil {
+        return nil, types.ErrNoDelegationExists
+    }
+    
+    // Withdraw rewards
+    rewards, err := k.WithdrawDelegationRewards(ctx, delAddr, valAddr)
+    if err != nil {
+        return nil, err
+    }
+    
+    return rewards, nil
+}
+```
+
+### Allocate Rewards to Validator
+
+```go
+// Allocate tokens to validator from fee pool
+func AllocateTokensToValidator(
+    ctx sdk.Context,
+    k keeper.Keeper,
+    val stakingtypes.ValidatorI,
+    tokens sdk.DecCoins,
+) {
+    // Get commission
+    commission := tokens.MulDec(val.GetCommission())
+    remaining := tokens.Sub(commission)
+    
+    // Add commission to validator
+    k.AddValidatorCommission(ctx, val.GetOperator(), commission)
+    
+    // Add remaining to validator current rewards
+    k.AddValidatorRewards(ctx, val.GetOperator(), remaining)
+}
+```
+
+### Fund Community Pool
+
+```go
+// Fund community pool
+func FundCommunityPool(
+    ctx sdk.Context,
+    k keeper.Keeper,
+    amount sdk.Coins,
+    sender sdk.AccAddress,
+) error {
+    // Transfer from sender to distribution module
+    err := k.bankKeeper.SendCoinsFromAccountToModule(
+        ctx, sender, types.ModuleName, amount,
+    )
+    if err != nil {
+        return err
+    }
+    
+    // Add to fee pool
+    feePool := k.GetFeePool(ctx)
+    feePool.CommunityPool = feePool.CommunityPool.Add(
+        sdk.NewDecCoinsFromCoins(amount...)...,
+    )
+    k.SetFeePool(ctx, feePool)
+    
+    return nil
+}
+```
+
+## CLI Commands Reference
+
+| Command | Description |
+|---------|-------------|
+| `simd query distribution commission [validator]` | Query validator commission |
+| `simd query distribution community-pool` | Query community pool |
+| `simd query distribution params` | Query distribution parameters |
+| `simd query distribution rewards [delegator]` | Query delegator rewards |
+| `simd query distribution slashes [validator] [start] [end]` | Query validator slashes |
+| `simd tx distribution fund-community-pool [amount]` | Fund community pool |
+| `simd tx distribution set-withdraw-addr [addr]` | Set withdraw address |
+| `simd tx distribution withdraw-all-rewards` | Withdraw all rewards |
+| `simd tx distribution withdraw-rewards [validator]` | Withdraw validator rewards |
+
+## Integration Guide
+
+```go
+// Initialize distribution keeper
+app.DistrKeeper = distrkeeper.NewKeeper(
+    appCodec,
+    runtime.NewKVStoreService(keys[distrtypes.StoreKey]),
+    app.AccountKeeper,
+    app.BankKeeper,
+    app.StakingKeeper,
+    authtypes.FeeCollectorName,
+    authtypes.NewModuleAddress(govtypes.ModuleName).String(),
+)
+
+// Register hooks
+app.StakingKeeper.SetHooks(
+    stakingtypes.NewMultiStakingHooks(
+        app.DistrKeeper.Hooks(),
+        app.SlashingKeeper.Hooks(),
+    ),
+)
+
+// Register module
+app.ModuleManager = module.NewManager(
+    distribution.NewAppModule(
+        appCodec,
+        app.DistrKeeper,
+        app.AccountKeeper,
+        app.BankKeeper,
+        app.StakingKeeper,
+    ),
+    // other modules...
+)
+```

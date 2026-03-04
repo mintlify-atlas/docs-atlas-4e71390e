@@ -1,0 +1,325 @@
+---
+title: AnteHandler
+description: Understanding and implementing AnteHandlers for transaction validation in Cosmos SDK
+---
+
+The AnteHandler is a critical component in Cosmos SDK that validates transactions before they are processed. It chains multiple decorators together to perform checks like signature verification, fee deduction, and gas consumption.
+
+## Overview
+
+AnteHandlers are executed before message execution in the transaction lifecycle. They validate transaction properties and ensure the transaction meets all requirements before state changes occur.
+
+### AnteHandler Signature
+
+```go
+type AnteHandler func(ctx Context, tx Tx, simulate bool) (newCtx Context, err error)
+```
+
+AnteHandlers receive:
+- `ctx`: The current context containing state and metadata
+- `tx`: The transaction to validate
+- `simulate`: Whether this is a simulation run
+
+They return a new context and an error if validation fails.
+
+## Default AnteHandler Chain
+
+The default AnteHandler in `x/auth` chains multiple decorators:
+
+```go title="x/auth/ante/ante.go"
+func NewAnteHandler(options HandlerOptions) (sdk.AnteHandler, error) {
+    if options.AccountKeeper == nil {
+        return nil, errorsmod.Wrap(sdkerrors.ErrLogic, "account keeper is required for ante builder")
+    }
+
+    if options.BankKeeper == nil {
+        return nil, errorsmod.Wrap(sdkerrors.ErrLogic, "bank keeper is required for ante builder")
+    }
+
+    if options.SignModeHandler == nil {
+        return nil, errorsmod.Wrap(sdkerrors.ErrLogic, "sign mode handler is required for ante builder")
+    }
+
+    anteDecorators := []sdk.AnteDecorator{
+        NewSetUpContextDecorator(), // outermost AnteDecorator. SetUpContext must be called first
+        NewExtensionOptionsDecorator(options.ExtensionOptionChecker),
+        NewValidateBasicDecorator(),
+        NewTxTimeoutHeightDecorator(),
+        NewValidateMemoDecorator(options.AccountKeeper),
+        NewConsumeGasForTxSizeDecorator(options.AccountKeeper),
+        NewDeductFeeDecorator(options.AccountKeeper, options.BankKeeper, options.FeegrantKeeper, options.TxFeeChecker),
+        NewSetPubKeyDecorator(options.AccountKeeper), // SetPubKeyDecorator must be called before all signature verification decorators
+        NewValidateSigCountDecorator(options.AccountKeeper),
+        NewSigGasConsumeDecorator(options.AccountKeeper, options.SigGasConsumer),
+        NewSigVerificationDecorator(options.AccountKeeper, options.SignModeHandler, options.SigVerifyOptions...),
+        NewIncrementSequenceDecorator(options.AccountKeeper),
+    }
+
+    return sdk.ChainAnteDecorators(anteDecorators...), nil
+}
+```
+
+Source: [x/auth/ante/ante.go:32](https://github.com/cosmos/cosmos-sdk/blob/main/x/auth/ante/ante.go#L32)
+
+## Key Decorators
+
+### SetUpContextDecorator
+
+Must be the first decorator. Sets up the gas meter and handles out-of-gas panics:
+
+```go title="x/auth/ante/setup.go"
+type SetUpContextDecorator struct{}
+
+func (sud SetUpContextDecorator) AnteHandle(ctx sdk.Context, tx sdk.Tx, simulate bool, next sdk.AnteHandler) (newCtx sdk.Context, err error) {
+    // all transactions must implement GasTx
+    gasTx, ok := tx.(GasTx)
+    if !ok {
+        // Set a gas meter with limit 0 as to prevent an infinite gas meter attack
+        // during runTx.
+        newCtx = SetGasMeter(simulate, ctx, 0)
+        return newCtx, errorsmod.Wrap(sdkerrors.ErrTxDecode, "Tx must be GasTx")
+    }
+
+    newCtx = SetGasMeter(simulate, ctx, gasTx.GetGas())
+
+    // Decorator will catch an OutOfGasPanic caused in the next antehandler
+    defer func() {
+        if r := recover(); r != nil {
+            switch rType := r.(type) {
+            case storetypes.ErrorOutOfGas:
+                log := fmt.Sprintf(
+                    "out of gas in location: %v; gasWanted: %d, gasUsed: %d",
+                    rType.Descriptor, gasTx.GetGas(), newCtx.GasMeter().GasConsumed())
+                err = errorsmod.Wrap(sdkerrors.ErrOutOfGas, log)
+            default:
+                panic(r)
+            }
+        }
+    }()
+
+    return next(newCtx, tx, simulate)
+}
+```
+
+Source: [x/auth/ante/setup.go:30](https://github.com/cosmos/cosmos-sdk/blob/main/x/auth/ante/setup.go#L30)
+
+### ValidateBasicDecorator
+
+Validates basic transaction properties:
+
+```go title="x/auth/ante/basic.go"
+type ValidateBasicDecorator struct{}
+
+func (vbd ValidateBasicDecorator) AnteHandle(ctx sdk.Context, tx sdk.Tx, simulate bool, next sdk.AnteHandler) (sdk.Context, error) {
+    // no need to validate basic on recheck tx, call next antehandler
+    if ctx.IsReCheckTx() {
+        return next(ctx, tx, simulate)
+    }
+
+    if validateBasic, ok := tx.(sdk.HasValidateBasic); ok {
+        if err := validateBasic.ValidateBasic(); err != nil {
+            return ctx, err
+        }
+    }
+
+    return next(ctx, tx, simulate)
+}
+```
+
+Source: [x/auth/ante/basic.go:30](https://github.com/cosmos/cosmos-sdk/blob/main/x/auth/ante/basic.go#L30)
+
+### DeductFeeDecorator
+
+Deducts transaction fees from the fee payer:
+
+```go title="x/auth/ante/fee.go"
+type DeductFeeDecorator struct {
+    accountKeeper  AccountKeeper
+    bankKeeper     types.BankKeeper
+    feegrantKeeper FeegrantKeeper
+    txFeeChecker   TxFeeChecker
+}
+
+func (dfd DeductFeeDecorator) AnteHandle(ctx sdk.Context, tx sdk.Tx, simulate bool, next sdk.AnteHandler) (sdk.Context, error) {
+    feeTx, ok := tx.(sdk.FeeTx)
+    if !ok {
+        return ctx, errorsmod.Wrap(sdkerrors.ErrTxDecode, "Tx must be a FeeTx")
+    }
+
+    if !simulate && ctx.BlockHeight() > 0 && feeTx.GetGas() == 0 {
+        return ctx, errorsmod.Wrap(sdkerrors.ErrInvalidGasLimit, "must provide positive gas")
+    }
+
+    var (
+        priority int64
+        err      error
+    )
+
+    fee := feeTx.GetFee()
+    if !simulate {
+        fee, priority, err = dfd.txFeeChecker(ctx, tx)
+        if err != nil {
+            return ctx, err
+        }
+    }
+    if err := dfd.checkDeductFee(ctx, tx, fee); err != nil {
+        return ctx, err
+    }
+
+    newCtx := ctx.WithPriority(priority)
+
+    return next(newCtx, tx, simulate)
+}
+```
+
+Source: [x/auth/ante/fee.go:42](https://github.com/cosmos/cosmos-sdk/blob/main/x/auth/ante/fee.go#L42)
+
+### SigVerificationDecorator
+
+Verifies all transaction signatures and handles unordered transactions:
+
+```go title="x/auth/ante/sigverify.go"
+type SigVerificationDecorator struct {
+    ak                   AccountKeeper
+    signModeHandler      *txsigning.HandlerMap
+    maxTxTimeoutDuration time.Duration
+    unorderedTxGasCost   uint64
+}
+
+func (svd SigVerificationDecorator) AnteHandle(ctx sdk.Context, tx sdk.Tx, simulate bool, next sdk.AnteHandler) (newCtx sdk.Context, err error) {
+    sigTx, ok := tx.(authsigning.Tx)
+    if !ok {
+        return ctx, errorsmod.Wrap(sdkerrors.ErrTxDecode, "invalid transaction type")
+    }
+
+    utx, ok := tx.(sdk.TxWithUnordered)
+    isUnordered := ok && utx.GetUnordered()
+    unorderedEnabled := svd.ak.UnorderedTransactionsEnabled()
+
+    if isUnordered && !unorderedEnabled {
+        return ctx, errorsmod.Wrap(sdkerrors.ErrNotSupported, "unordered transactions are not enabled")
+    }
+
+    sigs, err := sigTx.GetSignaturesV2()
+    if err != nil {
+        return ctx, err
+    }
+
+    signers, err := sigTx.GetSigners()
+    if err != nil {
+        return ctx, err
+    }
+
+    // check that signer length and signature length are the same
+    if len(sigs) != len(signers) {
+        return ctx, errorsmod.Wrapf(sdkerrors.ErrUnauthorized, "invalid number of signer;  expected: %d, got %d", len(signers), len(sigs))
+    }
+
+    // In unordered transactions, verify the nonce outside the sigs loop
+    if isUnordered {
+        if err := svd.verifyUnorderedNonce(ctx, utx); err != nil {
+            return ctx, err
+        }
+    }
+
+    // ... signature verification logic ...
+
+    return next(ctx, tx, simulate)
+}
+```
+
+Source: [x/auth/ante/sigverify.go:306](https://github.com/cosmos/cosmos-sdk/blob/main/x/auth/ante/sigverify.go#L306)
+
+## Unordered Transactions
+
+As of v0.53.0, the SDK supports unordered transactions with TTL-based nonces:
+
+```go
+const (
+    // DefaultMaxTimeoutDuration defines a default maximum TTL a transaction can define.
+    DefaultMaxTimeoutDuration = 10 * time.Minute
+    // DefaultUnorderedTxGasCost defines a default gas cost for unordered transactions.
+    DefaultUnorderedTxGasCost = uint64(2240)
+)
+```
+
+To configure unordered transaction options:
+
+```go
+options := ante.HandlerOptions{
+    SigVerifyOptions: []ante.SigVerificationDecoratorOption{
+        ante.WithUnorderedTxGasCost(ante.DefaultUnorderedTxGasCost),
+        ante.WithMaxUnorderedTxTimeoutDuration(ante.DefaultMaxTimeoutDuration),
+    },
+}
+```
+
+Source: [x/auth/ante/sigverify.go:260](https://github.com/cosmos/cosmos-sdk/blob/main/x/auth/ante/sigverify.go#L260)
+
+## Custom AnteHandlers
+
+You can create custom AnteHandlers by implementing the decorator pattern:
+
+```go
+type CustomDecorator struct {
+    // your fields
+}
+
+func NewCustomDecorator() CustomDecorator {
+    return CustomDecorator{}
+}
+
+func (cd CustomDecorator) AnteHandle(ctx sdk.Context, tx sdk.Tx, simulate bool, next sdk.AnteHandler) (sdk.Context, error) {
+    // your validation logic
+    
+    // call next decorator
+    return next(ctx, tx, simulate)
+}
+```
+
+Then chain it with other decorators:
+
+```go
+anteDecorators := []sdk.AnteDecorator{
+    ante.NewSetUpContextDecorator(),
+    NewCustomDecorator(), // your custom decorator
+    ante.NewValidateBasicDecorator(),
+    // ... other decorators
+}
+
+return sdk.ChainAnteDecorators(anteDecorators...), nil
+```
+
+## HandlerOptions
+
+The `HandlerOptions` struct configures the AnteHandler:
+
+```go
+type HandlerOptions struct {
+    AccountKeeper          AccountKeeper
+    BankKeeper             types.BankKeeper
+    ExtensionOptionChecker ExtensionOptionChecker
+    FeegrantKeeper         FeegrantKeeper
+    SignModeHandler        *txsigning.HandlerMap
+    SigGasConsumer         func(meter storetypes.GasMeter, sig signing.SignatureV2, params types.Params) error
+    TxFeeChecker           TxFeeChecker
+    SigVerifyOptions       []SigVerificationDecoratorOption
+}
+```
+
+Source: [x/auth/ante/ante.go:15](https://github.com/cosmos/cosmos-sdk/blob/main/x/auth/ante/ante.go#L15)
+
+## Best Practices
+
+1. **Order Matters**: `SetUpContextDecorator` must be first, `SetPubKeyDecorator` before signature verification
+2. **Gas Metering**: Always set up gas meters properly to prevent infinite gas attacks
+3. **Simulate Mode**: Handle simulation mode appropriately in custom decorators
+4. **Error Handling**: Return clear, actionable errors for validation failures
+5. **Performance**: Keep decorator logic lightweight as it runs for every transaction
+6. **Unordered Txs**: Use sequence 0 for unordered transactions with TTL timeout
+
+## See Also
+
+- [PostHandler](/advanced/post-handler) - Post-transaction processing
+- [Transaction Lifecycle](/core/transactions) - Complete transaction flow
+- [Gas and Fees](/core/gas-fees) - Gas metering details

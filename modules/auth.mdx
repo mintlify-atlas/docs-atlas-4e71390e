@@ -1,0 +1,314 @@
+---
+title: Auth Module
+description: Authentication and account management for Cosmos SDK applications
+---
+
+# Auth Module (x/auth)
+
+## Overview
+
+The `x/auth` module is responsible for specifying the base transaction and account types for a Cosmos SDK application. It handles authentication of accounts and transactions, manages account storage, and provides the AnteHandler middleware for transaction validity checks.
+
+**Purpose**: Provide foundational authentication infrastructure, account management, and transaction validation for blockchain applications.
+
+## Key Concepts
+
+### Gas & Fees
+
+Fees serve two primary purposes:
+- **State Growth Control**: Limit the growth of state stored by every full node
+- **Spam Prevention**: Provide general purpose censorship of low-value transactions
+
+Fees are calculated as:
+```
+fees = ceil(gasLimit * gasPrices)
+```
+
+Validators set minimum gas prices when starting their nodes:
+```bash
+simd start --minimum-gas-prices=0.00001stake;0.05photinos
+```
+
+### Account Types
+
+Accounts contain authentication information for uniquely identified users:
+- Public key
+- Address
+- Account number (for replay protection)
+- Sequence number (for replay protection)
+
+## State
+
+### Accounts
+
+Accounts are stored with the following key structure:
+```
+0x01 | Address -> ProtocolBuffer(account)
+```
+
+#### Account Interface
+
+```go
+type AccountI interface {
+    proto.Message
+    
+    GetAddress() sdk.AccAddress
+    SetAddress(sdk.AccAddress) error
+    
+    GetPubKey() crypto.PubKey
+    SetPubKey(crypto.PubKey) error
+    
+    GetAccountNumber() uint64
+    SetAccountNumber(uint64) error
+    
+    GetSequence() uint64
+    SetSequence(uint64) error
+    
+    String() string
+}
+```
+
+#### BaseAccount
+
+The most common account type storing all requisite fields:
+
+```protobuf
+message BaseAccount {
+    string address = 1;
+    google.protobuf.Any pub_key = 2;
+    uint64 account_number = 3;
+    uint64 sequence = 4;
+}
+```
+
+## AnteHandlers
+
+The `AnteHandler` performs basic transaction validity checks before execution. It's called during both `CheckTx` and `DeliverTx`.
+
+### Decorator Chain
+
+Decorators are chained together in the following order:
+
+1. **SetUpContextDecorator**: Sets the `GasMeter` in context
+2. **RejectExtensionOptionsDecorator**: Rejects extension options
+3. **MempoolFeeDecorator**: Checks tx fee against local mempool `minFee`
+4. **ValidateBasicDecorator**: Calls `tx.ValidateBasic()`
+5. **TxTimeoutHeightDecorator**: Checks for tx height timeout
+6. **ValidateMemoDecorator**: Validates tx memo
+7. **ConsumeGasTxSizeDecorator**: Consumes gas proportional to tx size
+8. **DeductFeeDecorator**: Deducts `FeeAmount` from first signer
+9. **SetPubKeyDecorator**: Sets pubkey for signers
+10. **ValidateSigCountDecorator**: Validates number of signatures
+11. **SigGasConsumeDecorator**: Consumes gas for each signature
+12. **SigVerificationDecorator**: Verifies all signatures
+13. **IncrementSequenceDecorator**: Increments account sequence
+
+## Account Keeper
+
+The Account Keeper provides full-permissioned access to account management:
+
+```go
+type AccountKeeperI interface {
+    NewAccountWithAddress(context.Context, sdk.AccAddress) sdk.AccountI
+    NewAccount(context.Context, sdk.AccountI) sdk.AccountI
+    HasAccount(context.Context, sdk.AccAddress) bool
+    GetAccount(context.Context, sdk.AccAddress) sdk.AccountI
+    SetAccount(context.Context, sdk.AccountI)
+    RemoveAccount(context.Context, sdk.AccountI)
+    IterateAccounts(context.Context, func(sdk.AccountI) bool)
+    GetPubKey(context.Context, sdk.AccAddress) (cryptotypes.PubKey, error)
+    GetSequence(context.Context, sdk.AccAddress) (uint64, error)
+    NextAccountNumber(context.Context) uint64
+    AddressCodec() address.Codec
+}
+```
+
+## Parameters
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| MaxMemoCharacters | uint64 | 256 | Maximum memo length |
+| TxSigLimit | uint64 | 7 | Maximum signatures per transaction |
+| TxSizeCostPerByte | uint64 | 10 | Gas cost per byte of transaction |
+| SigVerifyCostED25519 | uint64 | 590 | Gas cost for ED25519 signature verification |
+| SigVerifyCostSecp256k1 | uint64 | 1000 | Gas cost for Secp256k1 signature verification |
+
+## Queries
+
+### Query Account
+
+Retrieve account information by address:
+
+```bash
+simd query auth account cosmos1...
+```
+
+Example output:
+```yaml
+'@type': /cosmos.auth.v1beta1.BaseAccount
+account_number: "0"
+address: cosmos1zwg6tpl8aw4rawv8sgag9086lpw5hv33u5ctr2
+pub_key:
+  '@type': /cosmos.crypto.secp256k1.PubKey
+  key: ApDrE38zZdd7wLmFS9YmqO684y5DG6fjZ4rVeihF/AQD
+sequence: "1"
+```
+
+### Query All Accounts
+
+```bash
+simd query auth accounts
+```
+
+### Query Parameters
+
+```bash
+simd query auth params
+```
+
+## Transactions
+
+### Sign Transaction
+
+Sign an offline generated transaction:
+
+```bash
+simd tx sign tx.json --from $ALICE > tx.signed.json
+```
+
+### Multi-Sign Transaction
+
+Sign with a multisig account:
+
+```bash
+simd tx multisign transaction.json k1k2k3 k1sig.json k2sig.json k3sig.json
+```
+
+### Broadcast Transaction
+
+```bash
+simd tx broadcast tx.signed.json
+```
+
+### Validate Signatures
+
+```bash
+simd tx validate-signatures tx.signed.json
+```
+
+## gRPC Endpoints
+
+### Account Query
+
+```bash
+grpcurl -plaintext \
+    -d '{"address":"cosmos1.."}' \
+    localhost:9090 \
+    cosmos.auth.v1beta1.Query/Account
+```
+
+### Accounts Query
+
+```bash
+grpcurl -plaintext \
+    localhost:9090 \
+    cosmos.auth.v1beta1.Query/Accounts
+```
+
+### Params Query
+
+```bash
+grpcurl -plaintext \
+    localhost:9090 \
+    cosmos.auth.v1beta1.Query/Params
+```
+
+## Code Examples
+
+### Creating a New Account
+
+```go
+// Get account keeper
+accountKeeper := app.AccountKeeper
+
+// Create new account with address
+addr := sdk.AccAddress([]byte("address"))
+account := accountKeeper.NewAccountWithAddress(ctx, addr)
+
+// Set account number and sequence
+account.SetAccountNumber(0)
+account.SetSequence(0)
+
+// Save account to state
+accountKeeper.SetAccount(ctx, account)
+```
+
+### Retrieving an Account
+
+```go
+// Get account by address
+addr := sdk.AccAddress([]byte("address"))
+account := accountKeeper.GetAccount(ctx, addr)
+
+if account == nil {
+    return fmt.Errorf("account not found")
+}
+
+// Get sequence number
+sequence := account.GetSequence()
+```
+
+### Checking Account Existence
+
+```go
+addr := sdk.AccAddress([]byte("address"))
+if !accountKeeper.HasAccount(ctx, addr) {
+    return fmt.Errorf("account does not exist")
+}
+```
+
+## CLI Commands Reference
+
+| Command | Description |
+|---------|-------------|
+| `simd query auth account [address]` | Query account by address |
+| `simd query auth accounts` | Query all accounts |
+| `simd query auth params` | Query auth module parameters |
+| `simd tx sign [tx-file]` | Sign a transaction |
+| `simd tx multisign [tx-file] [multisig] [sigs...]` | Sign with multisig |
+| `simd tx broadcast [tx-file]` | Broadcast a signed transaction |
+| `simd tx validate-signatures [tx-file]` | Validate transaction signatures |
+
+## Integration Guide
+
+To integrate the auth module in your application:
+
+1. **Import the module**:
+```go
+import (
+    "github.com/cosmos/cosmos-sdk/x/auth"
+    authkeeper "github.com/cosmos/cosmos-sdk/x/auth/keeper"
+    authtypes "github.com/cosmos/cosmos-sdk/x/auth/types"
+)
+```
+
+2. **Initialize the keeper**:
+```go
+app.AccountKeeper = authkeeper.NewAccountKeeper(
+    appCodec,
+    runtime.NewKVStoreService(keys[authtypes.StoreKey]),
+    authtypes.ProtoBaseAccount,
+    maccPerms,
+    authcodec.NewBech32Codec(sdk.Bech32MainPrefix),
+    sdk.Bech32MainPrefix,
+    authtypes.NewModuleAddress(govtypes.ModuleName).String(),
+)
+```
+
+3. **Register the module**:
+```go
+app.ModuleManager = module.NewManager(
+    auth.NewAppModule(appCodec, app.AccountKeeper, authsims.RandomGenesisAccounts),
+    // other modules...
+)
+```

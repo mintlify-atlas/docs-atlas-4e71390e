@@ -1,0 +1,687 @@
+---
+title: Proof of Authority Module (x/poa)
+description: Learn about the Proof of Authority (PoA) module for managing permissioned validator sets in Cosmos SDK.
+---
+
+# Proof of Authority Module (x/poa)
+
+The Proof of Authority (PoA) module implements a permissioned consensus mechanism where a designated admin controls the validator set. This is designed for consortium chains, private networks, and testing environments where validator participation needs to be tightly controlled.
+
+<Warning>
+**License Notice:** This module uses the [Source Available Evaluation License](https://github.com/cosmos/cosmos-sdk/blob/main/enterprise/poa/LICENSE), which is different from the Apache-2.0 license used by core SDK modules. It prohibits commercial use, production use, and redistribution without a separate commercial license. Contact [institutions@cosmoslabs.io](mailto:institutions@cosmoslabs.io) for commercial licensing.
+</Warning>
+
+## Overview
+
+The PoA module replaces traditional staking-based validator selection with an admin-controlled validator set. Key features include:
+
+- **Admin-Controlled Validator Set**: A single admin account manages validator additions, removals, and power adjustments
+- **Fee Distribution**: Validators accumulate transaction fees proportional to their voting power
+- **Governance Integration**: Only active PoA validators can submit proposals, deposit, and vote
+- **Custom Vote Tallying**: Governance votes are weighted by validator power instead of staked tokens
+
+## Architecture
+
+The PoA module integrates with several core Cosmos SDK modules:
+
+| Module | Purpose | Interface |
+|--------|---------|-----------|
+| **CometBFT** | Consensus engine | Receives validator updates via ABCI |
+| **Auth** | Account management | Gets module accounts and address codec |
+| **Bank** | Token transfers | Sends accumulated fees to validators |
+| **Governance** | Proposals & voting | Custom vote tallying and access control |
+
+### Data Model
+
+The keeper maintains the following state:
+
+```go
+type Keeper struct {
+    params             collections.Item[types.Params]
+    validators         *collections.IndexedMap[collections.Pair[int64, string], types.Validator, ValidatorIndexes]
+    totalPower         collections.Item[int64]
+    totalAllocatedFees collections.Item[types.ValidatorFees]
+    queuedUpdates      collections.Vec[abci.ValidatorUpdate]
+}
+```
+
+**Key structures:**
+
+- `params`: Module parameters (admin address)
+- `validators`: Indexed map of validators by (power, consensus_address)
+- `totalPower`: Sum of all validator powers
+- `totalAllocatedFees`: Accumulated fees per validator
+- `queuedUpdates`: Pending validator updates for CometBFT
+
+## Key Types
+
+### Validator
+
+```protobuf
+message Validator {
+  google.protobuf.Any pub_key = 1;
+  int64 power = 2;
+  ValidatorMetadata metadata = 3;
+}
+
+message ValidatorMetadata {
+  string operator_address = 1;
+  string moniker = 2;
+  string description = 3;
+}
+```
+
+**Fields:**
+
+- `pub_key`: Ed25519 consensus public key for signing blocks
+- `power`: Voting power in consensus (0 = removed from active set)
+- `metadata.operator_address`: Account address for withdrawing fees
+- `metadata.moniker`: Human-readable validator name
+- `metadata.description`: Optional description
+
+**Validation:**
+
+```go
+func (v *Validator) ValidateBasic() error {
+    if v.Power < 0 {
+        return ErrNegativeValidatorPower
+    }
+
+    if err := v.Metadata.ValidateBasic(); err != nil {
+        return sdkerrors.Wrap(ErrInvalidMetadata, err.Error())
+    }
+
+    if v.PubKey == nil {
+        return fmt.Errorf("validator pubkey cannot be nil")
+    }
+
+    return nil
+}
+```
+
+### Params
+
+```protobuf
+message Params {
+  string admin = 1;
+}
+```
+
+The `admin` field is the only parameter and specifies the bech32 address that can update validators and module parameters.
+
+### ValidatorFees
+
+```go
+type ValidatorFees struct {
+    Fees sdk.DecCoins // Accumulated fees (can be fractional)
+}
+```
+
+Fees are stored as `DecCoins` to handle fractional amounts when distributing proportionally by power.
+
+## Message Handlers
+
+### MsgUpdateParams
+
+Update module parameters (admin address):
+
+```go
+type MsgUpdateParams struct {
+    Admin  string // Current admin (signer)
+    Params Params // New parameters
+}
+```
+
+**Example:**
+
+```bash
+simd tx poa update-params \
+    --admin cosmos1newadmin... \
+    --from admin \
+    --keyring-backend test
+```
+
+**Validation:**
+
+```go
+func (m *MsgUpdateParams) Validate(ac address.Codec) error {
+    if _, err := ac.StringToBytes(m.Admin); err != nil {
+        return sdkerrors.Wrap(ErrInvalidAdminAddress, "invalid signer address: "+err.Error())
+    }
+
+    if err := m.Params.Validate(ac); err != nil {
+        return err
+    }
+
+    return nil
+}
+```
+
+### MsgUpdateValidators
+
+Update the validator set (add, modify, or remove validators):
+
+```go
+type MsgUpdateValidators struct {
+    Admin      string
+    Validators []Validator
+}
+```
+
+**Example:**
+
+```json
+[
+  {
+    "pub_key": {
+      "@type": "/cosmos.crypto.ed25519.PubKey",
+      "key": "13iyxnnVneLg0AxHeUD7dRAegA8W3gB1mT4p7sPGjyY="
+    },
+    "power": 10000,
+    "metadata": {
+      "moniker": "Validator 1",
+      "description": "Company A validator",
+      "operator_address": "cosmos1..."
+    }
+  },
+  {
+    "pub_key": {
+      "@type": "/cosmos.crypto.ed25519.PubKey",
+      "key": "anotherbase64key="
+    },
+    "power": 0,
+    "metadata": {
+      "moniker": "Validator 2",
+      "description": "Removed validator",
+      "operator_address": "cosmos1..."
+    }
+  }
+]
+```
+
+**Processing Logic:**
+
+```go
+func (k Keeper) UpdateValidators(ctx context.Context, admin string, validators []types.Validator) error {
+    // Verify admin
+    params, _ := k.params.Get(ctx)
+    if params.Admin != admin {
+        return sdkerrors.ErrUnauthorized.Wrapf("expected %s, got %s", params.Admin, admin)
+    }
+
+    // Update each validator
+    for _, val := range validators {
+        consAddr, _ := val.GetConsAddr()
+
+        // Get existing validator if any
+        existing, err := k.GetValidatorByConsAddr(ctx, consAddr)
+
+        if val.Power == 0 {
+            // Remove validator
+            if err == nil {
+                k.RemoveValidator(ctx, consAddr)
+            }
+        } else {
+            // Add or update validator
+            if err != nil {
+                k.SetValidator(ctx, val)
+            } else {
+                // Update power
+                existing.Power = val.Power
+                k.SetValidator(ctx, existing)
+            }
+        }
+    }
+
+    return nil
+}
+```
+
+**Setting power to 0 removes the validator from the active set.**
+
+### MsgCreateValidator
+
+Any account can create a validator with zero initial power (pending admin approval):
+
+```go
+type MsgCreateValidator struct {
+    Moniker         string
+    Description     string
+    PubKey          *codectypes.Any
+    PubKeyType      string
+    OperatorAddress string // Signer
+}
+```
+
+**Example:**
+
+```bash
+simd tx poa create-validator \
+    "My Validator" \
+    "13iyxnnVneLg0AxHeUD7dRAegA8W3gB1mT4p7sPGjyY=" \
+    "ed25519" \
+    --description "Company B validator" \
+    --from myaccount \
+    --keyring-backend test
+```
+
+**Processing:**
+
+```go
+func (k Keeper) CreateValidator(ctx context.Context, msg *types.MsgCreateValidator) error {
+    // Validate message
+    if err := msg.Validate(k.authKeeper.AddressCodec()); err != nil {
+        return err
+    }
+
+    // Check if validator already exists
+    consAddr, _ := msg.GetConsAddr()
+    if _, err := k.GetValidatorByConsAddr(ctx, consAddr); err == nil {
+        return sdkerrors.ErrInvalidRequest.Wrap("validator already exists")
+    }
+
+    // Create validator with zero power (inactive)
+    validator := types.Validator{
+        PubKey: msg.PubKey,
+        Power:  0, // Admin must activate by setting power > 0
+        Metadata: types.ValidatorMetadata{
+            Moniker:         msg.Moniker,
+            Description:     msg.Description,
+            OperatorAddress: msg.OperatorAddress,
+        },
+    }
+
+    k.SetValidator(ctx, validator)
+
+    return nil
+}
+```
+
+### MsgWithdrawFees
+
+Validators withdraw accumulated fees to their operator address:
+
+```go
+type MsgWithdrawFees struct {
+    Operator string
+}
+```
+
+**Example:**
+
+```bash
+simd tx poa withdraw-fees \
+    --from myaccount \
+    --keyring-backend test
+```
+
+**Processing:**
+
+```go
+func (k Keeper) WithdrawFees(ctx context.Context, operatorAddr sdk.AccAddress) error {
+    // Get validator by operator address
+    validator, err := k.GetValidatorByOperator(ctx, operatorAddr)
+    if err != nil {
+        return sdkerrors.ErrNotFound.Wrap("validator not found")
+    }
+
+    // Get accumulated fees
+    consAddr, _ := validator.GetConsAddr()
+    fees, err := k.GetValidatorFees(ctx, consAddr)
+    if err != nil || fees.IsZero() {
+        return sdkerrors.ErrInvalidRequest.Wrap("no fees to withdraw")
+    }
+
+    // Convert DecCoins to Coins (truncate)
+    coins, _ := fees.TruncateDecimal()
+
+    // Transfer from module to operator
+    if err := k.bankKeeper.SendCoinsFromModuleToAccount(
+        ctx,
+        types.ModuleName,
+        operatorAddr,
+        coins,
+    ); err != nil {
+        return err
+    }
+
+    // Clear accumulated fees
+    k.SetValidatorFees(ctx, consAddr, sdk.DecCoins{})
+
+    return nil
+}
+```
+
+## Fee Distribution
+
+Transaction fees are distributed proportionally based on validator power:
+
+```go
+func (k Keeper) AllocateTokens(ctx sdk.Context) error {
+    // Get fees collected this block
+    feeCollector := k.authKeeper.GetModuleAccount(ctx, authtypes.FeeCollectorName)
+    feesCollected := k.bankKeeper.GetAllBalances(ctx, feeCollector.GetAddress())
+
+    if feesCollected.IsZero() {
+        return nil
+    }
+
+    // Transfer to PoA module
+    if err := k.bankKeeper.SendCoinsFromModuleToModule(
+        ctx,
+        authtypes.FeeCollectorName,
+        types.ModuleName,
+        feesCollected,
+    ); err != nil {
+        return err
+    }
+
+    // Get total voting power
+    totalPower, _ := k.totalPower.Get(ctx)
+    if totalPower == 0 {
+        return nil
+    }
+
+    // Allocate to each validator
+    iter := k.validators.Iterate(ctx, nil)
+    defer iter.Close()
+
+    for ; iter.Valid(); iter.Next() {
+        key, _ := iter.Key()
+        power := key.K1()
+        consAddrStr := key.K2()
+
+        if power == 0 {
+            continue
+        }
+
+        // Calculate validator's share: (power / totalPower) * fees
+        share := sdk.NewDecCoinsFromCoins(feesCollected...).MulDec(
+            math.LegacyNewDec(power).QuoInt64(totalPower),
+        )
+
+        // Add to accumulated fees
+        existing, _ := k.GetValidatorFees(ctx, consAddrStr)
+        k.SetValidatorFees(ctx, consAddrStr, existing.Add(share...))
+    }
+
+    return nil
+}
+```
+
+Fees are accumulated as `DecCoins` and truncated to `Coins` only upon withdrawal.
+
+## Governance Integration
+
+### Vote Tallying
+
+Governance votes are tallied by validator power instead of staked tokens:
+
+```go
+func (k Keeper) CalculateVoteResultsAndVotingPower(
+    ctx context.Context,
+    proposalID uint64,
+) (map[govtypes.VoteOption]math.LegacyDec, math.LegacyDec, error) {
+    results := make(map[govtypes.VoteOption]math.LegacyDec)
+    totalPower := math.LegacyZeroDec()
+
+    // Iterate all votes
+    votes := k.govKeeper.GetVotes(ctx, proposalID)
+
+    for _, vote := range votes {
+        voterAddr, _ := sdk.AccAddressFromBech32(vote.Voter)
+
+        // Get validator power
+        validator, err := k.GetValidatorByOperator(ctx, voterAddr)
+        if err != nil {
+            continue // Not a validator
+        }
+
+        power := math.LegacyNewDec(validator.Power)
+        totalPower = totalPower.Add(power)
+
+        // Tally votes
+        for _, option := range vote.Options {
+            weight := math.LegacyNewDecWithPrec(int64(option.Weight), 2)
+            results[option.Option] = results[option.Option].Add(power.Mul(weight))
+        }
+    }
+
+    return results, totalPower, nil
+}
+```
+
+### Access Control
+
+Only active validators can participate in governance:
+
+```go
+func (k Keeper) AfterProposalSubmission(ctx context.Context, proposalID uint64, submitterAddr sdk.AccAddress) error {
+    // Check if submitter is an active validator
+    validator, err := k.GetValidatorByOperator(ctx, submitterAddr)
+    if err != nil || validator.Power == 0 {
+        return sdkerrors.ErrUnauthorized.Wrap("only active validators can submit proposals")
+    }
+
+    return nil
+}
+
+func (k Keeper) AfterProposalDeposit(ctx context.Context, proposalID uint64, depositorAddr sdk.AccAddress) error {
+    // Check if depositor is an active validator
+    validator, err := k.GetValidatorByOperator(ctx, depositorAddr)
+    if err != nil || validator.Power == 0 {
+        return sdkerrors.ErrUnauthorized.Wrap("only active validators can deposit")
+    }
+
+    return nil
+}
+
+func (k Keeper) AfterProposalVote(ctx context.Context, proposalID uint64, voterAddr sdk.AccAddress) error {
+    // Check if voter is an active validator
+    validator, err := k.GetValidatorByOperator(ctx, voterAddr)
+    if err != nil || validator.Power == 0 {
+        return sdkerrors.ErrUnauthorized.Wrap("only active validators can vote")
+    }
+
+    return nil
+}
+```
+
+## ABCI Lifecycle
+
+### BeginBlock
+
+Allocates fees to validators:
+
+```go
+func (k Keeper) BeginBlock(ctx sdk.Context) error {
+    return k.AllocateTokens(ctx)
+}
+```
+
+### EndBlock
+
+Sends validator updates to CometBFT:
+
+```go
+func (k Keeper) EndBlock(ctx sdk.Context) ([]abci.ValidatorUpdate, error) {
+    // Get queued updates
+    updates := []abci.ValidatorUpdate{}
+    iter, _ := k.queuedUpdates.Iterate(ctx, nil)
+    defer iter.Close()
+
+    for ; iter.Valid(); iter.Next() {
+        update, _ := iter.Value()
+        updates = append(updates, update)
+    }
+
+    // Clear queue
+    k.queuedUpdates.Clear(ctx, nil)
+
+    return updates, nil
+}
+```
+
+Validator updates are queued when calling `SetValidator` or `RemoveValidator`:
+
+```go
+func (k Keeper) SetValidator(ctx context.Context, val types.Validator) error {
+    consAddr, _ := val.GetConsAddr()
+    consPubKey, _ := val.GetConsPubKey()
+
+    // Store validator
+    k.validators.Set(ctx, collections.Join(val.Power, consAddr), val)
+
+    // Queue update for CometBFT
+    update := abci.ValidatorUpdate{
+        PubKey: tmprotocrypto.PublicKey{
+            Sum: &tmprotocrypto.PublicKey_Ed25519{
+                Ed25519: consPubKey.Bytes(),
+            },
+        },
+        Power: val.Power,
+    }
+
+    k.queuedUpdates.Append(ctx, update)
+
+    return nil
+}
+```
+
+## Query Endpoints
+
+### Params
+
+Query module parameters:
+
+```bash
+simd query poa params
+```
+
+**Response:**
+
+```yaml
+params:
+  admin: cosmos1...
+```
+
+### Validators
+
+Query all validators:
+
+```bash
+simd query poa validators
+```
+
+**Response:**
+
+```yaml
+validators:
+- pub_key:
+    '@type': /cosmos.crypto.ed25519.PubKey
+    key: 13iyxnnVneLg0AxHeUD7dRAegA8W3gB1mT4p7sPGjyY=
+  power: "10000"
+  metadata:
+    operator_address: cosmos1...
+    moniker: Validator 1
+    description: Company A validator
+```
+
+### Validator
+
+Query a specific validator by consensus address:
+
+```bash
+simd query poa validator cosmosvalcons1...
+```
+
+## Use Cases
+
+### Consortium Blockchain
+
+Five companies form a consortium:
+
+```go
+// Initialize with consortium admin (multisig)
+params := poatypes.Params{
+    Admin: consortiumMultisigAddr.String(),
+}
+
+// Add one validator per company (equal power)
+validators := []poatypes.Validator{
+    {PubKey: company1PubKey, Power: 1000000, Metadata: ...},
+    {PubKey: company2PubKey, Power: 1000000, Metadata: ...},
+    {PubKey: company3PubKey, Power: 1000000, Metadata: ...},
+    {PubKey: company4PubKey, Power: 1000000, Metadata: ...},
+    {PubKey: company5PubKey, Power: 1000000, Metadata: ...},
+}
+
+// Governance requires 3/5 validator approval
+```
+
+### Testing Environment
+
+Quickly spin up validators for testing:
+
+```bash
+# Create 3 validators with different powers
+simd tx poa update-validators validators.json --from admin
+
+# Test governance with power-weighted voting
+simd tx gov submit-proposal proposal.json --from validator1
+simd tx gov vote 1 yes --from validator2
+simd tx gov vote 1 no --from validator3
+```
+
+### Private Enterprise Network
+
+Single organization controls all validators:
+
+```go
+params := poatypes.Params{
+    Admin: enterpriseAdminAddr.String(),
+}
+
+validators := []poatypes.Validator{
+    {PubKey: datacenter1PubKey, Power: 2000000, Metadata: ...},
+    {PubKey: datacenter2PubKey, Power: 2000000, Metadata: ...},
+    {PubKey: datacenter3PubKey, Power: 1000000, Metadata: ...}, // Backup
+}
+```
+
+## Best Practices
+
+1. **Use multisig for admin** to prevent single point of failure
+2. **Set equal validator power** for fair consortium governance
+3. **Monitor validator performance** and adjust power accordingly
+4. **Rotate validators** periodically for security
+5. **Test governance workflows** before deploying
+6. **Document validator requirements** for consortium members
+7. **Plan key management** strategy for admin and validators
+
+## Security Considerations
+
+- **Admin has full control** over the validator set - use multisig or governance
+- **No slashing** - validators can misbehave without on-chain penalties
+- **Validator collusion** is possible with small validator sets
+- **Fee manipulation** - admin can favor certain validators by adjusting power
+- **Key compromise** - losing admin key requires social recovery
+
+## Migration from Staking
+
+To migrate from a staking-based chain:
+
+1. **Export state** from staking chain
+2. **Remove staking/slashing** modules from app.go
+3. **Add PoA module** to module manager
+4. **Create genesis** with selected validators
+5. **Set admin** to governance or multisig
+6. **Initialize chain** with new genesis
+
+## References
+
+- [PoA README](/home/daytona/workspace/source/enterprise/poa/README.md)
+- [Source Code: enterprise/poa/x/poa/keeper/keeper.go](/home/daytona/workspace/source/enterprise/poa/x/poa/keeper/keeper.go:1-100)
+- [Source Code: enterprise/poa/x/poa/types/poa.go](/home/daytona/workspace/source/enterprise/poa/x/poa/types/poa.go:24-178)
+- [Enterprise Overview](/modules/enterprise-overview)
+- [Cosmos Labs Institutions](mailto:institutions@cosmoslabs.io)

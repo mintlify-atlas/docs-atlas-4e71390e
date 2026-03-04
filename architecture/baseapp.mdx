@@ -1,0 +1,445 @@
+---
+title: BaseApp
+description: Core application structure and ABCI implementation in Cosmos SDK
+---
+
+## What is BaseApp?
+
+BaseApp is the foundational component that implements the Application Blockchain Interface (ABCI) and manages the core application logic. Every Cosmos SDK application embeds BaseApp to handle consensus interactions, transaction routing, and state management.
+
+```go
+// Location: baseapp/baseapp.go:86
+type BaseApp struct {
+    // initialized on creation
+    mu                sync.Mutex
+    logger            log.Logger
+    name              string                      // application name
+    db                dbm.DB                      // database backend
+    cms               storetypes.CommitMultiStore // Main (uncached) state
+    qms               storetypes.MultiStore       // Query-only multistore
+    storeLoader       StoreLoader                 // store loading function
+    grpcQueryRouter   *GRPCQueryRouter            // gRPC query routing
+    msgServiceRouter  *MsgServiceRouter           // message routing
+    interfaceRegistry codectypes.InterfaceRegistry
+    txDecoder         sdk.TxDecoder               // decode tx bytes
+    txEncoder         sdk.TxEncoder               // encode tx to bytes
+    
+    mempool           mempool.Mempool             // transaction mempool
+    anteHandler       sdk.AnteHandler             // pre-execution checks
+    postHandler       sdk.PostHandler             // post-execution logic
+    
+    abciHandlers      sdk.ABCIHandlers            // lifecycle handlers
+    stateManager      *state.Manager              // state management
+    snapshotManager   *snapshots.Manager          // state snapshots
+    
+    // ... more fields
+}
+```
+
+## Creating a BaseApp
+
+```go
+// Location: baseapp/baseapp.go:195
+func NewBaseApp(
+    name string,
+    logger log.Logger,
+    db dbm.DB,
+    txDecoder sdk.TxDecoder,
+    options ...func(*BaseApp),
+) *BaseApp
+```
+
+### Example Initialization
+
+```go
+import (
+    "cosmossdk.io/log"
+    "github.com/cosmos/cosmos-sdk/baseapp"
+    dbm "github.com/cosmos/cosmos-db"
+)
+
+// Create a new application
+app := baseapp.NewBaseApp(
+    "myapp",
+    logger,
+    db,
+    txDecoder,
+    baseapp.SetPruning(pruningOpts),
+    baseapp.SetMinGasPrices("0.001stake"),
+    baseapp.SetChainID("mychain-1"),
+)
+```
+
+## Core Components
+
+### State Management
+
+BaseApp manages multiple state layers:
+
+```go
+// Location: baseapp/state/state.go:13
+type State struct {
+    MultiStore storetypes.CacheMultiStore
+    mtx        sync.RWMutex
+    ctx        sdk.Context
+    span       trace.Span
+}
+```
+
+<AccordionGroup>
+  <Accordion title="CommitMultiStore (cms)">
+    The root store containing all module substores. Committed state that persists between blocks.
+    
+    ```go
+    cms storetypes.CommitMultiStore
+    ```
+  </Accordion>
+  
+  <Accordion title="StateManager">
+    Manages different execution contexts (CheckTx, FinalizeBlock) with isolated state branches.
+    
+    ```go
+    stateManager *state.Manager
+    ```
+  </Accordion>
+  
+  <Accordion title="InterBlockCache">
+    Optional write-through cache for state that persists between blocks.
+    
+    ```go
+    interBlockCache storetypes.MultiStorePersistentCache
+    ```
+  </Accordion>
+</AccordionGroup>
+
+### Message Routing
+
+BaseApp routes messages to the appropriate module handlers:
+
+```go
+// Location: baseapp/msg_service_router.go
+type MsgServiceRouter struct {
+    routes       sync.Map                    // msg type -> handler
+    hybridHandlers map[string]Handler        // hybrid handlers  
+}
+
+type MessageRouter interface {
+    RegisterService(sd *grpc.ServiceDesc, handler interface{})
+    SetInterfaceRegistry(interfaceRegistry codectypes.InterfaceRegistry)
+    Handler(msg sdk.Msg) Handler
+    HandlerByTypeURL(typeURL string) Handler
+}
+```
+
+Messages are routed by their type URL (e.g., `/cosmos.bank.v1beta1.MsgSend`).
+
+### Query Routing
+
+```go
+// Location: baseapp/grpcrouter.go:5562
+type GRPCQueryRouter struct {
+    routes          map[string]GRPCQueryHandler
+    interfaceRegistry codectypes.InterfaceRegistry
+    serviceData     []serviceData
+}
+```
+
+Handles gRPC queries from clients, routing them to registered query services.
+
+## ABCI Lifecycle
+
+### InitChain
+
+Called once when the blockchain starts:
+
+```go
+// Location: baseapp/abci.go:53
+func (app *BaseApp) InitChain(req *abci.RequestInitChain) (*abci.ResponseInitChain, error) {
+    // Validate chain ID
+    if req.ChainId != app.chainID {
+        return nil, fmt.Errorf("invalid chain-id")
+    }
+    
+    // Set initial height
+    app.initialHeight = req.InitialHeight
+    if app.initialHeight == 0 {
+        app.initialHeight = 1
+    }
+    
+    // Initialize state
+    app.stateManager.SetState(execModeFinalize, app.cms, initHeader, ...)
+    
+    // Store consensus params
+    if req.ConsensusParams != nil {
+        err := app.StoreConsensusParams(finalizeState.Context(), *req.ConsensusParams)
+    }
+    
+    // Call InitChain handler
+    if app.abciHandlers.InitChainer != nil {
+        res, err := app.abciHandlers.InitChainer(finalizeState.Context(), req)
+    }
+    
+    return &abci.ResponseInitChain{...}, nil
+}
+```
+
+### FinalizeBlock
+
+Executes transactions and finalizes a block:
+
+<Steps>
+  <Step title="PreBlock">
+    Runs module PreBlockers (e.g., for vote extensions processing)
+  </Step>
+  
+  <Step title="BeginBlock">
+    Executes module BeginBlockers in order
+  </Step>
+  
+  <Step title="DeliverTx">
+    Executes each transaction in the block:
+    - Run ante handler
+    - Route and execute messages  
+    - Run post handler
+    - Emit events
+  </Step>
+  
+  <Step title="EndBlock">
+    Executes module EndBlockers (e.g., validator updates)
+  </Step>
+  
+  <Step title="Commit">
+    Writes state changes and computes app hash
+  </Step>
+</Steps>
+
+```go
+// Simplified FinalizeBlock flow
+func (app *BaseApp) FinalizeBlock(req *abci.RequestFinalizeBlock) (*abci.ResponseFinalizeBlock, error) {
+    // Get finalize state
+    finalizeState := app.stateManager.GetState(execModeFinalize)
+    
+    // PreBlock
+    if app.abciHandlers.PreBlocker != nil {
+        ctx, err := app.abciHandlers.PreBlocker(ctx)
+    }
+    
+    // BeginBlock
+    if app.abciHandlers.BeginBlocker != nil {
+        err := app.abciHandlers.BeginBlocker(ctx)
+    }
+    
+    // Execute transactions
+    for _, tx := range req.Txs {
+        res := app.runTx(ctx, tx, execModeFinalize)
+        txResults = append(txResults, res)
+    }
+    
+    // EndBlock
+    if app.abciHandlers.EndBlocker != nil {
+        err := app.abciHandlers.EndBlocker(ctx)
+    }
+    
+    return &abci.ResponseFinalizeBlock{
+        TxResults: txResults,
+        AppHash:   appHash,
+    }, nil
+}
+```
+
+### Commit
+
+```go
+func (app *BaseApp) Commit() (*abci.ResponseCommit, error) {
+    // Write pending state
+    finalizeState.MultiStore.Write()
+    
+    // Commit to disk
+    commitID := app.cms.Commit()
+    
+    return &abci.ResponseCommit{
+        RetainHeight: retainHeight,
+    }, nil
+}
+```
+
+## Transaction Execution
+
+### CheckTx Mode
+
+Validates transactions before mempool inclusion:
+
+```go
+func (app *BaseApp) CheckTx(req *abci.RequestCheckTx) (*abci.ResponseCheckTx, error) {
+    // Decode transaction
+    tx, err := app.txDecoder(req.Tx)
+    
+    // Run in check mode
+    gInfo, result, _, err := app.runTx(ctx, tx, execModeCheck)
+    
+    return &abci.ResponseCheckTx{
+        GasWanted: gInfo.GasWanted,
+        GasUsed:   gInfo.GasUsed,
+        Priority:  result.Priority,
+    }, nil
+}
+```
+
+### runTx Method
+
+Core transaction execution logic:
+
+```go
+func (app *BaseApp) runTx(
+    ctx sdk.Context,
+    tx sdk.Tx,
+    mode execMode,
+) (gInfo sdk.GasInfo, result *sdk.Result, anteEvents []abci.Event, err error) {
+    // 1. Ante Handler
+    newCtx, err := app.anteHandler(ctx, tx, mode == execModeSimulate)
+    
+    // 2. Execute Messages
+    msgResponses, err := app.runMsgs(newCtx, msgs, mode)
+    
+    // 3. Post Handler
+    if app.postHandler != nil {
+        newCtx, err = app.postHandler(newCtx, tx, mode == execModeSimulate, err == nil)
+    }
+    
+    return gInfo, result, anteEvents, err
+}
+```
+
+## Configuration Options
+
+BaseApp supports extensive configuration:
+
+```go
+// Location: baseapp/options.go
+
+// Set pruning options
+func SetPruning(opts pruningtypes.PruningOptions) func(*BaseApp)
+
+// Set minimum gas prices
+func SetMinGasPrices(gasPricesStr string) func(*BaseApp)
+
+// Set mempool
+func SetMempool(mempool mempool.Mempool) func(*BaseApp)
+
+// Set ante handler
+func SetAnteHandler(ah sdk.AnteHandler) func(*BaseApp)
+
+// Set snapshot store
+func SetSnapshotStore(ss *snapshots.Store) func(*BaseApp)
+```
+
+### Example Configuration
+
+```go
+app := baseapp.NewBaseApp(
+    appName,
+    logger,
+    db,
+    txConfig.TxDecoder(),
+    baseapp.SetPruning(pruningtypes.NewPruningOptionsFromString("everything")),
+    baseapp.SetMinGasPrices("0.001stake"),
+    baseapp.SetChainID(chainID),
+    baseapp.SetMempool(mempool.NewPriorityMempool()),
+    baseapp.SetAnteHandler(anteHandler),
+    baseapp.SetStreamingManager(streamingManager),
+)
+```
+
+## Gas Management
+
+```go
+// Transaction gas meter
+gasMeter := storetypes.NewGasMeter(gasLimit)
+
+// Block gas meter (tracks total gas per block)
+blockGasMeter := storetypes.NewInfiniteGasMeter()
+```
+
+<Warning>
+BaseApp can disable block gas metering with `disableBlockGasMeter` for parallel execution scenarios. Validators must validate total gas in `ProcessProposal`.
+</Warning>
+
+## Snapshot Management
+
+BaseApp integrates state sync snapshots:
+
+```go
+snapshotManager *snapshots.Manager
+
+// Create snapshot
+func (app *BaseApp) Snapshot(height uint64) error
+
+// Restore from snapshot  
+func (app *BaseApp) OfferSnapshot(snapshot *abci.Snapshot) error
+```
+
+## Optimistic Execution
+
+Experimental feature for parallel block execution:
+
+```go
+optimisticExec *oe.OptimisticExecution
+```
+
+Executes the next block optimistically while consensus finalizes the current block.
+
+## Key Interfaces
+
+```go
+// Store loader customizes store initialization
+type StoreLoader func(ms storetypes.CommitMultiStore) error
+
+// Param store for consensus parameters
+type ParamStore interface {
+    Get(ctx sdk.Context) (cmtproto.ConsensusParams, error)
+    Has(ctx sdk.Context) (bool, error)
+    Set(ctx sdk.Context, cp cmtproto.ConsensusParams) error
+}
+
+// Circuit breaker for emergency stops
+type CircuitBreaker interface {
+    IsAllowed(ctx context.Context, typeURL string) (bool, error)
+}
+```
+
+## Best Practices
+
+<AccordionGroup>
+  <Accordion title="Always Use BaseApp Options">
+    Configure BaseApp through option functions rather than direct field access.
+  </Accordion>
+  
+  <Accordion title="Implement Ante/Post Handlers">
+    Use ante handlers for authentication, signature verification, and fee deduction.
+  </Accordion>
+  
+  <Accordion title="Set Proper Gas Limits">
+    Configure appropriate gas limits and minimum gas prices for your chain.
+  </Accordion>
+  
+  <Accordion title="Enable Telemetry">
+    BaseApp has built-in OpenTelemetry support for monitoring.
+  </Accordion>
+</AccordionGroup>
+
+## Related Topics
+
+<CardGroup cols={2}>
+  <Card title="Transactions" icon="exchange-alt" href="/architecture/transactions">
+    Transaction lifecycle and execution
+  </Card>
+  <Card title="State Management" icon="database" href="/architecture/state-management">
+    How BaseApp manages state
+  </Card>
+  <Card title="Modules" icon="puzzle-piece" href="/architecture/modules">
+    Building and integrating modules
+  </Card>
+  <Card title="Consensus" icon="network-wired" href="/architecture/consensus">
+    ABCI and CometBFT integration
+  </Card>
+</CardGroup>

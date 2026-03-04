@@ -1,0 +1,533 @@
+---
+title: Epochs Module (x/epochs)
+description: Learn about the x/epochs module for executing code at fixed time intervals in Cosmos SDK.
+---
+
+# Epochs Module (x/epochs)
+
+The `x/epochs` module provides on-chain timers that execute at fixed time intervals. Other SDK modules can register hooks to execute logic when epoch timers tick, enabling time-based automation without relying on external triggers.
+
+## Overview
+
+The epochs module defines on-chain timers that tick at regular intervals (e.g., daily, weekly). When a timer ticks, all registered hooks are called in sequence, allowing modules to perform periodic tasks like:
+
+- Distributing staking rewards
+- Updating oracle prices
+- Executing scheduled governance actions
+- Resetting rate limits
+- Triggering algorithmic market operations
+
+## Key Concepts
+
+### EpochInfo
+
+Each timer is represented by an `EpochInfo` struct:
+
+```go
+type EpochInfo struct {
+    Identifier              string        // Unique timer identifier (e.g., "day", "week")
+    StartTime               time.Time     // When the timer started
+    Duration                time.Duration // Time between ticks
+    CurrentEpoch            int64         // Current epoch number
+    CurrentEpochStartTime   time.Time     // When current epoch started
+    CurrentEpochStartHeight int64         // Block height when current epoch started
+    EpochCountingStarted    bool          // Whether counting has begun
+}
+```
+
+### Timer Ticking Logic
+
+Timers tick at the **first block** whose timestamp exceeds the epoch end time:
+
+```go
+func (k Keeper) BeginBlocker(ctx sdk.Context) error {
+    for _, epoch := range k.AllEpochInfos(ctx) {
+        epochEndTime := epoch.CurrentEpochStartTime.Add(epoch.Duration)
+
+        if ctx.BlockTime().After(epochEndTime) {
+            // Call BeforeEpochStart hooks
+            k.hooks.BeforeEpochStart(ctx, epoch.Identifier, epoch.CurrentEpoch+1)
+
+            // Update epoch state
+            epoch.CurrentEpoch++
+            epoch.CurrentEpochStartTime = epochEndTime // Not block time!
+            epoch.CurrentEpochStartHeight = ctx.BlockHeight()
+
+            k.EpochInfo.Set(ctx, epoch.Identifier, epoch)
+
+            // Call AfterEpochEnd hooks
+            k.hooks.AfterEpochEnd(ctx, epoch.Identifier, epoch.CurrentEpoch)
+        }
+    }
+    return nil
+}
+```
+
+**Important:** The next epoch's start time is set to the **previous epoch's end time**, not the current block time. This ensures consistent intervals even if blocks are delayed.
+
+### Catching Up After Downtime
+
+If the chain is down for multiple epochs, the keeper will tick once per block until caught up:
+
+```
+Block 100: Epoch 1 ends at 12:00 PM
+[Chain down for 3 hours]
+Block 101 at 3:00 PM:
+  - Tick epoch 1->2 (12:00 PM -> 1:00 PM)
+  - Emit events for epoch 2
+Block 102 at 3:01 PM:
+  - Tick epoch 2->3 (1:00 PM -> 2:00 PM)
+  - Emit events for epoch 3
+Block 103 at 3:02 PM:
+  - Tick epoch 3->4 (2:00 PM -> 3:00 PM)
+  - Emit events for epoch 4
+```
+
+## Epoch Hooks
+
+Modules receive epoch notifications by implementing the `EpochHooks` interface:
+
+```go
+type EpochHooks interface {
+    // Called when an epoch ends
+    AfterEpochEnd(ctx context.Context, epochIdentifier string, epochNumber int64) error
+
+    // Called when a new epoch begins
+    BeforeEpochStart(ctx context.Context, epochIdentifier string, epochNumber int64) error
+}
+```
+
+### Registering Hooks
+
+**Manual Wiring:**
+
+```go
+import (
+    "github.com/cosmos/cosmos-sdk/x/epochs"
+    epochskeeper "github.com/cosmos/cosmos-sdk/x/epochs/keeper"
+    epochstypes "github.com/cosmos/cosmos-sdk/x/epochs/types"
+)
+
+// In app.go
+epochsKeeper := epochskeeper.NewKeeper(
+    runtime.NewKVStoreService(keys[epochstypes.StoreKey]),
+    appCodec,
+)
+
+// Register hooks from other modules
+epochsKeeper.SetHooks(
+    epochstypes.NewMultiEpochHooks(
+        app.DistrKeeper,    // Distribution module
+        app.IncentivesKeeper, // Custom incentives module
+    ),
+)
+
+app.EpochsKeeper = &epochsKeeper
+```
+
+**Depinject Wiring:**
+
+```go
+type MyModuleInputs struct {
+    depinject.In
+    // ... other dependencies
+}
+
+type MyModuleOutputs struct {
+    depinject.Out
+
+    Hooks types.EpochHooksWrapper
+}
+
+func ProvideModule(in MyModuleInputs) MyModuleOutputs {
+    keeper := NewKeeper(...)
+
+    return MyModuleOutputs{
+        Hooks: types.EpochHooksWrapper{
+            EpochHooks: keeper, // keeper implements EpochHooks
+        },
+    }
+}
+```
+
+### Implementing Hooks
+
+Modules filter by epoch identifier and execute their logic:
+
+```go
+type IncentivesKeeper struct {
+    // ... keeper fields
+}
+
+func (k IncentivesKeeper) AfterEpochEnd(ctx context.Context, epochIdentifier string, epochNumber int64) error {
+    params := k.GetParams(ctx)
+
+    // Only respond to specific epoch
+    if epochIdentifier != params.RewardsEpochIdentifier {
+        return nil
+    }
+
+    // Distribute rewards
+    totalRewards := k.GetEpochRewards(ctx)
+    validators := k.stakingKeeper.GetAllValidators(ctx)
+
+    for _, val := range validators {
+        share := k.CalculateValidatorShare(ctx, val, totalRewards)
+        if err := k.bankKeeper.SendCoinsFromModuleToAccount(
+            ctx,
+            types.ModuleName,
+            val.OperatorAddress,
+            share,
+        ); err != nil {
+            return err
+        }
+    }
+
+    return nil
+}
+
+func (k IncentivesKeeper) BeforeEpochStart(ctx context.Context, epochIdentifier string, epochNumber int64) error {
+    params := k.GetParams(ctx)
+
+    if epochIdentifier != params.RewardsEpochIdentifier {
+        return nil
+    }
+
+    // Reset epoch state
+    k.ResetEpochRewards(ctx)
+
+    return nil
+}
+```
+
+### Panic Isolation
+
+If a hook panics, its state changes are reverted, but other hooks continue executing:
+
+```go
+func (h MultiEpochHooks) AfterEpochEnd(ctx context.Context, epochIdentifier string, epochNumber int64) error {
+    var errs error
+    for i := range h {
+        // Each hook runs in isolation
+        errs = errors.Join(errs, h[i].AfterEpochEnd(ctx, epochIdentifier, epochNumber))
+    }
+    return errs
+}
+```
+
+This prevents one misbehaving module from halting the entire chain.
+
+## Keeper Functions
+
+### GetEpochInfo
+
+Retrieve epoch information by identifier:
+
+```go
+epochInfo, err := k.GetEpochInfo(ctx, "day")
+if err != nil {
+    return err
+}
+
+fmt.Println("Current epoch:", epochInfo.CurrentEpoch)
+fmt.Println("Started at:", epochInfo.CurrentEpochStartTime)
+```
+
+### AddEpochInfo
+
+Add a new epoch timer (typically done in genesis or upgrades):
+
+```go
+epoch := types.EpochInfo{
+    Identifier:              "week",
+    StartTime:               time.Now(),
+    Duration:                7 * 24 * time.Hour,
+    CurrentEpoch:            0,
+    CurrentEpochStartTime:   time.Now(),
+    CurrentEpochStartHeight: ctx.BlockHeight(),
+    EpochCountingStarted:    true,
+}
+
+if err := k.AddEpochInfo(ctx, epoch); err != nil {
+    return err
+}
+```
+
+### AllEpochInfos
+
+Iterate over all epoch timers:
+
+```go
+epochs, err := k.AllEpochInfos(ctx)
+if err != nil {
+    return err
+}
+
+for _, epoch := range epochs {
+    fmt.Printf("Epoch %s: %d\n", epoch.Identifier, epoch.CurrentEpoch)
+}
+```
+
+### NumBlocksSinceEpochStart
+
+Get the number of blocks since the current epoch started:
+
+```go
+blocksSinceStart, err := k.NumBlocksSinceEpochStart(ctx, "day")
+if err != nil {
+    return err
+}
+
+fmt.Printf("Blocks since epoch start: %d\n", blocksSinceStart)
+```
+
+## Query Endpoints
+
+### EpochInfos
+
+Query all running epoch timers:
+
+```bash
+simd query epochs epoch-infos
+```
+
+**Response:**
+
+```yaml
+epochs:
+- current_epoch: "183"
+  current_epoch_start_height: "2438409"
+  current_epoch_start_time: "2024-12-18T17:16:09.898160996Z"
+  duration: 86400s
+  epoch_counting_started: true
+  identifier: day
+  start_time: "2024-06-18T17:00:00Z"
+- current_epoch: "26"
+  current_epoch_start_height: "2424854"
+  current_epoch_start_time: "2024-12-17T17:02:07.229632445Z"
+  duration: 604800s
+  epoch_counting_started: true
+  identifier: week
+  start_time: "2024-06-18T17:00:00Z"
+```
+
+### CurrentEpoch
+
+Query the current epoch number for a specific identifier:
+
+```bash
+simd query epochs current-epoch day
+```
+
+**Response:**
+
+```yaml
+current_epoch: "183"
+```
+
+## Events
+
+The epochs module emits events when epochs start and end:
+
+### epoch_start
+
+```json
+{
+  "type": "epoch_start",
+  "attributes": [
+    {"key": "epoch_number", "value": "184"},
+    {"key": "start_time", "value": "2024-12-19T17:16:09Z"}
+  ]
+}
+```
+
+### epoch_end
+
+```json
+{
+  "type": "epoch_end",
+  "attributes": [
+    {"key": "epoch_number", "value": "183"}
+  ]
+}
+```
+
+## Genesis Configuration
+
+Define epoch timers in your genesis file:
+
+```json
+{
+  "epochs": {
+    "epochs": [
+      {
+        "identifier": "day",
+        "start_time": "2024-01-01T00:00:00Z",
+        "duration": "86400s",
+        "current_epoch": "0",
+        "current_epoch_start_time": "2024-01-01T00:00:00Z",
+        "current_epoch_start_height": "1",
+        "epoch_counting_started": true
+      },
+      {
+        "identifier": "week",
+        "start_time": "2024-01-01T00:00:00Z",
+        "duration": "604800s",
+        "current_epoch": "0",
+        "current_epoch_start_time": "2024-01-01T00:00:00Z",
+        "current_epoch_start_height": "1",
+        "epoch_counting_started": true
+      }
+    ]
+  }
+}
+```
+
+## Use Cases
+
+### Staking Rewards Distribution
+
+```go
+func (k DistrKeeper) AfterEpochEnd(ctx context.Context, epochIdentifier string, epochNumber int64) error {
+    if epochIdentifier != "day" {
+        return nil
+    }
+
+    // Distribute daily staking rewards
+    validators := k.stakingKeeper.GetAllValidators(ctx)
+    totalRewards := k.GetCommunityTax(ctx)
+
+    for _, val := range validators {
+        rewards := k.CalculateValidatorReward(ctx, val, totalRewards)
+        k.AllocateTokensToValidator(ctx, val, rewards)
+    }
+
+    return nil
+}
+```
+
+### Oracle Price Updates
+
+```go
+func (k OracleKeeper) AfterEpochEnd(ctx context.Context, epochIdentifier string, epochNumber int64) error {
+    if epochIdentifier != "hour" {
+        return nil
+    }
+
+    // Update oracle prices every hour
+    prices := k.AggregateSubmittedPrices(ctx)
+
+    for denom, price := range prices {
+        k.SetPrice(ctx, denom, price)
+    }
+
+    return nil
+}
+```
+
+### Rate Limit Reset
+
+```go
+func (k RateLimitKeeper) BeforeEpochStart(ctx context.Context, epochIdentifier string, epochNumber int64) error {
+    if epochIdentifier != "day" {
+        return nil
+    }
+
+    // Reset daily rate limits
+    k.ResetAllRateLimits(ctx)
+
+    return nil
+}
+```
+
+### Incentive Programs
+
+```go
+func (k IncentivesKeeper) AfterEpochEnd(ctx context.Context, epochIdentifier string, epochNumber int64) error {
+    if epochIdentifier != "week" {
+        return nil
+    }
+
+    // Distribute weekly liquidity mining rewards
+    pools := k.GetAllLiquidityPools(ctx)
+
+    for _, pool := range pools {
+        rewards := k.CalculatePoolRewards(ctx, pool)
+        k.DistributeRewardsToProviders(ctx, pool, rewards)
+    }
+
+    return nil
+}
+```
+
+## Module Integration
+
+### Module Manager Setup
+
+Add epochs to your module manager:
+
+```go
+app.ModuleManager = module.NewManager(
+    // ... other modules
+    epochs.NewAppModule(appCodec, app.EpochsKeeper),
+)
+
+// Set begin blocker order
+app.ModuleManager.SetOrderBeginBlockers(
+    // epochs must run before modules that depend on it
+    epochstypes.ModuleName,
+    distributiontypes.ModuleName,
+    incentivestypes.ModuleName,
+    // ... other modules
+)
+
+// Set genesis order
+app.ModuleManager.SetOrderInitGenesis(
+    // ... other modules
+    epochstypes.ModuleName,
+    // ... other modules
+)
+```
+
+### Store Keys
+
+Register the epochs store key:
+
+```go
+keys := storetypes.NewKVStoreKeys(
+    // ... other modules
+    epochstypes.StoreKey,
+)
+```
+
+## Best Practices
+
+1. **Filter by identifier** in your hooks to avoid executing logic for irrelevant epochs
+2. **Handle errors gracefully** to prevent halting hook execution
+3. **Keep hook logic efficient** since it runs on every block during catch-up
+4. **Use appropriate epoch intervals** (daily, weekly) based on your use case
+5. **Test hook behavior** during chain downtime scenarios
+6. **Monitor epoch events** to ensure timers are ticking as expected
+7. **Store epoch-specific state** in your module's store, not in memory
+
+## Security Considerations
+
+- Hook panics are isolated but can waste gas if they consistently fail
+- Long-running hooks can delay block production
+- Ensure hooks have bounded execution time
+- Validate epoch identifiers before processing in hooks
+- Be cautious with hooks that modify validator sets or critical state
+
+## Performance Notes
+
+- The epochs keeper iterates all epoch infos in `BeginBlock`
+- Keep the number of epoch identifiers small (< 10)
+- Hook execution is sequential, not parallel
+- During catch-up, hooks execute once per block per missed epoch
+- Use events to track hook execution for debugging
+
+## References
+
+- [Source Code: x/epochs/keeper/keeper.go](/home/daytona/workspace/source/x/epochs/keeper/keeper.go:11-46)
+- [Source Code: x/epochs/types/hooks.go](/home/daytona/workspace/source/x/epochs/types/hooks.go:8-47)
+- [Epochs README](https://github.com/cosmos/cosmos-sdk/blob/main/x/epochs/README.md)

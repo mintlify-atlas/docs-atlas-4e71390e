@@ -1,0 +1,481 @@
+---
+title: Governance Module
+description: On-chain governance for proposal submission and voting
+---
+
+# Governance Module (x/gov)
+
+## Overview
+
+The `x/gov` module enables Cosmos SDK-based blockchains to support an on-chain governance system where token holders can vote on proposals using a 1 token = 1 vote basis.
+
+**Purpose**: Provide a democratic mechanism for protocol upgrades, parameter changes, and community decisions without requiring hard forks.
+
+## Key Features
+
+- **Proposal Submission**: Users submit proposals with deposits
+- **Deposit Period**: Collect minimum deposit to enter voting
+- **Voting**: Token holders vote on active proposals
+- **Vote Inheritance**: Delegators inherit validator votes
+- **Deposit Refunds**: Refund or burn deposits based on proposal outcome
+- **Expedited Proposals**: Fast-track proposals with higher thresholds
+
+## Concepts
+
+### Proposal Lifecycle
+
+1. **Submission**: Proposal submitted with initial deposit
+2. **Deposit Period**: Collect `MinDeposit` from community
+3. **Voting Period**: Bonded token holders vote
+4. **Execution**: Passed proposals execute automatically
+
+### Proposal Types
+
+Proposals contain executable messages:
+
+```protobuf
+message Proposal {
+    uint64 id = 1;
+    repeated google.protobuf.Any messages = 2;
+    ProposalStatus status = 3;
+    TallyResult final_tally_result = 4;
+    google.protobuf.Timestamp submit_time = 5;
+    google.protobuf.Timestamp deposit_end_time = 6;
+    repeated Coin total_deposit = 7;
+    google.protobuf.Timestamp voting_start_time = 8;
+    google.protobuf.Timestamp voting_end_time = 9;
+    string metadata = 10;
+    string title = 11;
+    string summary = 12;
+    string proposer = 13;
+    bool expedited = 14;
+}
+```
+
+### Vote Options
+
+- **Yes**: Approve the proposal
+- **No**: Reject the proposal
+- **NoWithVeto**: Reject and penalize (burns deposits)
+- **Abstain**: Acknowledge but remain neutral
+
+### Weighted Voting
+
+Split voting power across multiple options:
+
+```protobuf
+message WeightedVoteOption {
+    VoteOption option = 1;
+    string weight = 2;  // Must sum to 1.0
+}
+```
+
+Example: 70% Yes, 30% No
+
+### Expedited Proposals
+
+- **Shorter Voting Period**: Reduced from 2 weeks to days
+- **Higher Threshold**: 66.7% instead of 50%
+- **Auto-Convert**: Falls back to regular if fails
+
+## State
+
+### Proposals
+
+Storage: `0x00 | proposalID -> ProtocolBuffer(Proposal)`
+
+### Votes
+
+Storage: `0x01 | proposalID | voterAddr -> ProtocolBuffer(Vote)`
+
+### Deposits
+
+Storage: `0x02 | proposalID | depositorAddr -> ProtocolBuffer(Deposit)`
+
+### Parameters
+
+```protobuf
+message Params {
+    repeated Coin min_deposit = 1;
+    google.protobuf.Duration max_deposit_period = 2;
+    google.protobuf.Duration voting_period = 3;
+    string quorum = 4;
+    string threshold = 5;
+    string veto_threshold = 6;
+    string min_initial_deposit_ratio = 7;
+    string expedited_voting_period = 8;
+    string expedited_threshold = 9;
+    repeated Coin expedited_min_deposit = 10;
+    bool burn_vote_quorum = 11;
+    bool burn_proposal_deposit_prevote = 12;
+    bool burn_vote_veto = 13;
+}
+```
+
+## Messages
+
+### MsgSubmitProposal
+
+Submit a new governance proposal:
+
+```protobuf
+message MsgSubmitProposal {
+    repeated google.protobuf.Any messages = 1;
+    repeated Coin initial_deposit = 2;
+    string proposer = 3;
+    string metadata = 4;
+    string title = 5;
+    string summary = 6;
+    bool expedited = 7;
+}
+```
+
+**Usage**:
+```bash
+simd tx gov submit-proposal \
+    --title="Upgrade v2" \
+    --summary="Upgrade chain to v2" \
+    --deposit=1000000stake \
+    --from=mykey
+```
+
+### MsgDeposit
+
+Deposit tokens on a proposal:
+
+```protobuf
+message MsgDeposit {
+    uint64 proposal_id = 1;
+    string depositor = 2;
+    repeated Coin amount = 3;
+}
+```
+
+**Usage**:
+```bash
+simd tx gov deposit 1 1000000stake --from=mykey
+```
+
+### MsgVote
+
+Vote on an active proposal:
+
+```protobuf
+message MsgVote {
+    uint64 proposal_id = 1;
+    string voter = 2;
+    VoteOption option = 3;
+    string metadata = 4;
+}
+```
+
+**Usage**:
+```bash
+simd tx gov vote 1 yes --from=mykey
+```
+
+### MsgVoteWeighted
+
+Vote with split options:
+
+```protobuf
+message MsgVoteWeighted {
+    uint64 proposal_id = 1;
+    string voter = 2;
+    repeated WeightedVoteOption options = 3;
+    string metadata = 4;
+}
+```
+
+**Usage**:
+```bash
+simd tx gov weighted-vote 1 yes=0.7,no=0.3 --from=mykey
+```
+
+## Tallying
+
+### Quorum
+
+Minimum percentage of voting power that must vote:
+```
+quorum = 33.4%  // Default
+```
+
+### Threshold
+
+Minimum `Yes` votes (excluding `Abstain`):
+```
+threshold = 50%              // Regular proposals
+expeditedThreshold = 66.7%   // Expedited proposals
+```
+
+### Veto
+
+Maximum `NoWithVeto` votes:
+```
+vetoThreshold = 33.4%
+```
+
+### Proposal Passes If:
+
+1. Quorum is reached
+2. `Yes / (Yes + No + NoWithVeto)` > Threshold
+3. `NoWithVeto / (Yes + No + NoWithVeto + Abstain)` < VetoThreshold
+
+## Queries
+
+### Query Proposal
+
+```bash
+simd query gov proposal 1
+```
+
+### Query Proposals
+
+```bash
+# All proposals
+simd query gov proposals
+
+# By status
+simd query gov proposals --status=voting_period
+```
+
+### Query Vote
+
+```bash
+simd query gov vote 1 cosmos1...
+```
+
+### Query Votes
+
+```bash
+simd query gov votes 1
+```
+
+### Query Deposit
+
+```bash
+simd query gov deposit 1 cosmos1...
+```
+
+### Query Deposits
+
+```bash
+simd query gov deposits 1
+```
+
+### Query Tally
+
+```bash
+simd query gov tally 1
+```
+
+### Query Parameters
+
+```bash
+simd query gov params
+```
+
+## gRPC Endpoints
+
+### Proposal
+
+```bash
+grpcurl -plaintext \
+    -d '{"proposal_id":"1"}' \
+    localhost:9090 \
+    cosmos.gov.v1.Query/Proposal
+```
+
+### Proposals
+
+```bash
+grpcurl -plaintext \
+    -d '{"proposal_status":"PROPOSAL_STATUS_VOTING_PERIOD"}' \
+    localhost:9090 \
+    cosmos.gov.v1.Query/Proposals
+```
+
+### Vote
+
+```bash
+grpcurl -plaintext \
+    -d '{"proposal_id":"1","voter":"cosmos1.."}' \
+    localhost:9090 \
+    cosmos.gov.v1.Query/Vote
+```
+
+### TallyResult
+
+```bash
+grpcurl -plaintext \
+    -d '{"proposal_id":"1"}' \
+    localhost:9090 \
+    cosmos.gov.v1.Query/TallyResult
+```
+
+## Events
+
+### Proposal Events
+
+| Type | Attribute Key | Attribute Value |
+|------|---------------|----------------|
+| submit_proposal | proposal_id | {proposalID} |
+| submit_proposal | proposal_type | {proposalType} |
+| proposal_deposit | proposal_id | {proposalID} |
+| proposal_deposit | amount | {depositAmount} |
+
+### Vote Events
+
+| Type | Attribute Key | Attribute Value |
+|------|---------------|----------------|
+| proposal_vote | proposal_id | {proposalID} |
+| proposal_vote | option | {voteOption} |
+
+## Code Examples
+
+### Submit Proposal
+
+```go
+// Create proposal messages
+msg := banktypes.NewMsgSend(
+    govModuleAddr,
+    recipientAddr,
+    sdk.NewCoins(sdk.NewInt64Coin("stake", 1000)),
+)
+
+// Submit proposal
+proposal := govtypes.NewMsgSubmitProposal(
+    []sdk.Msg{msg},
+    sdk.NewCoins(sdk.NewInt64Coin("stake", 10000000)),
+    proposerAddr.String(),
+    "",
+    "Send Tokens",
+    "Proposal to send tokens from community pool",
+    false,
+)
+```
+
+### Vote on Proposal
+
+```go
+// Vote yes
+voteMsg := govtypes.NewMsgVote(
+    voterAddr,
+    proposalID,
+    govtypes.OptionYes,
+    "",
+)
+```
+
+### Weighted Vote
+
+```go
+// Split vote: 70% yes, 30% abstain
+options := []govtypes.WeightedVoteOption{
+    {Option: govtypes.OptionYes, Weight: sdk.MustNewDecFromStr("0.7")},
+    {Option: govtypes.OptionAbstain, Weight: sdk.MustNewDecFromStr("0.3")},
+}
+
+voteMsg := govtypes.NewMsgVoteWeighted(
+    voterAddr,
+    proposalID,
+    options,
+    "",
+)
+```
+
+### Query Tally
+
+```go
+// Get tally for proposal
+tally, err := govKeeper.Tally(ctx, proposal)
+if err != nil {
+    return err
+}
+
+fmt.Printf("Yes: %s\n", tally.YesCount)
+fmt.Printf("No: %s\n", tally.NoCount)
+fmt.Printf("NoWithVeto: %s\n", tally.NoWithVetoCount)
+fmt.Printf("Abstain: %s\n", tally.AbstainCount)
+```
+
+## Custom Vote Calculation
+
+Implement custom voting logic:
+
+```go
+type CustomTallyFn func(
+    ctx context.Context,
+    k keeper.Keeper,
+    proposal v1.Proposal,
+) (
+    totalVoterPower math.LegacyDec,
+    totalValPower math.Int,
+    results map[v1.VoteOption]math.LegacyDec,
+    err error,
+)
+
+// Example: Quadratic voting
+func QuadraticVoting(
+    ctx context.Context,
+    k keeper.Keeper,
+    proposal v1.Proposal,
+) (math.LegacyDec, math.Int, map[v1.VoteOption]math.LegacyDec, error) {
+    // Calculate square root of voting power
+    // Implementation here...
+}
+
+// Register custom function
+govKeeper := govkeeper.NewKeeper(
+    // ... params
+    govkeeper.WithCustomVoteHandler(QuadraticVoting),
+)
+```
+
+## CLI Commands Reference
+
+| Command | Description |
+|---------|-------------|
+| `simd query gov proposal [id]` | Query proposal details |
+| `simd query gov proposals` | Query all proposals |
+| `simd query gov vote [id] [voter]` | Query vote |
+| `simd query gov votes [id]` | Query all votes |
+| `simd query gov deposit [id] [depositor]` | Query deposit |
+| `simd query gov deposits [id]` | Query all deposits |
+| `simd query gov tally [id]` | Query tally results |
+| `simd query gov params` | Query governance parameters |
+| `simd tx gov submit-proposal` | Submit proposal |
+| `simd tx gov deposit [id] [amount]` | Deposit on proposal |
+| `simd tx gov vote [id] [option]` | Vote on proposal |
+| `simd tx gov weighted-vote [id] [options]` | Weighted vote |
+
+## Integration Guide
+
+```go
+// Initialize governance keeper
+app.GovKeeper = govkeeper.NewKeeper(
+    appCodec,
+    runtime.NewKVStoreService(keys[govtypes.StoreKey]),
+    app.AccountKeeper,
+    app.BankKeeper,
+    app.StakingKeeper,
+    app.DistrKeeper,
+    app.MsgServiceRouter(),
+    govConfig,
+    authtypes.NewModuleAddress(govtypes.ModuleName).String(),
+)
+
+// Register module
+app.ModuleManager = module.NewManager(
+    gov.NewAppModule(appCodec, &app.GovKeeper, app.AccountKeeper, app.BankKeeper),
+    // other modules...
+)
+
+// Set governance hooks
+app.GovKeeper.SetHooks(
+    govtypes.NewMultiGovHooks(
+        // Add custom hooks here
+    ),
+)
+```

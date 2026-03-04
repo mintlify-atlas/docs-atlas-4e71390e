@@ -1,0 +1,472 @@
+---
+title: Message Service
+description: Message routing and handler implementation using Protobuf services
+---
+
+## Overview
+
+The Message Service pattern uses Protobuf service definitions to route and handle state transitions. It provides type-safe message handling with automatic registration and gRPC-like semantics.
+
+## Message Service Router
+
+### MsgServiceRouter
+
+```go
+type MsgServiceRouter struct {
+    interfaceRegistry codectypes.InterfaceRegistry
+    routes            map[string]MsgServiceHandler
+    hybridHandlers    map[string]func(ctx context.Context, req, resp protoiface.MessageV1) error
+    circuitBreaker    CircuitBreaker
+}
+
+func NewMsgServiceRouter() *MsgServiceRouter {
+    return &MsgServiceRouter{
+        routes:         map[string]MsgServiceHandler{},
+        hybridHandlers: map[string]func(ctx context.Context, req, resp protoiface.MessageV1) error{},
+    }
+}
+```
+
+**Location:** `baseapp/msg_service_router.go:29-44`
+
+### MsgServiceHandler
+
+```go
+type MsgServiceHandler = func(ctx sdk.Context, req sdk.Msg) (*sdk.Result, error)
+```
+
+**Location:** `baseapp/msg_service_router.go:51`
+
+Handles message execution and returns result.
+
+### Router Methods
+
+```go
+// Handler returns the handler for a message
+func (msr *MsgServiceRouter) Handler(msg sdk.Msg) MsgServiceHandler
+
+// HandlerByTypeURL returns handler by type URL
+func (msr *MsgServiceRouter) HandlerByTypeURL(typeURL string) MsgServiceHandler
+
+// RegisterService registers a gRPC service
+func (msr *MsgServiceRouter) RegisterService(sd *grpc.ServiceDesc, handler any)
+```
+
+**Location:** `baseapp/msg_service_router.go:53-83`
+
+## Defining Message Services
+
+### Protobuf Service Definition
+
+```protobuf
+// x/bank/types/tx.proto
+syntax = "proto3";
+package cosmos.bank.v1beta1;
+
+import "cosmos/msg/v1/msg.proto";
+import "cosmos/base/v1beta1/coin.proto";
+
+option go_package = "github.com/cosmos/cosmos-sdk/x/bank/types";
+
+// Msg defines the bank Msg service
+service Msg {
+  option (cosmos.msg.v1.service) = true;
+  
+  // Send defines a method for sending coins from one account to another
+  rpc Send(MsgSend) returns (MsgSendResponse);
+  
+  // MultiSend defines a method for sending coins from some accounts to other accounts
+  rpc MultiSend(MsgMultiSend) returns (MsgMultiSendResponse);
+  
+  // UpdateParams defines a governance operation for updating the x/bank module parameters
+  rpc UpdateParams(MsgUpdateParams) returns (MsgUpdateParamsResponse);
+}
+
+// MsgSend represents a message to send coins from one account to another
+message MsgSend {
+  option (cosmos.msg.v1.signer) = "from_address";
+  
+  string from_address = 1;
+  string to_address = 2;
+  repeated cosmos.base.v1beta1.Coin amount = 3;
+}
+
+message MsgSendResponse {}
+
+message MsgMultiSend {
+  option (cosmos.msg.v1.signer) = "inputs";
+  
+  repeated Input inputs = 1;
+  repeated Output outputs = 2;
+}
+
+message MsgMultiSendResponse {}
+```
+
+The `cosmos.msg.v1.service` option marks this as a message service.
+The `cosmos.msg.v1.signer` option specifies which field contains the signer.
+
+## Implementing Message Servers
+
+### MsgServer Implementation
+
+```go
+package keeper
+
+import (
+    "context"
+    
+    sdk "github.com/cosmos/cosmos-sdk/types"
+    "github.com/cosmos/cosmos-sdk/x/bank/types"
+)
+
+type msgServer struct {
+    Keeper
+}
+
+// NewMsgServerImpl returns an implementation of the bank MsgServer interface
+func NewMsgServerImpl(keeper Keeper) types.MsgServer {
+    return &msgServer{Keeper: keeper}
+}
+
+var _ types.MsgServer = msgServer{}
+
+// Send implements the Send method of MsgServer
+func (k msgServer) Send(
+    goCtx context.Context,
+    msg *types.MsgSend,
+) (*types.MsgSendResponse, error) {
+    ctx := sdk.UnwrapSDKContext(goCtx)
+    
+    // Parse addresses
+    from, err := sdk.AccAddressFromBech32(msg.FromAddress)
+    if err != nil {
+        return nil, err
+    }
+    
+    to, err := sdk.AccAddressFromBech32(msg.ToAddress)
+    if err != nil {
+        return nil, err
+    }
+    
+    // Validate message
+    if !msg.Amount.IsValid() {
+        return nil, sdkerrors.Wrap(sdkerrors.ErrInvalidCoins, msg.Amount.String())
+    }
+    
+    // Execute transfer
+    if err := k.SendCoins(ctx, from, to, msg.Amount); err != nil {
+        return nil, err
+    }
+    
+    // Emit event
+    ctx.EventManager().EmitEvent(
+        sdk.NewEvent(
+            sdk.EventTypeMessage,
+            sdk.NewAttribute(sdk.AttributeKeyModule, types.AttributeValueCategory),
+            sdk.NewAttribute(sdk.AttributeKeySender, msg.FromAddress),
+        ),
+    )
+    
+    return &types.MsgSendResponse{}, nil
+}
+
+// MultiSend implements the MultiSend method of MsgServer
+func (k msgServer) MultiSend(
+    goCtx context.Context,
+    msg *types.MsgMultiSend,
+) (*types.MsgMultiSendResponse, error) {
+    ctx := sdk.UnwrapSDKContext(goCtx)
+    
+    // Validate message
+    if err := msg.ValidateBasic(); err != nil {
+        return nil, err
+    }
+    
+    // Execute multi-send
+    if err := k.InputOutputCoins(ctx, msg.Inputs, msg.Outputs); err != nil {
+        return nil, err
+    }
+    
+    return &types.MsgMultiSendResponse{}, nil
+}
+
+// UpdateParams implements governance parameter updates
+func (k msgServer) UpdateParams(
+    goCtx context.Context,
+    msg *types.MsgUpdateParams,
+) (*types.MsgUpdateParamsResponse, error) {
+    ctx := sdk.UnwrapSDKContext(goCtx)
+    
+    // Validate authority
+    if k.authority != msg.Authority {
+        return nil, sdkerrors.Wrapf(
+            govtypes.ErrInvalidSigner,
+            "invalid authority; expected %s, got %s",
+            k.authority,
+            msg.Authority,
+        )
+    }
+    
+    // Update params
+    if err := k.SetParams(ctx, msg.Params); err != nil {
+        return nil, err
+    }
+    
+    return &types.MsgUpdateParamsResponse{}, nil
+}
+```
+
+### Registering Message Server
+
+```go
+package mymodule
+
+import (
+    "github.com/cosmos/cosmos-sdk/types/module"
+)
+
+type AppModule struct {
+    keeper keeper.Keeper
+}
+
+// RegisterServices registers module services
+func (am AppModule) RegisterServices(cfg module.Configurator) {
+    // Register msg server
+    types.RegisterMsgServer(
+        cfg.MsgServer(),
+        keeper.NewMsgServerImpl(am.keeper),
+    )
+    
+    // Register query server
+    types.RegisterQueryServer(cfg.QueryServer(), am.keeper)
+    
+    // Register migrations
+    // ...
+}
+```
+
+## Message Validation
+
+### ValidateBasic
+
+Messages should implement basic stateless validation:
+
+```go
+func (msg MsgSend) ValidateBasic() error {
+    // Validate from address
+    _, err := sdk.AccAddressFromBech32(msg.FromAddress)
+    if err != nil {
+        return sdkerrors.Wrapf(sdkerrors.ErrInvalidAddress, "invalid from address: %s", err)
+    }
+    
+    // Validate to address
+    _, err = sdk.AccAddressFromBech32(msg.ToAddress)
+    if err != nil {
+        return sdkerrors.Wrapf(sdkerrors.ErrInvalidAddress, "invalid to address: %s", err)
+    }
+    
+    // Validate amount
+    if !msg.Amount.IsValid() {
+        return sdkerrors.Wrap(sdkerrors.ErrInvalidCoins, msg.Amount.String())
+    }
+    
+    if !msg.Amount.IsAllPositive() {
+        return sdkerrors.Wrap(sdkerrors.ErrInvalidCoins, "amount must be positive")
+    }
+    
+    return nil
+}
+```
+
+### GetSigners
+
+The `GetSigners` method returns addresses that must sign the message:
+
+```go
+// Auto-generated from cosmos.msg.v1.signer annotation
+func (msg *MsgSend) GetSigners() []sdk.AccAddress {
+    from, err := sdk.AccAddressFromBech32(msg.FromAddress)
+    if err != nil {
+        panic(err)
+    }
+    return []sdk.AccAddress{from}
+}
+```
+
+## Handler Execution Flow
+
+```
+1. Client submits transaction with messages
+   ↓
+2. AnteHandler validates transaction (fees, signatures, etc.)
+   ↓
+3. For each message in transaction:
+   ↓
+4. MsgServiceRouter.Handler(msg) finds handler by type URL
+   ↓
+5. Execute handler with message and context
+   ↓
+6. Handler calls keeper methods to modify state
+   ↓
+7. Handler emits events
+   ↓
+8. Handler returns Result
+   ↓
+9. PostHandler executes (optional)
+   ↓
+10. Transaction result returned to client
+```
+
+## Testing Message Handlers
+
+```go
+package keeper_test
+
+import (
+    "testing"
+    
+    sdk "github.com/cosmos/cosmos-sdk/types"
+    "github.com/cosmos/cosmos-sdk/x/bank/types"
+)
+
+func (suite *KeeperTestSuite) TestMsgSend() {
+    ctx := suite.ctx
+    msgServer := keeper.NewMsgServerImpl(suite.keeper)
+    
+    // Setup: Fund sender
+    sender := sdk.AccAddress([]byte("sender"))
+    recipient := sdk.AccAddress([]byte("recipient"))
+    amount := sdk.NewCoins(sdk.NewInt64Coin("stake", 1000))
+    
+    suite.Require().NoError(
+        suite.bankKeeper.MintCoins(ctx, types.ModuleName, amount),
+    )
+    suite.Require().NoError(
+        suite.bankKeeper.SendCoinsFromModuleToAccount(ctx, types.ModuleName, sender, amount),
+    )
+    
+    // Execute message
+    msg := types.NewMsgSend(sender, recipient, sdk.NewCoins(sdk.NewInt64Coin("stake", 500)))
+    _, err := msgServer.Send(sdk.WrapSDKContext(ctx), msg)
+    suite.Require().NoError(err)
+    
+    // Verify balances
+    senderBalance := suite.bankKeeper.GetBalance(ctx, sender, "stake")
+    suite.Require().Equal(int64(500), senderBalance.Amount.Int64())
+    
+    recipientBalance := suite.bankKeeper.GetBalance(ctx, recipient, "stake")
+    suite.Require().Equal(int64(500), recipientBalance.Amount.Int64())
+    
+    // Verify events
+    events := ctx.EventManager().Events()
+    suite.Require().NotEmpty(events)
+}
+
+func (suite *KeeperTestSuite) TestMsgSendInsufficientFunds() {
+    ctx := suite.ctx
+    msgServer := keeper.NewMsgServerImpl(suite.keeper)
+    
+    sender := sdk.AccAddress([]byte("sender"))
+    recipient := sdk.AccAddress([]byte("recipient"))
+    
+    // Try to send without funds
+    msg := types.NewMsgSend(
+        sender,
+        recipient,
+        sdk.NewCoins(sdk.NewInt64Coin("stake", 500)),
+    )
+    
+    _, err := msgServer.Send(sdk.WrapSDKContext(ctx), msg)
+    suite.Require().Error(err)
+    suite.Require().Contains(err.Error(), "insufficient funds")
+}
+```
+
+## Best Practices
+
+### Error Handling
+
+```go
+import (
+    sdkerrors "github.com/cosmos/cosmos-sdk/types/errors"
+)
+
+func (k msgServer) Process(
+    goCtx context.Context,
+    msg *types.MsgProcess,
+) (*types.MsgProcessResponse, error) {
+    ctx := sdk.UnwrapSDKContext(goCtx)
+    
+    // Use appropriate error codes
+    if msg.Value < 0 {
+        return nil, sdkerrors.Wrap(
+            sdkerrors.ErrInvalidRequest,
+            "value must be non-negative",
+        )
+    }
+    
+    // Wrap keeper errors
+    if err := k.DoSomething(ctx, msg); err != nil {
+        return nil, sdkerrors.Wrap(err, "failed to process")
+    }
+    
+    return &types.MsgProcessResponse{}, nil
+}
+```
+
+### Event Emission
+
+```go
+func (k msgServer) Execute(
+    goCtx context.Context,
+    msg *types.MsgExecute,
+) (*types.MsgExecuteResponse, error) {
+    ctx := sdk.UnwrapSDKContext(goCtx)
+    
+    // Execute logic
+    result := k.Keeper.Execute(ctx, msg)
+    
+    // Emit typed event
+    ctx.EventManager().EmitEvent(
+        sdk.NewEvent(
+            types.EventTypeExecute,
+            sdk.NewAttribute(types.AttributeKeyExecutor, msg.Executor),
+            sdk.NewAttribute(types.AttributeKeyResult, result.String()),
+        ),
+    )
+    
+    return &types.MsgExecuteResponse{Result: result}, nil
+}
+```
+
+### Authority Checks
+
+```go
+func (k msgServer) UpdateParams(
+    goCtx context.Context,
+    msg *types.MsgUpdateParams,
+) (*types.MsgUpdateParamsResponse, error) {
+    ctx := sdk.UnwrapSDKContext(goCtx)
+    
+    // Verify authority (usually governance module)
+    if k.authority != msg.Authority {
+        return nil, sdkerrors.Wrapf(
+            govtypes.ErrInvalidSigner,
+            "invalid authority; expected %s, got %s",
+            k.authority,
+            msg.Authority,
+        )
+    }
+    
+    // Update parameters
+    return k.Keeper.UpdateParams(ctx, msg.Params)
+}
+```
+
+## Related APIs
+
+- [BaseApp](/api/baseapp) - Message routing infrastructure
+- [Keeper Patterns](/api/keeper-patterns) - State management in handlers
+- [Types](/api/types) - Message and context types
+- [gRPC](/api/grpc) - Query service implementation

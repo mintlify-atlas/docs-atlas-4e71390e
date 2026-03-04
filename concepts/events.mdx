@@ -1,0 +1,486 @@
+---
+title: Events
+description: Understanding event emission, subscription, and indexing in Cosmos SDK
+---
+
+# Events
+
+Events are a way for applications to notify clients about state changes during transaction execution. They are emitted during message handling and can be queried and indexed by clients.
+
+## Event System Overview
+
+### Event Structure
+
+Events consist of a type and a list of attributes:
+
+```go types/events.go
+// Event is a type alias for ABCI Event
+type Event abci.Event
+
+type Events []Event
+
+// Event structure from CometBFT
+type Event struct {
+    Type       string            // Event type (e.g., "transfer")
+    Attributes []EventAttribute  // Key-value pairs
+}
+
+type EventAttribute struct {
+    Key   string  // Attribute key
+    Value string  // Attribute value
+}
+```
+
+### Creating Events
+
+```go types/events.go
+// Create an event with attributes
+event := sdk.NewEvent(
+    "transfer",
+    sdk.NewAttribute("recipient", recipient.String()),
+    sdk.NewAttribute("sender", sender.String()),
+    sdk.NewAttribute("amount", amount.String()),
+)
+
+// Create attribute
+attr := sdk.NewAttribute("key", "value")
+```
+
+## Event Manager
+
+The EventManager collects events during transaction execution:
+
+```go types/events.go
+// EventManager stores events
+type EventManager struct {
+    events Events
+}
+
+func NewEventManager() *EventManager {
+    return &EventManager{EmptyEvents()}
+}
+
+// Get all events
+func (em *EventManager) Events() Events {
+    return em.events
+}
+
+// Emit a single event
+func (em *EventManager) EmitEvent(event Event) {
+    em.events = em.events.AppendEvent(event)
+}
+
+// Emit multiple events
+func (em *EventManager) EmitEvents(events Events) {
+    em.events = em.events.AppendEvents(events)
+}
+```
+
+### Accessing Event Manager
+
+```go
+// Get event manager from context
+em := ctx.EventManager()
+
+// Emit event
+em.EmitEvent(sdk.NewEvent(
+    "message",
+    sdk.NewAttribute("module", "bank"),
+    sdk.NewAttribute("action", "send"),
+))
+```
+
+## Typed Events
+
+SDK supports typed events using Protocol Buffers:
+
+```protobuf
+// Define typed event in .proto file
+message EventTransfer {
+    string recipient = 1;
+    string sender = 2;
+    string amount = 3;
+}
+```
+
+### Emitting Typed Events
+
+```go types/events.go
+// Emit typed event
+func (em *EventManager) EmitTypedEvent(event proto.Message) error {
+    // Converts proto message to Event
+    evt, err := TypedEventToEvent(event)
+    if err != nil {
+        return err
+    }
+    
+    em.EmitEvent(evt)
+    return nil
+}
+
+// Convert proto message to event
+func TypedEventToEvent(tev proto.Message) (Event, error) {
+    evtType := proto.MessageName(tev)
+    evtJSON, err := codec.ProtoMarshalJSON(tev, nil)
+    if err != nil {
+        return Event{}, err
+    }
+    
+    // Convert JSON to attributes
+    var attrMap map[string]json.RawMessage
+    json.Unmarshal(evtJSON, &attrMap)
+    
+    attrs := make([]abci.EventAttribute, 0, len(attrMap))
+    for k, v := range attrMap {
+        attrs = append(attrs, abci.EventAttribute{
+            Key:   k,
+            Value: string(v),
+        })
+    }
+    
+    return Event{
+        Type:       evtType,
+        Attributes: attrs,
+    }, nil
+}
+```
+
+### Usage Example
+
+```go
+// Define typed event
+event := &banktypes.EventTransfer{
+    Recipient: recipient.String(),
+    Sender:    sender.String(),
+    Amount:    amount.String(),
+}
+
+// Emit it
+if err := ctx.EventManager().EmitTypedEvent(event); err != nil {
+    return err
+}
+```
+
+## Core Event Service
+
+The core API provides an event service for modules:
+
+```go core/event/service.go
+type Service interface {
+    EventManager(context.Context) Manager
+}
+
+type Manager interface {
+    // Emit consensus events (state-machine breaking)
+    Emit(ctx context.Context, event protoiface.MessageV1) error
+    
+    // Emit key-value events (non-consensus)
+    EmitKV(ctx context.Context, eventType string, attrs ...Attribute) error
+    
+    // Emit non-consensus events
+    EmitNonConsensus(ctx context.Context, event protoiface.MessageV1) error
+}
+
+type Attribute struct {
+    Key, Value string
+}
+```
+
+### Using Event Service
+
+```go runtime/events.go
+// Get event manager from context
+eventManager := eventService.EventManager(ctx)
+
+// Emit typed event
+err := eventManager.Emit(ctx, &types.EventTransfer{
+    Recipient: recipient,
+    Sender:    sender,
+    Amount:    amount,
+})
+
+// Emit KV event
+err := eventManager.EmitKV(ctx, "transfer",
+    event.Attribute{Key: "recipient", Value: recipient},
+    event.Attribute{Key: "sender", Value: sender},
+)
+```
+
+## Module Events
+
+Modules define standard events for their operations:
+
+```go x/bank/types/events.go
+const (
+    EventTypeTransfer     = "transfer"
+    EventTypeCoinSpent    = "coin_spent"
+    EventTypeCoinReceived = "coin_received"
+    EventTypeCoinMint     = "coinbase"
+    EventTypeCoinBurn     = "burn"
+    
+    AttributeKeyRecipient = "recipient"
+    AttributeKeySender    = "sender"
+    AttributeKeySpender   = "spender"
+    AttributeKeyReceiver  = "receiver"
+    AttributeKeyMinter    = "minter"
+    AttributeKeyBurner    = "burner"
+)
+
+// Helper functions for creating events
+func NewCoinSpentEvent(spender sdk.AccAddress, amount sdk.Coins) sdk.Event {
+    return sdk.NewEvent(
+        EventTypeCoinSpent,
+        sdk.NewAttribute(AttributeKeySpender, spender.String()),
+        sdk.NewAttribute(sdk.AttributeKeyAmount, amount.String()),
+    )
+}
+
+func NewCoinReceivedEvent(receiver sdk.AccAddress, amount sdk.Coins) sdk.Event {
+    return sdk.NewEvent(
+        EventTypeCoinReceived,
+        sdk.NewAttribute(AttributeKeyReceiver, receiver.String()),
+        sdk.NewAttribute(sdk.AttributeKeyAmount, amount.String()),
+    )
+}
+```
+
+## Event Emission Examples
+
+### Bank Module Transfer
+
+```go
+// Inside bank keeper SendCoins method
+func (k Keeper) SendCoins(
+    ctx sdk.Context,
+    from, to sdk.AccAddress,
+    amount sdk.Coins,
+) error {
+    // ... transfer logic ...
+    
+    // Emit coin spent event
+    ctx.EventManager().EmitEvent(
+        banktypes.NewCoinSpentEvent(from, amount),
+    )
+    
+    // Emit coin received event
+    ctx.EventManager().EmitEvent(
+        banktypes.NewCoinReceivedEvent(to, amount),
+    )
+    
+    // Emit transfer event
+    ctx.EventManager().EmitEvent(
+        sdk.NewEvent(
+            banktypes.EventTypeTransfer,
+            sdk.NewAttribute(banktypes.AttributeKeySender, from.String()),
+            sdk.NewAttribute(banktypes.AttributeKeyRecipient, to.String()),
+            sdk.NewAttribute(sdk.AttributeKeyAmount, amount.String()),
+        ),
+    )
+    
+    return nil
+}
+```
+
+### Message Execution
+
+```go
+// Emit events in message handler
+func (k msgServer) Send(goCtx context.Context, msg *types.MsgSend) (*types.MsgSendResponse, error) {
+    ctx := sdk.UnwrapSDKContext(goCtx)
+    
+    // Execute send
+    err := k.keeper.SendCoins(ctx, msg.FromAddress, msg.ToAddress, msg.Amount)
+    if err != nil {
+        return nil, err
+    }
+    
+    // Emit message event
+    ctx.EventManager().EmitEvent(
+        sdk.NewEvent(
+            sdk.EventTypeMessage,
+            sdk.NewAttribute(sdk.AttributeKeyModule, types.ModuleName),
+            sdk.NewAttribute(sdk.AttributeKeyAction, types.TypeMsgSend),
+            sdk.NewAttribute(sdk.AttributeKeySender, msg.FromAddress.String()),
+        ),
+    )
+    
+    return &types.MsgSendResponse{}, nil
+}
+```
+
+## Querying Events
+
+### Via RPC
+
+Clients query events using CometBFT RPC:
+
+```bash
+# Query events by type
+curl localhost:26657/tx_search?query="transfer.recipient='cosmos1...'"
+
+# Query with multiple conditions
+curl localhost:26657/tx_search?query="transfer.sender='cosmos1...'%20AND%20transfer.amount='1000uatom'"
+```
+
+### Event Query Syntax
+
+```bash
+# Format: "<event_type>.<attribute_key>='<value>'"
+
+# Single condition
+transfer.recipient='cosmos1abc...'
+
+# Multiple conditions (AND)
+transfer.sender='cosmos1abc...' AND transfer.amount='1000uatom'
+
+# Range queries
+tx.height>=100 AND tx.height<=200
+
+# Check existence
+transfer.recipient EXISTS
+```
+
+### Programmatic Querying
+
+```go
+// Query transactions by events
+import "github.com/cometbft/cometbft/rpc/client/http"
+
+client, err := http.New("http://localhost:26657", "/websocket")
+if err != nil {
+    return err
+}
+
+// Build query
+query := "transfer.recipient='cosmos1...' AND tx.height>=100"
+
+// Search transactions
+result, err := client.TxSearch(
+    context.Background(),
+    query,
+    false, // prove
+    nil,   // page
+    nil,   // per_page
+    "",    // order_by
+)
+
+for _, tx := range result.Txs {
+    // Process transaction events
+    for _, event := range tx.TxResult.Events {
+        fmt.Printf("Event: %s\n", event.Type)
+        for _, attr := range event.Attributes {
+            fmt.Printf("  %s: %s\n", attr.Key, attr.Value)
+        }
+    }
+}
+```
+
+## WebSocket Subscriptions
+
+Subscribe to events in real-time:
+
+```go
+// Subscribe to events
+import "github.com/cometbft/cometbft/rpc/client/http"
+
+client, _ := http.New("http://localhost:26657", "/websocket")
+err := client.Start()
+
+// Subscribe to query
+query := "transfer.recipient='cosmos1...'"
+subscription, err := client.Subscribe(
+    context.Background(),
+    "my-client",
+    query,
+)
+
+// Listen for events
+for event := range subscription {
+    data := event.Data.(types.EventDataTx)
+    fmt.Printf("New transaction: %s\n", data.TxResult.Hash)
+    
+    for _, evt := range data.TxResult.Events {
+        // Process event
+    }
+}
+```
+
+## Event Indexing
+
+CometBFT indexes events for querying:
+
+```toml
+# In config.toml
+[tx_index]
+
+# Index all events (default)
+indexer = "kv"
+
+# Disable indexing
+indexer = "null"
+
+# Index specific events only
+index_keys = "transfer.recipient,transfer.sender"
+
+# Index all keys
+index_all_keys = true
+```
+
+## Best Practices
+
+1. **Use typed events** for consensus-critical events
+2. **Emit events after state changes** - don't emit if operation fails
+3. **Use consistent event types** across modules
+4. **Include relevant attributes** for querying and filtering
+5. **Document events** in module specifications
+6. **Use standard attributes** (sdk.AttributeKeyModule, sdk.AttributeKeyAction, etc.)
+7. **Don't emit excessive events** - they increase block size
+8. **Emit deterministically** - event order must be consistent across nodes
+9. **Use EmitKV** for non-consensus events (logs, metrics)
+10. **Index selectively** in production to manage storage
+
+## Standard Event Attributes
+
+Common attributes used across modules:
+
+```go
+const (
+    AttributeKeyModule    = "module"
+    AttributeKeyAction    = "action"
+    AttributeKeySender    = "sender"
+    AttributeKeyAmount    = "amount"
+    AttributeKeyRecipient = "recipient"
+    AttributeKeyValidator = "validator"
+    AttributeKeyDelegator = "delegator"
+)
+```
+
+## Event Format Example
+
+Complete event from a bank transfer:
+
+```json
+{
+  "type": "transfer",
+  "attributes": [
+    {
+      "key": "recipient",
+      "value": "cosmos1abc..."
+    },
+    {
+      "key": "sender",
+      "value": "cosmos1xyz..."
+    },
+    {
+      "key": "amount",
+      "value": "1000uatom"
+    }
+  ]
+}
+```
+
+## Related Concepts
+
+- [Transactions](/essentials/transactions) - Transaction structure and execution
+- [Queries](/concepts/queries) - Querying application state
+- [Messages](/essentials/messages) - Message types and handlers

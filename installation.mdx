@@ -1,0 +1,484 @@
+---
+title: Installation
+description: Complete guide to installing and setting up the Cosmos SDK development environment
+---
+
+This guide covers everything you need to install and configure the Cosmos SDK for blockchain development.
+
+## System Requirements
+
+### Go Version
+
+Cosmos SDK requires **Go 1.25.7 or later**. The SDK uses the latest Go features for optimal performance and security.
+
+<Note>
+  We advise always using the latest maintained [Go version](https://go.dev/dl/) for building Cosmos SDK applications.
+</Note>
+
+### Operating Systems
+
+The Cosmos SDK is supported on:
+
+- **Linux** (recommended for production)
+- **macOS** (recommended for development)
+- **Windows** (via WSL2)
+
+### Hardware Requirements
+
+Minimum specifications for development:
+
+- **CPU**: 2+ cores
+- **RAM**: 4GB minimum, 8GB recommended
+- **Disk**: 20GB available space
+- **Network**: Stable internet connection for syncing
+
+<Warning>
+  Production nodes require significantly more resources depending on the chain. Check your specific chain's requirements.
+</Warning>
+
+## Installation Methods
+
+### Method 1: Install from Source (Recommended)
+
+Building from source gives you the latest features and allows customization.
+
+<Steps>
+  <Step title="Install Go">
+    Download and install Go 1.25.7 or later from [go.dev/dl](https://go.dev/dl/).
+
+    Verify your installation:
+
+    ```bash
+    go version
+    ```
+
+    Expected output:
+    ```
+    go version go1.25.7 linux/amd64
+    ```
+  </Step>
+
+  <Step title="Configure Go Environment">
+    Set up your Go workspace by adding these to your shell profile (`~/.bashrc`, `~/.zshrc`, etc.):
+
+    ```bash
+    export GOPATH=$HOME/go
+    export PATH=$PATH:$GOPATH/bin
+    ```
+
+    Apply the changes:
+
+    ```bash
+    source ~/.bashrc  # or ~/.zshrc
+    ```
+  </Step>
+
+  <Step title="Clone the Repository">
+    Clone the Cosmos SDK repository:
+
+    ```bash
+    git clone https://github.com/cosmos/cosmos-sdk.git
+    cd cosmos-sdk
+    ```
+
+    Optionally, check out a specific version:
+
+    ```bash
+    git fetch --tags
+    git checkout v0.53.0  # Replace with desired version
+    ```
+  </Step>
+
+  <Step title="Build and Install">
+    Build the SimApp example application:
+
+    ```bash
+    make install
+    ```
+
+    This compiles the `simd` binary and installs it to `$GOPATH/bin`.
+
+    <Note>
+      The build process uses build tags defined in the Makefile. Default tags include `netgo` for static linking.
+    </Note>
+  </Step>
+
+  <Step title="Verify Installation">
+    Confirm the binary is installed correctly:
+
+    ```bash
+    simd version
+    ```
+
+    You should see version information and the commit hash.
+  </Step>
+</Steps>
+
+### Method 2: Install from Release
+
+For stable releases, you can download pre-built binaries:
+
+```bash
+# Download the latest release binary for your platform
+wget https://github.com/cosmos/cosmos-sdk/releases/download/v0.53.0/simd-linux-amd64
+
+# Make it executable
+chmod +x simd-linux-amd64
+
+# Move to PATH
+sudo mv simd-linux-amd64 /usr/local/bin/simd
+
+# Verify
+simd version
+```
+
+### Method 3: Using Docker
+
+For containerized development:
+
+```bash
+# Pull the official image
+docker pull ghcr.io/cosmos/simapp:latest
+
+# Run a container
+docker run -it ghcr.io/cosmos/simapp:latest simd version
+```
+
+## Build Options
+
+The Cosmos SDK supports various build options through environment variables:
+
+### Database Backend Selection
+
+<CodeGroup>
+```bash LevelDB (Default)
+make install
+```
+
+```bash RocksDB
+COSMOS_BUILD_OPTIONS=rocksdb make install
+```
+
+```bash BadgerDB
+COSMOS_BUILD_OPTIONS=badgerdb make install
+```
+
+```bash BoltDB
+COSMOS_BUILD_OPTIONS=boltdb make install
+```
+</CodeGroup>
+
+### Ledger Support
+
+Enable hardware wallet support:
+
+```bash
+LEDGER_ENABLED=true make install
+```
+
+<Note>
+  Ledger support requires `gcc` installed on Linux/macOS. On Windows, you need `gcc.exe`.
+</Note>
+
+### Cross-Platform Builds
+
+Build for different platforms:
+
+<CodeGroup>
+```bash Linux AMD64
+make build-linux-amd64
+```
+
+```bash Linux ARM64
+make build-linux-arm64
+```
+</CodeGroup>
+
+Binaries are output to the `build/` directory.
+
+### Debug Builds
+
+For debugging with symbols:
+
+```bash
+COSMOS_BUILD_OPTIONS=debug make install
+```
+
+## Dependencies
+
+### Required System Packages
+
+Install build dependencies for your platform:
+
+<CodeGroup>
+```bash Ubuntu/Debian
+sudo apt update
+sudo apt install -y build-essential git wget
+```
+
+```bash macOS
+brew install git wget
+```
+
+```bash Fedora/RHEL
+sudo yum groupinstall -y "Development Tools"
+sudo yum install -y git wget
+```
+</CodeGroup>
+
+### Optional: Development Tools
+
+Useful tools for development:
+
+```bash
+# Install mockgen for generating test mocks
+go install go.uber.org/mock/mockgen@latest
+
+# Install golangci-lint for code linting
+go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.10.1
+
+# Install buf for protobuf management
+go install github.com/bufbuild/buf/cmd/buf@latest
+```
+
+## Environment Setup
+
+### Set Default Node Home
+
+Customize where blockchain data is stored:
+
+```bash
+export DAEMON_HOME=$HOME/.mychain
+export DAEMON_NAME=myappd
+```
+
+### Configure Shell Completion
+
+Enable command-line autocomplete:
+
+<CodeGroup>
+```bash Bash
+simd completion bash > /etc/bash_completion.d/simd
+```
+
+```bash Zsh
+simd completion zsh > "${fpath[1]}/_simd"
+```
+
+```bash Fish
+simd completion fish > ~/.config/fish/completions/simd.fish
+```
+</CodeGroup>
+
+## Verification Steps
+
+After installation, verify your setup:
+
+### 1. Check Binary Installation
+
+```bash
+which simd
+# Expected: /home/user/go/bin/simd
+
+simd version --long
+```
+
+Expected output includes:
+```yaml
+name: sim
+server_name: simd
+version: 0.53.0
+commit: abc123...
+go: go1.25.7
+build_tags: netgo
+```
+
+### 2. Test Basic Commands
+
+```bash
+# Show help
+simd --help
+
+# Show available commands
+simd --help | grep "Available Commands"
+```
+
+### 3. Initialize a Test Chain
+
+```bash
+# Initialize without starting
+simd init testnode --chain-id test
+
+# Verify config was created
+ls ~/.simapp/config/
+```
+
+### 4. Check Go Module
+
+For custom applications using the SDK as a dependency:
+
+```bash
+go list -m github.com/cosmos/cosmos-sdk
+```
+
+## Troubleshooting
+
+### Issue: `simd: command not found`
+
+**Solution**: Ensure `$GOPATH/bin` is in your PATH:
+
+```bash
+echo $PATH | grep -o "$GOPATH/bin"
+```
+
+If not found, add to your shell profile:
+
+```bash
+export PATH=$PATH:$GOPATH/bin
+```
+
+### Issue: Go Version Too Old
+
+**Solution**: Update Go to 1.25.7 or later:
+
+```bash
+# Remove old version
+sudo rm -rf /usr/local/go
+
+# Download and install new version
+wget https://go.dev/dl/go1.25.7.linux-amd64.tar.gz
+sudo tar -C /usr/local -xzf go1.25.7.linux-amd64.tar.gz
+
+# Verify
+go version
+```
+
+### Issue: Build Fails with Ledger Errors
+
+**Solution**: Disable Ledger support if you don't need it:
+
+```bash
+LEDGER_ENABLED=false make install
+```
+
+Or install GCC:
+
+<CodeGroup>
+```bash Ubuntu
+sudo apt install -y gcc
+```
+
+```bash macOS
+xcode-select --install
+```
+</CodeGroup>
+
+### Issue: `cannot find module` Error
+
+**Solution**: Ensure dependencies are downloaded:
+
+```bash
+go mod download
+go mod verify
+```
+
+### Issue: Disk Space
+
+**Solution**: Clean build artifacts:
+
+```bash
+make clean
+go clean -cache -modcache -testcache
+```
+
+## Additional Tools
+
+### Cosmovisor
+
+Automatic binary upgrade management:
+
+```bash
+make cosmovisor
+# Binary installed to: $GOPATH/bin/cosmovisor
+```
+
+### Confix
+
+Configuration file migration tool:
+
+```bash
+make confix
+# Binary installed to: $GOPATH/bin/confix
+```
+
+## Building Custom Applications
+
+To use Cosmos SDK in your own project:
+
+### 1. Initialize Go Module
+
+```bash
+mkdir mychain
+cd mychain
+go mod init github.com/username/mychain
+```
+
+### 2. Add Cosmos SDK Dependency
+
+```bash
+go get github.com/cosmos/cosmos-sdk@v0.53.0
+```
+
+### 3. Import in Your Code
+
+```go
+import (
+    "github.com/cosmos/cosmos-sdk/types"
+    "github.com/cosmos/cosmos-sdk/client"
+)
+```
+
+## Next Steps
+
+<CardGroup cols={2}>
+  <Card title="Quickstart" icon="rocket" href="/quickstart">
+    Initialize and run your first blockchain node
+  </Card>
+  <Card title="Application Architecture" icon="sitemap" href="/architecture/overview">
+    Learn how Cosmos SDK applications are structured
+  </Card>
+  <Card title="Building Modules" icon="cubes" href="/modules/building-modules">
+    Start building custom blockchain modules
+  </Card>
+  <Card title="Building Chains" icon="gear" href="/building/app-creation">
+    Deep dive into creating blockchain applications
+  </Card>
+</CardGroup>
+
+## Staying Updated
+
+### Check for Updates
+
+```bash
+cd cosmos-sdk
+git fetch --tags
+git tag --sort=-version:refname | head -n 5
+```
+
+### Upgrade to New Version
+
+```bash
+git checkout v0.53.0  # Replace with target version
+make install
+```
+
+<Warning>
+  Always review the [CHANGELOG](https://github.com/cosmos/cosmos-sdk/blob/main/CHANGELOG.md) and migration guides before upgrading.
+</Warning>
+
+## Community Resources
+
+- **Documentation**: [docs.cosmos.network](https://docs.cosmos.network)
+- **Discord**: [discord.com/invite/interchain](https://discord.com/invite/interchain)
+- **GitHub**: [github.com/cosmos/cosmos-sdk](https://github.com/cosmos/cosmos-sdk)
+- **Tutorials**: [tutorials.cosmos.network](https://tutorials.cosmos.network)

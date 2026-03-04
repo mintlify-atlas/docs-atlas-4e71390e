@@ -1,0 +1,379 @@
+---
+title: Creating a Cosmos SDK Application
+description: Learn how to build a blockchain application using the Cosmos SDK with real examples from SimApp
+---
+
+# Creating a Cosmos SDK Application
+
+This guide walks you through creating a new blockchain application using the Cosmos SDK. We'll use the reference implementation from `simapp` to demonstrate real-world patterns.
+
+## Application Structure
+
+A Cosmos SDK application is built around several core components:
+
+- **BaseApp**: The ABCI application implementation
+- **Codec**: Handles serialization and deserialization
+- **Module Manager**: Coordinates all modules
+- **Keepers**: Module-specific state management
+- **Store Keys**: Access to persistent storage
+
+## Basic Application Setup
+
+### Defining Your Application
+
+First, define your application structure. Here's the SimApp structure from `simapp/app.go:126-163`:
+
+```go
+type SimApp struct {
+    *baseapp.BaseApp
+    legacyAmino       *codec.LegacyAmino
+    appCodec          codec.Codec
+    txConfig          client.TxConfig
+    interfaceRegistry types.InterfaceRegistry
+
+    // keys to access the substores
+    keys map[string]*storetypes.KVStoreKey
+
+    // essential keepers
+    AccountKeeper         authkeeper.AccountKeeper
+    BankKeeper            bankkeeper.BaseKeeper
+    StakingKeeper         *stakingkeeper.Keeper
+    SlashingKeeper        slashingkeeper.Keeper
+    MintKeeper            mintkeeper.Keeper
+    DistrKeeper           distrkeeper.Keeper
+    GovKeeper             govkeeper.Keeper
+    UpgradeKeeper         *upgradekeeper.Keeper
+    EvidenceKeeper        evidencekeeper.Keeper
+    ConsensusParamsKeeper consensusparamkeeper.Keeper
+
+    // supplementary keepers
+    FeeGrantKeeper     feegrantkeeper.Keeper
+    AuthzKeeper        authzkeeper.Keeper
+    EpochsKeeper       *epochskeeper.Keeper
+    ProtocolPoolKeeper protocolpoolkeeper.Keeper
+
+    // the module manager
+    ModuleManager      *module.Manager
+    BasicModuleManager module.BasicManager
+
+    // simulation manager
+    sm *module.SimulationManager
+
+    // module configurator
+    configurator module.Configurator
+}
+```
+
+### Application Constructor
+
+The `NewSimApp` function initializes your application. Here's the essential setup from `simapp/app.go:174-242`:
+
+```go
+func NewSimApp(
+    logger log.Logger,
+    db dbm.DB,
+    traceStore io.Writer,
+    loadLatest bool,
+    appOpts servertypes.AppOptions,
+    baseAppOptions ...func(*baseapp.BaseApp),
+) *SimApp {
+    // Create interface registry for protobuf types
+    interfaceRegistry, _ := types.NewInterfaceRegistryWithOptions(
+        types.InterfaceRegistryOptions{
+            ProtoFiles: proto.HybridResolver,
+            SigningOptions: signing.Options{
+                AddressCodec: address.Bech32Codec{
+                    Bech32Prefix: sdk.GetConfig().GetBech32AccountAddrPrefix(),
+                },
+                ValidatorAddressCodec: address.Bech32Codec{
+                    Bech32Prefix: sdk.GetConfig().GetBech32ValidatorAddrPrefix(),
+                },
+            },
+        })
+    appCodec := codec.NewProtoCodec(interfaceRegistry)
+    legacyAmino := codec.NewLegacyAmino()
+    txConfig := authtx.NewTxConfig(appCodec, authtx.DefaultSignModes)
+
+    // Register standard types
+    std.RegisterLegacyAminoCodec(legacyAmino)
+    std.RegisterInterfaces(interfaceRegistry)
+
+    // Create BaseApp
+    bApp := baseapp.NewBaseApp(
+        appName, 
+        logger, 
+        db, 
+        txConfig.TxDecoder(), 
+        baseAppOptions...
+    )
+    bApp.SetCommitMultiStoreTracer(traceStore)
+    bApp.SetVersion(version.Version)
+    bApp.SetInterfaceRegistry(interfaceRegistry)
+    bApp.SetTxEncoder(txConfig.TxEncoder())
+
+    // ... continued below
+}
+```
+
+## Setting Up Store Keys
+
+Store keys provide access to different module stores. From `simapp/app.go:243-258`:
+
+```go
+keys := storetypes.NewKVStoreKeys(
+    authtypes.StoreKey,
+    banktypes.StoreKey,
+    stakingtypes.StoreKey,
+    minttypes.StoreKey,
+    distrtypes.StoreKey,
+    slashingtypes.StoreKey,
+    govtypes.StoreKey,
+    consensusparamtypes.StoreKey,
+    upgradetypes.StoreKey,
+    feegrant.StoreKey,
+    evidencetypes.StoreKey,
+    authzkeeper.StoreKey,
+    epochstypes.StoreKey,
+    protocolpooltypes.StoreKey,
+)
+```
+
+## Initializing Keepers
+
+Keepers manage module-specific state. Here's how to initialize them from `simapp/app.go:284-370`:
+
+```go
+// Account Keeper - manages accounts and addresses
+app.AccountKeeper = authkeeper.NewAccountKeeper(
+    appCodec,
+    runtime.NewKVStoreService(keys[authtypes.StoreKey]),
+    authtypes.ProtoBaseAccount,
+    maccPerms,  // module account permissions
+    authcodec.NewBech32Codec(sdk.Bech32MainPrefix),
+    sdk.Bech32MainPrefix,
+    authtypes.NewModuleAddress(govtypes.ModuleName).String(),
+)
+
+// Bank Keeper - manages token transfers
+app.BankKeeper = bankkeeper.NewBaseKeeper(
+    appCodec,
+    runtime.NewKVStoreService(keys[banktypes.StoreKey]),
+    app.AccountKeeper,
+    BlockedAddresses(),  // addresses that cannot receive funds
+    authtypes.NewModuleAddress(govtypes.ModuleName).String(),
+    logger,
+)
+
+// Staking Keeper - manages proof-of-stake
+app.StakingKeeper = stakingkeeper.NewKeeper(
+    appCodec,
+    runtime.NewKVStoreService(keys[stakingtypes.StoreKey]),
+    app.AccountKeeper,
+    app.BankKeeper,
+    authtypes.NewModuleAddress(govtypes.ModuleName).String(),
+    authcodec.NewBech32Codec(sdk.Bech32PrefixValAddr),
+    authcodec.NewBech32Codec(sdk.Bech32PrefixConsAddr),
+)
+```
+
+## Module Manager Setup
+
+The Module Manager coordinates all modules in your application. From `simapp/app.go:465-485`:
+
+```go
+app.ModuleManager = module.NewManager(
+    genutil.NewAppModule(
+        app.AccountKeeper, app.StakingKeeper, app,
+        txConfig,
+    ),
+    auth.NewAppModule(appCodec, app.AccountKeeper, authsims.RandomGenesisAccounts, nil),
+    vesting.NewAppModule(app.AccountKeeper, app.BankKeeper),
+    bank.NewAppModule(appCodec, app.BankKeeper, app.AccountKeeper, nil),
+    feegrantmodule.NewAppModule(appCodec, app.AccountKeeper, app.BankKeeper, app.FeeGrantKeeper, app.interfaceRegistry),
+    gov.NewAppModule(appCodec, &app.GovKeeper, app.AccountKeeper, app.BankKeeper, nil),
+    mint.NewAppModule(appCodec, app.MintKeeper, app.AccountKeeper, nil, nil),
+    slashing.NewAppModule(appCodec, app.SlashingKeeper, app.AccountKeeper, app.BankKeeper, app.StakingKeeper, nil, app.interfaceRegistry),
+    distr.NewAppModule(appCodec, app.DistrKeeper, app.AccountKeeper, app.BankKeeper, app.StakingKeeper, nil),
+    staking.NewAppModule(appCodec, app.StakingKeeper, app.AccountKeeper, app.BankKeeper, nil),
+    upgrade.NewAppModule(app.UpgradeKeeper, app.AccountKeeper.AddressCodec()),
+    evidence.NewAppModule(app.EvidenceKeeper),
+    authzmodule.NewAppModule(appCodec, app.AuthzKeeper, app.AccountKeeper, app.BankKeeper, app.interfaceRegistry),
+    consensus.NewAppModule(appCodec, app.ConsensusParamsKeeper),
+    epochs.NewAppModule(app.EpochsKeeper),
+    protocolpool.NewAppModule(app.ProtocolPoolKeeper, app.AccountKeeper, app.BankKeeper),
+)
+```
+
+## Module Execution Order
+
+Define the order in which modules execute during different phases. From `simapp/app.go:503-573`:
+
+```go
+// Pre-blockers run before BeginBlock
+app.ModuleManager.SetOrderPreBlockers(
+    upgradetypes.ModuleName,
+    authtypes.ModuleName,
+)
+
+// BeginBlockers run at the start of each block
+app.ModuleManager.SetOrderBeginBlockers(
+    minttypes.ModuleName,
+    distrtypes.ModuleName,
+    protocolpooltypes.ModuleName,
+    slashingtypes.ModuleName,
+    evidencetypes.ModuleName,
+    stakingtypes.ModuleName,
+    genutiltypes.ModuleName,
+    authz.ModuleName,
+    epochstypes.ModuleName,
+)
+
+// EndBlockers run at the end of each block
+app.ModuleManager.SetOrderEndBlockers(
+    banktypes.ModuleName,
+    govtypes.ModuleName,
+    stakingtypes.ModuleName,
+    genutiltypes.ModuleName,
+    feegrant.ModuleName,
+    protocolpooltypes.ModuleName,
+)
+
+// Genesis initialization order
+genesisModuleOrder := []string{
+    authtypes.ModuleName,
+    banktypes.ModuleName,
+    distrtypes.ModuleName,
+    stakingtypes.ModuleName,
+    slashingtypes.ModuleName,
+    govtypes.ModuleName,
+    minttypes.ModuleName,
+    genutiltypes.ModuleName,
+    evidencetypes.ModuleName,
+    authz.ModuleName,
+    feegrant.ModuleName,
+    upgradetypes.ModuleName,
+    vestingtypes.ModuleName,
+    consensusparamtypes.ModuleName,
+    epochstypes.ModuleName,
+    protocolpooltypes.ModuleName,
+}
+
+app.ModuleManager.SetOrderInitGenesis(genesisModuleOrder...)
+app.ModuleManager.SetOrderExportGenesis(exportModuleOrder...)
+```
+
+## ABCI Handlers
+
+Set up the ABCI lifecycle handlers from `simapp/app.go:614-618`:
+
+```go
+app.SetInitChainer(app.InitChainer)
+app.SetPreBlocker(app.PreBlocker)
+app.SetBeginBlocker(app.BeginBlocker)
+app.SetEndBlocker(app.EndBlocker)
+app.setAnteHandler(txConfig)
+```
+
+### Init Chainer
+
+The InitChainer runs when the chain first starts from `simapp/app.go:701-711`:
+
+```go
+func (app *SimApp) InitChainer(ctx sdk.Context, req *abci.RequestInitChain) (*abci.ResponseInitChain, error) {
+    var genesisState GenesisState
+    if err := json.Unmarshal(req.AppStateBytes, &genesisState); err != nil {
+        panic(err)
+    }
+    err := app.UpgradeKeeper.SetModuleVersionMap(ctx, app.ModuleManager.GetVersionMap())
+    if err != nil {
+        return nil, err
+    }
+    return app.ModuleManager.InitGenesis(ctx, app.appCodec, genesisState)
+}
+```
+
+### Block Lifecycle Handlers
+
+From `simapp/app.go:682-694`:
+
+```go
+// PreBlocker runs before BeginBlock
+func (app *SimApp) PreBlocker(ctx sdk.Context, _ *abci.RequestFinalizeBlock) (*sdk.ResponsePreBlock, error) {
+    return app.ModuleManager.PreBlock(ctx)
+}
+
+// BeginBlocker runs at the start of every block
+func (app *SimApp) BeginBlocker(ctx sdk.Context) (sdk.BeginBlock, error) {
+    return app.ModuleManager.BeginBlock(ctx)
+}
+
+// EndBlocker runs at the end of every block
+func (app *SimApp) EndBlocker(ctx sdk.Context) (sdk.EndBlock, error) {
+    return app.ModuleManager.EndBlock(ctx)
+}
+```
+
+## Ante Handler
+
+The ante handler runs before transaction execution from `simapp/app.go:644-665`:
+
+```go
+func (app *SimApp) setAnteHandler(txConfig client.TxConfig) {
+    anteHandler, err := ante.NewAnteHandler(
+        ante.HandlerOptions{
+            AccountKeeper:   app.AccountKeeper,
+            BankKeeper:      app.BankKeeper,
+            SignModeHandler: txConfig.SignModeHandler(),
+            FeegrantKeeper:  app.FeeGrantKeeper,
+            SigGasConsumer:  ante.DefaultSigVerificationGasConsumer,
+            SigVerifyOptions: []ante.SigVerificationDecoratorOption{
+                ante.WithUnorderedTxGasCost(ante.DefaultUnorderedTxGasCost),
+                ante.WithMaxUnorderedTxTimeoutDuration(ante.DefaultMaxTimeoutDuration),
+            },
+        },
+    )
+    if err != nil {
+        panic(err)
+    }
+
+    app.SetAnteHandler(anteHandler)
+}
+```
+
+## Module Account Permissions
+
+Define which module accounts can mint, burn, or stake tokens from `simapp/app.go:106-115`:
+
+```go
+maccPerms = map[string][]string{
+    authtypes.FeeCollectorName:                  nil,
+    distrtypes.ModuleName:                       nil,
+    minttypes.ModuleName:                        {authtypes.Minter},
+    stakingtypes.BondedPoolName:                 {authtypes.Burner, authtypes.Staking},
+    stakingtypes.NotBondedPoolName:              {authtypes.Burner, authtypes.Staking},
+    govtypes.ModuleName:                         {authtypes.Burner},
+    protocolpooltypes.ModuleName:                nil,
+    protocolpooltypes.ProtocolPoolEscrowAccount: nil,
+}
+```
+
+## Loading the Application
+
+Finally, load the application state from `simapp/app.go:635-639`:
+
+```go
+if loadLatest {
+    if err := app.LoadLatestVersion(); err != nil {
+        panic(fmt.Errorf("error loading last version: %w", err))
+    }
+}
+
+return app
+```
+
+## Next Steps
+
+- Learn about [Dependency Injection](/building/dependency-injection) for a declarative approach
+- Understand [Genesis Configuration](/building/genesis) for chain initialization
+- Explore [Testing Strategies](/building/testing) for your application
+- Implement [Simulation Testing](/building/simulation) for fuzzing and determinism

@@ -1,0 +1,431 @@
+---
+title: Evidence Module
+description: Submission and handling of blockchain misbehavior evidence
+---
+
+# Evidence Module (x/evidence)
+
+## Overview
+
+The `x/evidence` module allows for the submission and handling of arbitrary evidence of misbehavior, such as equivocation (double signing) and counterfactual signing. It differs from standard evidence handling by allowing clients and foreign chains to submit complex evidence directly.
+
+**Purpose**: Provide a flexible framework for detecting, submitting, and handling various types of validator misbehavior beyond what the consensus engine automatically detects.
+
+## Key Concepts
+
+### Evidence Types
+
+Two primary types of evidence are handled:
+
+1. **DuplicateVoteEvidence**: Validator signed two conflicting votes at same height/round
+2. **LightClientAttackEvidence**: Validator participated in light client attack
+
+Both are treated as **Equivocation** in the SDK.
+
+### Evidence Interface
+
+All evidence must implement:
+
+```go
+type Evidence interface {
+    proto.Message
+    
+    Route() string
+    String() string
+    Hash() []byte
+    ValidateBasic() error
+    GetHeight() int64  // Height of infraction
+}
+```
+
+### ValidatorEvidence Interface
+
+Extended interface for validator-specific evidence:
+
+```go
+type ValidatorEvidence interface {
+    Evidence
+    
+    GetConsensusAddress() sdk.ConsAddress
+    GetValidatorPower() int64
+    GetTotalPower() int64
+}
+```
+
+### Evidence Router
+
+Routes evidence to appropriate handler:
+
+```go
+type Router interface {
+    AddRoute(r string, h Handler) Router
+    HasRoute(r string) bool
+    GetRoute(path string) Handler
+    Seal()
+    Sealed() bool
+}
+```
+
+### Evidence Handler
+
+Executes business logic for evidence:
+
+```go
+type Handler func(context.Context, Evidence) error
+```
+
+## State
+
+### Evidence Storage
+
+Evidence is stored once validated:
+
+**Storage**: `0x00 | Hash -> ProtocolBuffer(Evidence)`
+
+### Genesis State
+
+```protobuf
+message GenesisState {
+    repeated google.protobuf.Any evidence = 1;
+}
+```
+
+## Messages
+
+### MsgSubmitEvidence
+
+Submit evidence of misbehavior:
+
+```protobuf
+message MsgSubmitEvidence {
+    string submitter = 1;
+    google.protobuf.Any evidence = 2;
+}
+```
+
+**Validation**:
+- Evidence must not already exist
+- Evidence must have registered handler
+- Evidence must pass `ValidateBasic()`
+- Evidence must be within evidence age limit
+
+**Usage**:
+```bash
+simd tx evidence submit [evidence-json] --from=mykey
+```
+
+## BeginBlock Evidence Handling
+
+CometBFT forwards evidence in `BeginBlock`:
+
+```go
+func BeginBlocker(ctx sdk.Context, req abci.RequestBeginBlock, k keeper.Keeper) {
+    for _, evidence := range req.ByzantineValidators {
+        var evidenceMsg exported.Evidence
+        
+        switch evidence.Type {
+        case abci.EvidenceType_DUPLICATE_VOTE:
+            evidenceMsg = &types.Equivocation{
+                Height:           evidence.Height,
+                Power:            evidence.Validator.Power,
+                Time:             evidence.Time,
+                ConsensusAddress: evidence.Validator.Address.String(),
+            }
+            
+        case abci.EvidenceType_LIGHT_CLIENT_ATTACK:
+            evidenceMsg = &types.Equivocation{
+                Height:           evidence.Height,
+                Power:            evidence.Validator.Power,
+                Time:             evidence.Time,
+                ConsensusAddress: evidence.Validator.Address.String(),
+            }
+        }
+        
+        // Handle evidence
+        if evidenceMsg != nil {
+            if err := k.HandleEquivocationEvidence(ctx, evidenceMsg); err != nil {
+                ctx.Logger().Error("failed to handle evidence", "err", err)
+            }
+        }
+    }
+}
+```
+
+### Equivocation Handling
+
+When equivocation is detected:
+
+```go
+func HandleEquivocationEvidence(
+    ctx sdk.Context,
+    evidence *types.Equivocation,
+) error {
+    consAddr := evidence.GetConsensusAddress()
+    
+    // Check if evidence is too old
+    params := k.GetParams(ctx)
+    blockTime := ctx.BlockTime()
+    age := blockTime.Sub(evidence.GetTime())
+    
+    if age > params.MaxEvidenceAge {
+        return fmt.Errorf("evidence is too old")
+    }
+    
+    // Get validator
+    validator := k.stakingKeeper.ValidatorByConsAddr(ctx, consAddr)
+    if validator == nil {
+        return fmt.Errorf("validator not found")
+    }
+    
+    // Check if already tombstoned
+    if k.slashingKeeper.IsTombstoned(ctx, consAddr) {
+        return fmt.Errorf("validator already tombstoned")
+    }
+    
+    // Slash validator
+    slashFraction := k.slashingKeeper.SlashFractionDoubleSign(ctx)
+    k.slashingKeeper.SlashWithInfractionReason(
+        ctx,
+        consAddr,
+        evidence.GetHeight(),
+        evidence.GetValidatorPower(),
+        slashFraction,
+        stakingtypes.Infraction_INFRACTION_DOUBLE_SIGN,
+    )
+    
+    // Jail permanently
+    k.slashingKeeper.Jail(ctx, consAddr)
+    
+    // Tombstone
+    k.slashingKeeper.JailUntil(ctx, consAddr, types.DoubleSignJailEndTime)
+    k.slashingKeeper.Tombstone(ctx, consAddr)
+    
+    // Store evidence
+    k.SetEvidence(ctx, evidence)
+    
+    return nil
+}
+```
+
+### Evidence Age Validation
+
+```
+Evidence.Timestamp >= block.Timestamp - MaxEvidenceAge
+```
+
+Where:
+- `Evidence.Timestamp`: Block time at infraction height
+- `block.Timestamp`: Current block time
+- `MaxEvidenceAge`: From x/slashing parameters
+
+## Queries
+
+### Query Evidence
+
+Get evidence by hash:
+
+```bash
+simd query evidence evidence [hash]
+```
+
+Example:
+```bash
+simd query evidence evidence DF0C23E8634E480F84B9D5674A7CDC9816466DEC28A3358F73260F68D28D7660
+```
+
+Example output:
+```yaml
+evidence:
+  consensus_address: cosmosvalcons1...
+  height: "11"
+  power: "100"
+  time: "2021-10-20T16:08:38.194017624Z"
+```
+
+### Query All Evidence
+
+```bash
+simd query evidence list
+```
+
+## gRPC Endpoints
+
+### Evidence
+
+```bash
+grpcurl -plaintext \
+    -d '{"evidence_hash":"DF0C23E8..."}' \
+    localhost:9090 \
+    cosmos.evidence.v1beta1.Query/Evidence
+```
+
+### AllEvidence
+
+```bash
+grpcurl -plaintext \
+    localhost:9090 \
+    cosmos.evidence.v1beta1.Query/AllEvidence
+```
+
+## Events
+
+### MsgSubmitEvidence
+
+| Type | Attribute Key | Attribute Value |
+|------|---------------|----------------|
+| submit_evidence | evidence_hash | {evidenceHash} |
+| message | module | evidence |
+| message | sender | {senderAddress} |
+| message | action | submit_evidence |
+
+## Code Examples
+
+### Submit Evidence
+
+```go
+// Create equivocation evidence
+evidence := &types.Equivocation{
+    Height:           100,
+    Time:             time.Now(),
+    Power:            1000,
+    ConsensusAddress: "cosmosvalcons1...",
+}
+
+// Submit evidence
+msg := types.NewMsgSubmitEvidence(submitter, evidence)
+_, err := msgServer.SubmitEvidence(ctx, msg)
+if err != nil {
+    return err
+}
+```
+
+### Query Evidence
+
+```go
+// Query evidence by hash
+hash := evidence.Hash()
+evidence, found := evidenceKeeper.GetEvidence(ctx, hash)
+if !found {
+    return fmt.Errorf("evidence not found")
+}
+
+fmt.Printf("Evidence height: %d\n", evidence.GetHeight())
+```
+
+### Custom Evidence Type
+
+```go
+// Define custom evidence
+type CustomEvidence struct {
+    Height      int64
+    Validator   string
+    CustomField string
+}
+
+func (e *CustomEvidence) Route() string { return "custom" }
+func (e *CustomEvidence) String() string { return "custom evidence" }
+func (e *CustomEvidence) Hash() []byte {
+    bz, _ := json.Marshal(e)
+    return tmhash.Sum(bz)
+}
+func (e *CustomEvidence) ValidateBasic() error {
+    if e.Height <= 0 {
+        return fmt.Errorf("invalid height")
+    }
+    return nil
+}
+func (e *CustomEvidence) GetHeight() int64 { return e.Height }
+
+// Register handler
+func CustomEvidenceHandler(ctx sdk.Context, e exported.Evidence) error {
+    evidence := e.(*CustomEvidence)
+    // Handle custom evidence
+    return nil
+}
+
+// Add route
+evidenceRouter := types.NewRouter()
+evidenceRouter.AddRoute("custom", CustomEvidenceHandler)
+evidenceKeeper := keeper.NewKeeper(
+    cdc,
+    storeKey,
+    stakingKeeper,
+    slashingKeeper,
+)
+evidenceKeeper.SetRouter(evidenceRouter)
+```
+
+### Iterate Evidence
+
+```go
+// Iterate all evidence
+evidenceKeeper.IterateEvidence(ctx, func(evidence exported.Evidence) bool {
+    fmt.Printf("Evidence: height=%d, hash=%X\n", 
+        evidence.GetHeight(),
+        evidence.Hash(),
+    )
+    return false // continue iteration
+})
+```
+
+## REST Endpoints
+
+### Evidence
+
+```bash
+curl "http://localhost:1317/cosmos/evidence/v1beta1/evidence/{hash}"
+```
+
+### All Evidence
+
+```bash
+curl "http://localhost:1317/cosmos/evidence/v1beta1/evidence"
+```
+
+## CLI Commands Reference
+
+| Command | Description |
+|---------|-------------|
+| `simd query evidence evidence [hash]` | Query evidence by hash |
+| `simd query evidence list` | Query all evidence |
+| `simd tx evidence submit [evidence-json]` | Submit evidence |
+
+## Integration Guide
+
+```go
+// Initialize evidence keeper
+app.EvidenceKeeper = evidencekeeper.NewKeeper(
+    appCodec,
+    runtime.NewKVStoreService(keys[evidencetypes.StoreKey]),
+    app.StakingKeeper,
+    app.SlashingKeeper,
+)
+
+// Set evidence router
+evidenceRouter := evidencetypes.NewRouter()
+// Add custom evidence handlers here
+evidenceRouter.Seal()
+app.EvidenceKeeper.SetRouter(evidenceRouter)
+
+// Register module
+app.ModuleManager = module.NewManager(
+    evidence.NewAppModule(app.EvidenceKeeper),
+    // other modules...
+)
+```
+
+## Security Considerations
+
+1. **Evidence Validation**: Always validate evidence thoroughly
+2. **Age Limits**: Enforce evidence age limits to prevent old attacks
+3. **Duplicate Detection**: Check for duplicate evidence submission
+4. **Handler Registration**: Only register trusted evidence handlers
+5. **Slashing Coordination**: Ensure proper coordination with slashing module
+
+## Best Practices
+
+1. **Monitor Evidence**: Set up alerts for evidence submission
+2. **Rapid Response**: Handle evidence quickly to maintain security
+3. **Document Handlers**: Clearly document custom evidence types
+4. **Test Thoroughly**: Test evidence handling on testnets
+5. **Backup Nodes**: Run monitoring nodes to detect misbehavior

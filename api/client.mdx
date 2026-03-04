@@ -1,0 +1,456 @@
+---
+title: Client
+description: Client context for building and broadcasting transactions
+---
+
+## Overview
+
+The client package provides tools for building, signing, and broadcasting transactions, as well as querying blockchain state. It's used by CLI commands, REST servers, and client applications.
+
+## Core Types
+
+### Context
+
+```go
+type Context struct {
+    FromAddress           sdk.AccAddress
+    Client                CometRPC
+    GRPCClient            *grpc.ClientConn
+    GRPCConnProvider      *GRPCConnProvider
+    ChainID               string
+    Codec                 codec.Codec
+    InterfaceRegistry     codectypes.InterfaceRegistry
+    Input                 io.Reader
+    Keyring               keyring.Keyring
+    KeyringOptions        []keyring.Option
+    KeyringDir            string
+    KeyringDefaultKeyName string
+    Output                io.Writer
+    OutputFormat          string
+    Height                int64
+    HomeDir               string
+    From                  string
+    BroadcastMode         string
+    FromName              string
+    SignModeStr           string
+    UseLedger             bool
+    Simulate              bool
+    GenerateOnly          bool
+    Offline               bool
+    SkipConfirm           bool
+    TxConfig              TxConfig
+    AccountRetriever      AccountRetriever
+    NodeURI               string
+    FeePayer              sdk.AccAddress
+    FeeGranter            sdk.AccAddress
+    Viper                 *viper.Viper
+    LedgerHasProtobuf     bool
+    PreprocessTxHook      PreprocessTxFn
+    IsAux                 bool
+    LegacyAmino           *codec.LegacyAmino
+    CmdContext            context.Context
+}
+```
+
+**Location:** `client/context.go:29-72`
+
+Context implements a typical context for transaction handling and queries.
+
+### Context Builder Methods
+
+```go
+// Configuration
+func (ctx Context) WithCodec(m codec.Codec) Context
+func (ctx Context) WithChainID(chainID string) Context
+func (ctx Context) WithHeight(height int64) Context
+func (ctx Context) WithNodeURI(nodeURI string) Context
+func (ctx Context) WithClient(client CometRPC) Context
+func (ctx Context) WithGRPCClient(grpcClient *grpc.ClientConn) Context
+
+// Keyring
+func (ctx Context) WithKeyring(k keyring.Keyring) Context
+func (ctx Context) WithKeyringDir(dir string) Context
+func (ctx Context) WithFrom(from string) Context
+
+// Transaction options
+func (ctx Context) WithBroadcastMode(mode string) Context
+func (ctx Context) WithSimulation(simulate bool) Context
+func (ctx Context) WithGenerateOnly(generateOnly bool) Context
+func (ctx Context) WithOffline(offline bool) Context
+func (ctx Context) WithSkipConfirmation(skip bool) Context
+
+// Output
+func (ctx Context) WithOutput(w io.Writer) Context
+func (ctx Context) WithOutputFormat(format string) Context
+```
+
+**Location:** `client/context.go:74-200`
+
+## Transaction Building
+
+### TxBuilder
+
+```go
+type TxBuilder interface {
+    GetTx() signing.Tx
+    
+    SetMsgs(msgs ...sdk.Msg) error
+    SetSignatures(signatures ...signingtypes.SignatureV2) error
+    SetMemo(memo string)
+    SetFeeAmount(amount sdk.Coins)
+    SetGasLimit(limit uint64)
+    SetTimeoutHeight(height uint64)
+    SetFeeGranter(feeGranter sdk.AccAddress)
+    SetFeePayer(feePayer sdk.AccAddress)
+    
+    AddAuxSignerData(data tx.AuxSignerData) error
+}
+```
+
+Builds unsigned transactions.
+
+### TxConfig
+
+```go
+type TxConfig interface {
+    TxEncoder() sdk.TxEncoder
+    TxDecoder() sdk.TxDecoder
+    TxJSONEncoder() sdk.TxEncoder
+    TxJSONDecoder() sdk.TxDecoder
+    
+    MarshalSignatureJSON([]signingtypes.SignatureV2) ([]byte, error)
+    UnmarshalSignatureJSON([]byte) ([]signingtypes.SignatureV2, error)
+    
+    NewTxBuilder() TxBuilder
+    
+    SignModeHandler() signing.SignModeHandler
+}
+```
+
+Provides transaction encoding/decoding and builder creation.
+
+## Usage Examples
+
+### Creating a Client Context
+
+```go
+import (
+    "github.com/cosmos/cosmos-sdk/client"
+    "github.com/cosmos/cosmos-sdk/client/flags"
+    "github.com/cosmos/cosmos-sdk/crypto/keyring"
+)
+
+func NewClientContext() (client.Context, error) {
+    // Create keyring
+    kr, err := keyring.New(
+        "myapp",
+        keyring.BackendTest,
+        homeDir,
+        nil,
+    )
+    if err != nil {
+        return client.Context{}, err
+    }
+    
+    // Create context
+    clientCtx := client.Context{}.
+        WithCodec(cdc).
+        WithInterfaceRegistry(interfaceRegistry).
+        WithTxConfig(txConfig).
+        WithLegacyAmino(amino).
+        WithInput(os.Stdin).
+        WithOutput(os.Stdout).
+        WithAccountRetriever(types.AccountRetriever{}).
+        WithBroadcastMode(flags.BroadcastSync).
+        WithHomeDir(homeDir).
+        WithKeyring(kr).
+        WithChainID("mychain-1").
+        WithNodeURI("http://localhost:26657")
+    
+    // Initialize RPC client
+    rpcClient, err := client.NewClientFromNode(clientCtx.NodeURI)
+    if err != nil {
+        return client.Context{}, err
+    }
+    clientCtx = clientCtx.WithClient(rpcClient)
+    
+    return clientCtx, nil
+}
+```
+
+### Building and Signing a Transaction
+
+```go
+func SendTokens(
+    clientCtx client.Context,
+    from sdk.AccAddress,
+    to sdk.AccAddress,
+    amount sdk.Coins,
+) error {
+    // Create message
+    msg := banktypes.NewMsgSend(from, to, amount)
+    
+    // Validate message
+    if err := msg.ValidateBasic(); err != nil {
+        return err
+    }
+    
+    // Create transaction builder
+    txBuilder := clientCtx.TxConfig.NewTxBuilder()
+    
+    // Set messages
+    if err := txBuilder.SetMsgs(msg); err != nil {
+        return err
+    }
+    
+    // Set gas and fees
+    txBuilder.SetGasLimit(200000)
+    txBuilder.SetFeeAmount(sdk.NewCoins(sdk.NewInt64Coin("stake", 1000)))
+    
+    // Set memo
+    txBuilder.SetMemo("token transfer")
+    
+    // Get account info for sequence
+    account, err := clientCtx.AccountRetriever.GetAccount(clientCtx, from)
+    if err != nil {
+        return err
+    }
+    
+    // Sign transaction
+    signerData := signing.SignerData{
+        ChainID:       clientCtx.ChainID,
+        AccountNumber: account.GetAccountNumber(),
+        Sequence:      account.GetSequence(),
+    }
+    
+    sigData, err := signing.SignWithPrivKey(
+        clientCtx.TxConfig.SignModeHandler().DefaultMode(),
+        signerData,
+        txBuilder,
+        privKey,
+        clientCtx.TxConfig,
+        account.GetSequence(),
+    )
+    if err != nil {
+        return err
+    }
+    
+    // Set signature
+    sig := signing.SignatureV2{
+        PubKey: privKey.PubKey(),
+        Data:   sigData,
+        Sequence: account.GetSequence(),
+    }
+    
+    if err := txBuilder.SetSignatures(sig); err != nil {
+        return err
+    }
+    
+    // Encode transaction
+    txBytes, err := clientCtx.TxConfig.TxEncoder()(txBuilder.GetTx())
+    if err != nil {
+        return err
+    }
+    
+    // Broadcast transaction
+    res, err := clientCtx.BroadcastTx(txBytes)
+    if err != nil {
+        return err
+    }
+    
+    // Print result
+    return clientCtx.PrintProto(res)
+}
+```
+
+### Broadcasting Transactions
+
+```go
+import (
+    "github.com/cosmos/cosmos-sdk/client"
+    sdk "github.com/cosmos/cosmos-sdk/types"
+)
+
+// Broadcast modes
+const (
+    BroadcastSync  = "sync"  // Returns after CheckTx
+    BroadcastAsync = "async" // Returns immediately
+    BroadcastBlock = "block" // Deprecated: waits for block inclusion
+)
+
+func BroadcastTx(clientCtx client.Context, txBytes []byte) (*sdk.TxResponse, error) {
+    switch clientCtx.BroadcastMode {
+    case flags.BroadcastSync:
+        return clientCtx.BroadcastTxSync(txBytes)
+    case flags.BroadcastAsync:
+        return clientCtx.BroadcastTxAsync(txBytes)
+    default:
+        return clientCtx.BroadcastTxCommit(txBytes) // deprecated
+    }
+}
+```
+
+### Querying State via gRPC
+
+```go
+import (
+    banktypes "github.com/cosmos/cosmos-sdk/x/bank/types"
+)
+
+func QueryBalance(
+    clientCtx client.Context,
+    address sdk.AccAddress,
+    denom string,
+) (*sdk.Coin, error) {
+    // Create query client
+    queryClient := banktypes.NewQueryClient(clientCtx)
+    
+    // Query balance
+    res, err := queryClient.Balance(
+        context.Background(),
+        &banktypes.QueryBalanceRequest{
+            Address: address.String(),
+            Denom:   denom,
+        },
+    )
+    if err != nil {
+        return nil, err
+    }
+    
+    return res.Balance, nil
+}
+
+func QueryAllBalances(
+    clientCtx client.Context,
+    address sdk.AccAddress,
+) (sdk.Coins, error) {
+    queryClient := banktypes.NewQueryClient(clientCtx)
+    
+    res, err := queryClient.AllBalances(
+        context.Background(),
+        &banktypes.QueryAllBalancesRequest{
+            Address: address.String(),
+        },
+    )
+    if err != nil {
+        return nil, err
+    }
+    
+    return res.Balances, nil
+}
+```
+
+### Using in CLI Commands
+
+```go
+import (
+    "github.com/spf13/cobra"
+    "github.com/cosmos/cosmos-sdk/client"
+    "github.com/cosmos/cosmos-sdk/client/flags"
+    "github.com/cosmos/cosmos-sdk/client/tx"
+)
+
+func NewSendTxCmd() *cobra.Command {
+    cmd := &cobra.Command{
+        Use:   "send [to_address] [amount]",
+        Short: "Send funds from one account to another",
+        Args:  cobra.ExactArgs(2),
+        RunE: func(cmd *cobra.Command, args []string) error {
+            clientCtx, err := client.GetClientTxContext(cmd)
+            if err != nil {
+                return err
+            }
+            
+            toAddr, err := sdk.AccAddressFromBech32(args[0])
+            if err != nil {
+                return err
+            }
+            
+            coins, err := sdk.ParseCoinsNormalized(args[1])
+            if err != nil {
+                return err
+            }
+            
+            msg := banktypes.NewMsgSend(
+                clientCtx.GetFromAddress(),
+                toAddr,
+                coins,
+            )
+            
+            return tx.GenerateOrBroadcastTxCLI(clientCtx, cmd.Flags(), msg)
+        },
+    }
+    
+    flags.AddTxFlagsToCmd(cmd)
+    return cmd
+}
+```
+
+### Account Retrieval
+
+```go
+import authtypes "github.com/cosmos/cosmos-sdk/x/auth/types"
+
+func GetAccount(
+    clientCtx client.Context,
+    addr sdk.AccAddress,
+) (client.Account, error) {
+    queryClient := authtypes.NewQueryClient(clientCtx)
+    
+    res, err := queryClient.Account(
+        context.Background(),
+        &authtypes.QueryAccountRequest{
+            Address: addr.String(),
+        },
+    )
+    if err != nil {
+        return nil, err
+    }
+    
+    var account authtypes.AccountI
+    if err := clientCtx.InterfaceRegistry.UnpackAny(res.Account, &account); err != nil {
+        return nil, err
+    }
+    
+    return account, nil
+}
+```
+
+## Keyring Management
+
+```go
+import "github.com/cosmos/cosmos-sdk/crypto/keyring"
+
+// Create keyring
+kr, err := keyring.New(
+    "myapp",
+    keyring.BackendTest, // or BackendOS, BackendFile
+    homeDir,
+    os.Stdin,
+)
+
+// Create new key
+info, mnemonic, err := kr.NewMnemonic(
+    "mykey",
+    keyring.English,
+    sdk.FullFundraiserPath,
+    keyring.DefaultBIP39Passphrase,
+    hd.Secp256k1,
+)
+
+// Get key
+info, err := kr.Key("mykey")
+
+// List keys
+keys, err := kr.List()
+
+// Sign with key
+sig, pubKey, err := kr.Sign("mykey", msg)
+```
+
+## Related APIs
+
+- [BaseApp](/api/baseapp) - Server-side application
+- [gRPC](/api/grpc) - gRPC query services
+- [REST](/api/rest) - REST API server
+- [Types](/api/types) - Core types like Msg and Coin

@@ -1,0 +1,541 @@
+---
+title: gRPC
+description: gRPC server setup and query service implementation
+---
+
+## Overview
+
+Cosmos SDK provides built-in gRPC server support for querying blockchain state and broadcasting transactions. Modules register gRPC query services that clients can invoke remotely.
+
+## Server Setup
+
+### Starting gRPC Server
+
+```go
+import (
+    "github.com/cosmos/cosmos-sdk/server/grpc"
+    "github.com/cosmos/cosmos-sdk/server/config"
+)
+
+// Server configuration
+type Config struct {
+    Enable  bool   `mapstructure:"enable"`
+    Address string `mapstructure:"address"`
+}
+
+// Default configuration
+func DefaultConfig() *Config {
+    return &Config{
+        Enable:  true,
+        Address: "0.0.0.0:9090",
+    }
+}
+```
+
+**Location:** `server/config/config.go`
+
+### Starting the Server in Application
+
+```go
+import (
+    "github.com/cosmos/cosmos-sdk/server"
+    servergrpc "github.com/cosmos/cosmos-sdk/server/grpc"
+)
+
+func (app *App) RegisterGRPCServer(grpcSrv *grpc.Server) {
+    // Register query services from all modules
+    app.ModuleManager.RegisterGRPCGatewayRoutes(clientCtx, grpcSrv)
+}
+
+// Start gRPC server
+func startGRPCServer(
+    ctx *server.Context,
+    app servertypes.Application,
+    grpcAddr string,
+) (*grpc.Server, error) {
+    grpcSrv := grpc.NewServer()
+    
+    // Register application gRPC services
+    app.RegisterGRPCServer(grpcSrv)
+    
+    // Start listening
+    listener, err := net.Listen("tcp", grpcAddr)
+    if err != nil {
+        return nil, err
+    }
+    
+    go func() {
+        if err := grpcSrv.Serve(listener); err != nil {
+            ctx.Logger.Error("failed to serve gRPC", "error", err)
+        }
+    }()
+    
+    return grpcSrv, nil
+}
+```
+
+**Location:** `server/start.go`
+
+## Query Services
+
+### GRPCQueryRouter
+
+```go
+type GRPCQueryRouter struct {
+    routes          map[string]GRPCQueryHandler
+    interfaceRegistry codectypes.InterfaceRegistry
+}
+
+func NewGRPCQueryRouter() *GRPCQueryRouter {
+    return &GRPCQueryRouter{
+        routes: map[string]GRPCQueryHandler{},
+    }
+}
+
+// RegisterService registers gRPC query service
+func (qrt *GRPCQueryRouter) RegisterService(sd *grpc.ServiceDesc, handler interface{})
+```
+
+**Location:** `baseapp/grpc_query_router.go`
+
+### Defining Query Services
+
+Query services are defined in protobuf:
+
+```protobuf
+// x/bank/types/query.proto
+syntax = "proto3";
+package cosmos.bank.v1beta1;
+
+import "cosmos/base/query/v1beta1/pagination.proto";
+import "cosmos/base/v1beta1/coin.proto";
+
+service Query {
+  // Balance queries the balance of a single coin for a single account
+  rpc Balance(QueryBalanceRequest) returns (QueryBalanceResponse) {
+    option (google.api.http).get = "/cosmos/bank/v1beta1/balances/{address}/by_denom";
+  }
+  
+  // AllBalances queries the balance of all coins for a single account
+  rpc AllBalances(QueryAllBalancesRequest) returns (QueryAllBalancesResponse) {
+    option (google.api.http).get = "/cosmos/bank/v1beta1/balances/{address}";
+  }
+  
+  // TotalSupply queries the total supply of all coins
+  rpc TotalSupply(QueryTotalSupplyRequest) returns (QueryTotalSupplyResponse) {
+    option (google.api.http).get = "/cosmos/bank/v1beta1/supply";
+  }
+}
+
+message QueryBalanceRequest {
+  string address = 1;
+  string denom = 2;
+}
+
+message QueryBalanceResponse {
+  cosmos.base.v1beta1.Coin balance = 1;
+}
+```
+
+### Implementing Query Servers
+
+```go
+package keeper
+
+import (
+    "context"
+    
+    "google.golang.org/grpc/codes"
+    "google.golang.org/grpc/status"
+    
+    sdk "github.com/cosmos/cosmos-sdk/types"
+    "github.com/cosmos/cosmos-sdk/x/bank/types"
+)
+
+var _ types.QueryServer = BaseKeeper{}
+
+// Balance implements the Query/Balance gRPC method
+func (k BaseKeeper) Balance(
+    ctx context.Context,
+    req *types.QueryBalanceRequest,
+) (*types.QueryBalanceResponse, error) {
+    if req == nil {
+        return nil, status.Error(codes.InvalidArgument, "empty request")
+    }
+    
+    if req.Address == "" {
+        return nil, status.Error(codes.InvalidArgument, "address cannot be empty")
+    }
+    
+    if err := sdk.ValidateDenom(req.Denom); err != nil {
+        return nil, status.Error(codes.InvalidArgument, err.Error())
+    }
+    
+    sdkCtx := sdk.UnwrapSDKContext(ctx)
+    address, err := sdk.AccAddressFromBech32(req.Address)
+    if err != nil {
+        return nil, status.Errorf(codes.InvalidArgument, "invalid address: %s", err)
+    }
+    
+    balance := k.GetBalance(sdkCtx, address, req.Denom)
+    
+    return &types.QueryBalanceResponse{Balance: &balance}, nil
+}
+
+// AllBalances implements the Query/AllBalances gRPC method
+func (k BaseKeeper) AllBalances(
+    ctx context.Context,
+    req *types.QueryAllBalancesRequest,
+) (*types.QueryAllBalancesResponse, error) {
+    if req == nil {
+        return nil, status.Error(codes.InvalidArgument, "empty request")
+    }
+    
+    addr, err := sdk.AccAddressFromBech32(req.Address)
+    if err != nil {
+        return nil, status.Errorf(codes.InvalidArgument, "invalid address: %s", err)
+    }
+    
+    sdkCtx := sdk.UnwrapSDKContext(ctx)
+    
+    balances := sdk.NewCoins()
+    accountStore := k.getAccountStore(sdkCtx, addr)
+    
+    pageRes, err := query.Paginate(
+        accountStore,
+        req.Pagination,
+        func(key []byte, value []byte) error {
+            var balance sdk.Coin
+            if err := k.cdc.Unmarshal(value, &balance); err != nil {
+                return err
+            }
+            balances = append(balances, balance)
+            return nil
+        },
+    )
+    if err != nil {
+        return nil, status.Error(codes.Internal, err.Error())
+    }
+    
+    return &types.QueryAllBalancesResponse{
+        Balances:   balances,
+        Pagination: pageRes,
+    }, nil
+}
+```
+
+**Location:** `x/bank/keeper/grpc_query.go`
+
+### Registering Query Services
+
+```go
+package bank
+
+import (
+    "github.com/cosmos/cosmos-sdk/types/module"
+    "github.com/cosmos/cosmos-sdk/x/bank/keeper"
+    "github.com/cosmos/cosmos-sdk/x/bank/types"
+)
+
+type AppModule struct {
+    keeper keeper.Keeper
+}
+
+// RegisterServices registers module services
+func (am AppModule) RegisterServices(cfg module.Configurator) {
+    // Register query server
+    types.RegisterQueryServer(cfg.QueryServer(), am.keeper)
+    
+    // Register msg server
+    types.RegisterMsgServer(cfg.MsgServer(), keeper.NewMsgServerImpl(am.keeper))
+}
+```
+
+## Client Usage
+
+### Creating gRPC Client
+
+```go
+import (
+    "context"
+    "google.golang.org/grpc"
+    "google.golang.org/grpc/credentials/insecure"
+    
+    banktypes "github.com/cosmos/cosmos-sdk/x/bank/types"
+)
+
+// Connect to gRPC server
+func NewGRPCClient(grpcAddr string) (*grpc.ClientConn, error) {
+    return grpc.Dial(
+        grpcAddr,
+        grpc.WithTransportCredentials(insecure.NewCredentials()),
+    )
+}
+
+// Query balance
+func QueryBalance(
+    grpcConn *grpc.ClientConn,
+    address string,
+    denom string,
+) (*sdk.Coin, error) {
+    queryClient := banktypes.NewQueryClient(grpcConn)
+    
+    res, err := queryClient.Balance(
+        context.Background(),
+        &banktypes.QueryBalanceRequest{
+            Address: address,
+            Denom:   denom,
+        },
+    )
+    if err != nil {
+        return nil, err
+    }
+    
+    return res.Balance, nil
+}
+```
+
+### Using with Client Context
+
+```go
+import (
+    "github.com/cosmos/cosmos-sdk/client"
+    banktypes "github.com/cosmos/cosmos-sdk/x/bank/types"
+)
+
+func QueryWithClientContext(
+    clientCtx client.Context,
+    address sdk.AccAddress,
+) (sdk.Coins, error) {
+    queryClient := banktypes.NewQueryClient(clientCtx)
+    
+    res, err := queryClient.AllBalances(
+        context.Background(),
+        &banktypes.QueryAllBalancesRequest{
+            Address: address.String(),
+        },
+    )
+    if err != nil {
+        return nil, err
+    }
+    
+    return res.Balances, nil
+}
+```
+
+## Pagination
+
+### Using Pagination in Queries
+
+```go
+import (
+    "github.com/cosmos/cosmos-sdk/types/query"
+)
+
+func QueryWithPagination(
+    queryClient banktypes.QueryClient,
+    address string,
+) (sdk.Coins, error) {
+    var allBalances sdk.Coins
+    var nextKey []byte
+    
+    for {
+        res, err := queryClient.AllBalances(
+            context.Background(),
+            &banktypes.QueryAllBalancesRequest{
+                Address: address,
+                Pagination: &query.PageRequest{
+                    Key:   nextKey,
+                    Limit: 100,
+                },
+            },
+        )
+        if err != nil {
+            return nil, err
+        }
+        
+        allBalances = append(allBalances, res.Balances...)
+        
+        if res.Pagination == nil || res.Pagination.NextKey == nil {
+            break
+        }
+        nextKey = res.Pagination.NextKey
+    }
+    
+    return allBalances, nil
+}
+```
+
+### Implementing Pagination in Server
+
+```go
+import (
+    "cosmossdk.io/store/prefix"
+    "github.com/cosmos/cosmos-sdk/types/query"
+)
+
+func (k Keeper) ListItems(
+    ctx context.Context,
+    req *types.QueryListRequest,
+) (*types.QueryListResponse, error) {
+    sdkCtx := sdk.UnwrapSDKContext(ctx)
+    store := prefix.NewStore(sdkCtx.KVStore(k.storeKey), types.ItemPrefix)
+    
+    var items []types.Item
+    pageRes, err := query.Paginate(
+        store,
+        req.Pagination,
+        func(key []byte, value []byte) error {
+            var item types.Item
+            if err := k.cdc.Unmarshal(value, &item); err != nil {
+                return err
+            }
+            items = append(items, item)
+            return nil
+        },
+    )
+    if err != nil {
+        return nil, status.Error(codes.Internal, err.Error())
+    }
+    
+    return &types.QueryListResponse{
+        Items:      items,
+        Pagination: pageRes,
+    }, nil
+}
+```
+
+## Interceptors and Middleware
+
+### Adding gRPC Interceptors
+
+```go
+import (
+    "google.golang.org/grpc"
+)
+
+// Custom interceptor
+func loggingInterceptor(
+    ctx context.Context,
+    req interface{},
+    info *grpc.UnaryServerInfo,
+    handler grpc.UnaryHandler,
+) (interface{}, error) {
+    log.Printf("gRPC method: %s", info.FullMethod)
+    return handler(ctx, req)
+}
+
+// Create server with interceptors
+func newGRPCServer() *grpc.Server {
+    return grpc.NewServer(
+        grpc.UnaryInterceptor(loggingInterceptor),
+    )
+}
+```
+
+## Best Practices
+
+### Error Handling
+
+```go
+import (
+    "google.golang.org/grpc/codes"
+    "google.golang.org/grpc/status"
+)
+
+func (k Keeper) GetItem(
+    ctx context.Context,
+    req *types.QueryGetRequest,
+) (*types.QueryGetResponse, error) {
+    // Validate request
+    if req == nil {
+        return nil, status.Error(codes.InvalidArgument, "empty request")
+    }
+    
+    if req.Id == 0 {
+        return nil, status.Error(codes.InvalidArgument, "id cannot be zero")
+    }
+    
+    // Query item
+    sdkCtx := sdk.UnwrapSDKContext(ctx)
+    item, found := k.GetItem(sdkCtx, req.Id)
+    if !found {
+        return nil, status.Errorf(codes.NotFound, "item %d not found", req.Id)
+    }
+    
+    return &types.QueryGetResponse{Item: &item}, nil
+}
+```
+
+### Context Unwrapping
+
+```go
+// Always unwrap SDK context from gRPC context
+func (k Keeper) QueryMethod(
+    ctx context.Context,
+    req *types.QueryRequest,
+) (*types.QueryResponse, error) {
+    sdkCtx := sdk.UnwrapSDKContext(ctx)
+    
+    // Use sdkCtx for accessing stores and other SDK features
+    store := sdkCtx.KVStore(k.storeKey)
+    // ...
+}
+```
+
+## Testing gRPC Services
+
+```go
+import (
+    "testing"
+    "github.com/stretchr/testify/suite"
+    
+    "github.com/cosmos/cosmos-sdk/testutil/network"
+)
+
+type GRPCQueryTestSuite struct {
+    suite.Suite
+    
+    cfg     network.Config
+    network *network.Network
+}
+
+func (s *GRPCQueryTestSuite) SetupSuite() {
+    s.T().Log("setting up integration test suite")
+    
+    cfg := network.DefaultConfig()
+    s.cfg = cfg
+    s.network = network.New(s.T(), cfg)
+    
+    s.Require().NotNil(s.network)
+}
+
+func (s *GRPCQueryTestSuite) TestQueryBalance() {
+    val := s.network.Validators[0]
+    clientCtx := val.ClientCtx
+    
+    queryClient := banktypes.NewQueryClient(clientCtx)
+    
+    res, err := queryClient.Balance(
+        context.Background(),
+        &banktypes.QueryBalanceRequest{
+            Address: val.Address.String(),
+            Denom:   s.cfg.BondDenom,
+        },
+    )
+    
+    s.Require().NoError(err)
+    s.Require().NotNil(res.Balance)
+    s.Require().True(res.Balance.IsPositive())
+}
+
+func TestGRPCQueryTestSuite(t *testing.T) {
+    suite.Run(t, new(GRPCQueryTestSuite))
+}
+```
+
+## Related APIs
+
+- [REST](/api/rest) - REST API gateway
+- [Client](/api/client) - Client context for queries
+- [Keeper Patterns](/api/keeper-patterns) - Implementing query logic

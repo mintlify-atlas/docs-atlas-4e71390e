@@ -1,0 +1,513 @@
+---
+title: Keeper Patterns
+description: Design patterns for implementing module state management
+---
+
+## Overview
+
+Keepers are the gatekeepers of module state in Cosmos SDK. They encapsulate access to a module's store and provide methods for reading and writing state in a type-safe manner.
+
+## Keeper Structure
+
+### Basic Keeper Pattern
+
+```go
+package keeper
+
+import (
+    "cosmossdk.io/core/store"
+    "cosmossdk.io/log/v2"
+    
+    "github.com/cosmos/cosmos-sdk/codec"
+    sdk "github.com/cosmos/cosmos-sdk/types"
+)
+
+type Keeper struct {
+    cdc          codec.BinaryCodec
+    storeService store.KVStoreService
+    
+    // Authority for governance proposals
+    authority string
+    
+    // Optional: Other keepers this keeper depends on
+    bankKeeper   types.BankKeeper
+    stakingKeeper types.StakingKeeper
+    
+    logger log.Logger
+}
+
+func NewKeeper(
+    cdc codec.BinaryCodec,
+    storeService store.KVStoreService,
+    bankKeeper types.BankKeeper,
+    authority string,
+    logger log.Logger,
+) Keeper {
+    // Validate authority address
+    if _, err := sdk.AccAddressFromBech32(authority); err != nil {
+        panic(fmt.Errorf("invalid authority address: %w", err))
+    }
+    
+    return Keeper{
+        cdc:          cdc,
+        storeService: storeService,
+        bankKeeper:   bankKeeper,
+        authority:    authority,
+        logger:       logger.With(log.ModuleKey, "x/mymodule"),
+    }
+}
+```
+
+**Example from:** `x/bank/keeper/keeper.go:64-121`
+
+### Keeper Interface Pattern
+
+```go
+// Define expected keeper interfaces in types
+package types
+
+import sdk "github.com/cosmos/cosmos-sdk/types"
+
+type BankKeeper interface {
+    SendCoins(ctx sdk.Context, fromAddr sdk.AccAddress, toAddr sdk.AccAddress, amt sdk.Coins) error
+    GetBalance(ctx sdk.Context, addr sdk.AccAddress, denom string) sdk.Coin
+    SpendableCoins(ctx sdk.Context, addr sdk.AccAddress) sdk.Coins
+}
+
+type StakingKeeper interface {
+    GetValidator(ctx sdk.Context, addr sdk.ValAddress) (validator types.Validator, found bool)
+    BondDenom(ctx sdk.Context) string
+}
+```
+
+This allows for:
+- Dependency injection
+- Testing with mock keepers
+- Avoiding circular dependencies
+
+## Store Access Patterns
+
+### Basic CRUD Operations
+
+```go
+package keeper
+
+import (
+    "context"
+    
+    "cosmossdk.io/store/prefix"
+    sdk "github.com/cosmos/cosmos-sdk/types"
+)
+
+// Set stores an item
+func (k Keeper) SetItem(ctx context.Context, item types.Item) error {
+    sdkCtx := sdk.UnwrapSDKContext(ctx)
+    store := sdkCtx.KVStore(k.storeKey)
+    
+    key := types.ItemKey(item.Id)
+    value := k.cdc.MustMarshal(&item)
+    
+    store.Set(key, value)
+    return nil
+}
+
+// Get retrieves an item
+func (k Keeper) GetItem(ctx context.Context, id uint64) (types.Item, bool) {
+    sdkCtx := sdk.UnwrapSDKContext(ctx)
+    store := sdkCtx.KVStore(k.storeKey)
+    
+    key := types.ItemKey(id)
+    value := store.Get(key)
+    
+    if value == nil {
+        return types.Item{}, false
+    }
+    
+    var item types.Item
+    k.cdc.MustUnmarshal(value, &item)
+    return item, true
+}
+
+// Has checks if an item exists
+func (k Keeper) HasItem(ctx context.Context, id uint64) bool {
+    sdkCtx := sdk.UnwrapSDKContext(ctx)
+    store := sdkCtx.KVStore(k.storeKey)
+    return store.Has(types.ItemKey(id))
+}
+
+// Delete removes an item
+func (k Keeper) DeleteItem(ctx context.Context, id uint64) {
+    sdkCtx := sdk.UnwrapSDKContext(ctx)
+    store := sdkCtx.KVStore(k.storeKey)
+    store.Delete(types.ItemKey(id))
+}
+```
+
+### Iteration Patterns
+
+```go
+// Iterate over all items
+func (k Keeper) IterateItems(
+    ctx sdk.Context,
+    cb func(item types.Item) (stop bool),
+) {
+    store := ctx.KVStore(k.storeKey)
+    iterator := sdk.KVStorePrefixIterator(store, types.ItemPrefix)
+    defer iterator.Close()
+    
+    for ; iterator.Valid(); iterator.Next() {
+        var item types.Item
+        k.cdc.MustUnmarshal(iterator.Value(), &item)
+        
+        if cb(item) {
+            break
+        }
+    }
+}
+
+// Get all items
+func (k Keeper) GetAllItems(ctx sdk.Context) []types.Item {
+    var items []types.Item
+    k.IterateItems(ctx, func(item types.Item) bool {
+        items = append(items, item)
+        return false // continue iteration
+    })
+    return items
+}
+
+// Reverse iteration
+func (k Keeper) IterateItemsReverse(
+    ctx sdk.Context,
+    cb func(item types.Item) bool,
+) {
+    store := ctx.KVStore(k.storeKey)
+    iterator := sdk.KVStoreReversePrefixIterator(store, types.ItemPrefix)
+    defer iterator.Close()
+    
+    for ; iterator.Valid(); iterator.Next() {
+        var item types.Item
+        k.cdc.MustUnmarshal(iterator.Value(), &item)
+        if cb(item) {
+            break
+        }
+    }
+}
+```
+
+### Using Prefix Stores
+
+```go
+import "cosmossdk.io/store/prefix"
+
+// Get account-specific store
+func (k Keeper) getAccountStore(ctx sdk.Context, addr sdk.AccAddress) sdk.KVStore {
+    store := ctx.KVStore(k.storeKey)
+    return prefix.NewStore(store, types.AddressPrefix(addr))
+}
+
+// Store balance for address
+func (k Keeper) SetBalance(
+    ctx sdk.Context,
+    addr sdk.AccAddress,
+    balance sdk.Coin,
+) {
+    accountStore := k.getAccountStore(ctx, addr)
+    
+    // Keys within prefix store don't need address prefix
+    key := []byte(balance.Denom)
+    value := k.cdc.MustMarshal(&balance)
+    
+    accountStore.Set(key, value)
+}
+```
+
+## State Management Patterns
+
+### Counters and Sequences
+
+```go
+// Auto-incrementing ID
+func (k Keeper) GetNextID(ctx sdk.Context) uint64 {
+    store := ctx.KVStore(k.storeKey)
+    bz := store.Get(types.CounterKey)
+    
+    var counter uint64
+    if bz != nil {
+        counter = sdk.BigEndianToUint64(bz)
+    }
+    
+    counter++
+    store.Set(types.CounterKey, sdk.Uint64ToBigEndian(counter))
+    
+    return counter
+}
+
+// Create item with auto-generated ID
+func (k Keeper) CreateItem(
+    ctx sdk.Context,
+    item types.Item,
+) (uint64, error) {
+    item.Id = k.GetNextID(ctx)
+    k.SetItem(ctx, item)
+    return item.Id, nil
+}
+```
+
+### Indexing
+
+```go
+// Primary storage by ID
+func (k Keeper) SetItem(ctx sdk.Context, item types.Item) {
+    store := ctx.KVStore(k.storeKey)
+    
+    // Primary key: ID -> Item
+    primaryKey := types.ItemKey(item.Id)
+    value := k.cdc.MustMarshal(&item)
+    store.Set(primaryKey, value)
+    
+    // Secondary index: Owner -> ID
+    indexKey := types.ItemByOwnerKey(item.Owner, item.Id)
+    store.Set(indexKey, []byte{})
+}
+
+// Query by owner
+func (k Keeper) GetItemsByOwner(
+    ctx sdk.Context,
+    owner sdk.AccAddress,
+) []types.Item {
+    store := ctx.KVStore(k.storeKey)
+    prefix := types.ItemByOwnerPrefix(owner)
+    iterator := sdk.KVStorePrefixIterator(store, prefix)
+    defer iterator.Close()
+    
+    var items []types.Item
+    for ; iterator.Valid(); iterator.Next() {
+        // Extract ID from index key
+        _, id := types.ParseItemByOwnerKey(iterator.Key())
+        
+        // Load full item from primary storage
+        item, found := k.GetItem(ctx, id)
+        if found {
+            items = append(items, item)
+        }
+    }
+    return items
+}
+
+// Update with re-indexing
+func (k Keeper) UpdateItem(
+    ctx sdk.Context,
+    oldItem types.Item,
+    newItem types.Item,
+) {
+    store := ctx.KVStore(k.storeKey)
+    
+    // Remove old index if owner changed
+    if !oldItem.Owner.Equals(newItem.Owner) {
+        oldIndexKey := types.ItemByOwnerKey(oldItem.Owner, oldItem.Id)
+        store.Delete(oldIndexKey)
+    }
+    
+    // Set new item (includes new index)
+    k.SetItem(ctx, newItem)
+}
+```
+
+## Keeper Dependencies
+
+### Bank Keeper Usage
+
+```go
+import banktypes "github.com/cosmos/cosmos-sdk/x/bank/types"
+
+// Transfer tokens
+func (k Keeper) Purchase(
+    ctx sdk.Context,
+    buyer sdk.AccAddress,
+    seller sdk.AccAddress,
+    price sdk.Coins,
+) error {
+    // Check buyer has sufficient balance
+    balance := k.bankKeeper.SpendableCoins(ctx, buyer)
+    if !balance.IsAllGTE(price) {
+        return sdkerrors.Wrap(sdkerrors.ErrInsufficientFunds, "buyer has insufficient funds")
+    }
+    
+    // Transfer coins
+    return k.bankKeeper.SendCoins(ctx, buyer, seller, price)
+}
+
+// Mint to module account
+func (k Keeper) MintReward(
+    ctx sdk.Context,
+    recipient sdk.AccAddress,
+    amount sdk.Coins,
+) error {
+    // Mint to module account
+    if err := k.bankKeeper.MintCoins(ctx, types.ModuleName, amount); err != nil {
+        return err
+    }
+    
+    // Send to recipient
+    return k.bankKeeper.SendCoinsFromModuleToAccount(
+        ctx,
+        types.ModuleName,
+        recipient,
+        amount,
+    )
+}
+```
+
+### Staking Keeper Usage
+
+```go
+import stakingtypes "github.com/cosmos/cosmos-sdk/x/staking/types"
+
+// Check if address is a validator
+func (k Keeper) IsValidator(ctx sdk.Context, addr sdk.AccAddress) bool {
+    valAddr := sdk.ValAddress(addr)
+    _, found := k.stakingKeeper.GetValidator(ctx, valAddr)
+    return found
+}
+
+// Get delegations for address
+func (k Keeper) GetDelegations(
+    ctx sdk.Context,
+    delegator sdk.AccAddress,
+) []stakingtypes.Delegation {
+    return k.stakingKeeper.GetAllDelegatorDelegations(ctx, delegator)
+}
+```
+
+## Validation Patterns
+
+```go
+// Validate before state changes
+func (k Keeper) CreateProposal(
+    ctx sdk.Context,
+    proposer sdk.AccAddress,
+    content string,
+    deposit sdk.Coins,
+) (uint64, error) {
+    // Validate inputs
+    if len(content) == 0 {
+        return 0, sdkerrors.Wrap(sdkerrors.ErrInvalidRequest, "content cannot be empty")
+    }
+    
+    if len(content) > types.MaxContentLength {
+        return 0, sdkerrors.Wrapf(
+            sdkerrors.ErrInvalidRequest,
+            "content too long: %d > %d",
+            len(content),
+            types.MaxContentLength,
+        )
+    }
+    
+    // Validate deposit
+    if !deposit.IsValid() || deposit.IsZero() {
+        return 0, sdkerrors.Wrap(sdkerrors.ErrInvalidCoins, "deposit must be positive")
+    }
+    
+    // Check proposer has funds
+    balance := k.bankKeeper.SpendableCoins(ctx, proposer)
+    if !balance.IsAllGTE(deposit) {
+        return 0, sdkerrors.Wrap(sdkerrors.ErrInsufficientFunds, "insufficient deposit")
+    }
+    
+    // Collect deposit
+    if err := k.bankKeeper.SendCoinsFromAccountToModule(
+        ctx, proposer, types.ModuleName, deposit,
+    ); err != nil {
+        return 0, err
+    }
+    
+    // Create proposal
+    id := k.GetNextProposalID(ctx)
+    proposal := types.Proposal{
+        Id:       id,
+        Proposer: proposer.String(),
+        Content:  content,
+        Deposit:  deposit,
+        Status:   types.StatusDepositPeriod,
+    }
+    
+    k.SetProposal(ctx, proposal)
+    
+    // Emit event
+    ctx.EventManager().EmitEvent(
+        sdk.NewEvent(
+            types.EventTypeProposalCreated,
+            sdk.NewAttribute(types.AttributeKeyProposalID, fmt.Sprintf("%d", id)),
+            sdk.NewAttribute(types.AttributeKeyProposer, proposer.String()),
+        ),
+    )
+    
+    return id, nil
+}
+```
+
+## Testing Keepers
+
+```go
+package keeper_test
+
+import (
+    "testing"
+    
+    "github.com/stretchr/testify/suite"
+    
+    storetypes "cosmossdk.io/store/types"
+    sdk "github.com/cosmos/cosmos-sdk/types"
+)
+
+type KeeperTestSuite struct {
+    suite.Suite
+    
+    ctx    sdk.Context
+    keeper keeper.Keeper
+}
+
+func (suite *KeeperTestSuite) SetupTest() {
+    // Create test context
+    suite.ctx = sdk.NewContext(/*...*/)
+    
+    // Create keeper with mocks
+    suite.keeper = keeper.NewKeeper(
+        codec,
+        storeKey,
+        mockBankKeeper,
+        authority,
+        logger,
+    )
+}
+
+func (suite *KeeperTestSuite) TestCreateItem() {
+    ctx := suite.ctx
+    
+    // Create item
+    item := types.Item{
+        Owner:   addr,
+        Content: "test",
+    }
+    
+    id, err := suite.keeper.CreateItem(ctx, item)
+    suite.Require().NoError(err)
+    suite.Require().Greater(id, uint64(0))
+    
+    // Verify stored
+    stored, found := suite.keeper.GetItem(ctx, id)
+    suite.Require().True(found)
+    suite.Require().Equal(item.Content, stored.Content)
+}
+
+func TestKeeperTestSuite(t *testing.T) {
+    suite.Run(t, new(KeeperTestSuite))
+}
+```
+
+## Related APIs
+
+- [Store](/api/store) - Storage interfaces
+- [Types](/api/types) - Context and SDK types
+- [Module Manager](/api/module-manager) - Module lifecycle
+- [Msg Service](/api/msg-service) - Message handlers using keepers

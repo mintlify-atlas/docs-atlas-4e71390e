@@ -1,122 +1,158 @@
 {
   "$schema": "https://mintlify.com/docs.json",
-  "theme": "mint",
-  "name": "Mint Starter Kit",
+  "name": "Cosmos SDK",
+  "theme": "aspen",
   "colors": {
-    "primary": "#16A34A",
-    "light": "#07C983",
-    "dark": "#15803D"
+    "primary": "#7c7c7c",
+    "light": "#070707",
+    "dark": "#cfcfcf"
   },
-  "favicon": "/favicon.svg",
+  "favicon": "https://media.brand.dev/bdcf468a-7cca-49cb-824d-bc38f109e33f.png",
+  "logo": {
+    "light": "https://media.brand.dev/8c3e6408-28e4-4d3f-943e-356a9e357ae5.svg",
+    "dark": "https://media.brand.dev/8c3e6408-28e4-4d3f-943e-356a9e357ae5.svg"
+  },
+  "navbar": {
+    "primary": {
+      "type": "github",
+      "href": "https://github.com/cosmos/cosmos-sdk"
+    }
+  },
+  "footer": {
+    "socials": {
+      "github": "https://github.com/cosmos/cosmos-sdk"
+    }
+  },
   "navigation": {
     "tabs": [
       {
-        "tab": "Guides",
+        "tab": "Documentation",
         "groups": [
           {
-            "group": "Getting started",
+            "group": "Get Started",
             "pages": [
-              "index",
+              "introduction",
               "quickstart",
-              "development"
+              "installation"
             ]
           },
           {
-            "group": "Customization",
+            "group": "Architecture",
             "pages": [
-              "essentials/settings",
-              "essentials/navigation"
+              "architecture/overview",
+              "architecture/baseapp",
+              "architecture/modules",
+              "architecture/transactions",
+              "architecture/state-management",
+              "architecture/consensus"
             ]
           },
           {
-            "group": "Writing content",
+            "group": "Building Chains",
             "pages": [
-              "essentials/markdown",
-              "essentials/code",
-              "essentials/images",
-              "essentials/reusable-snippets"
+              "building/app-creation",
+              "building/dependency-injection",
+              "building/genesis",
+              "building/testing",
+              "building/simulation"
             ]
           },
           {
-            "group": "AI tools",
+            "group": "Core Concepts",
             "pages": [
-              "ai-tools/cursor",
-              "ai-tools/claude-code",
-              "ai-tools/windsurf"
+              "concepts/accounts",
+              "concepts/gas-fees",
+              "concepts/events",
+              "concepts/queries",
+              "concepts/encoding",
+              "concepts/migrations"
+            ]
+          },
+          {
+            "group": "Advanced Topics",
+            "pages": [
+              "advanced/ante-handler",
+              "advanced/post-handler",
+              "advanced/upgrade-guide",
+              "advanced/security",
+              "advanced/telemetry"
             ]
           }
         ]
       },
       {
-        "tab": "API reference",
+        "tab": "Modules",
         "groups": [
           {
-            "group": "API documentation",
+            "group": "Overview",
             "pages": [
-              "api-reference/introduction"
+              "modules/index",
+              "modules/building-modules"
             ]
           },
           {
-            "group": "Endpoint examples",
+            "group": "Essential Modules",
             "pages": [
-              "api-reference/endpoint/get",
-              "api-reference/endpoint/create",
-              "api-reference/endpoint/delete",
-              "api-reference/endpoint/webhook"
+              "modules/auth",
+              "modules/bank",
+              "modules/consensus",
+              "modules/distribution",
+              "modules/governance",
+              "modules/mint",
+              "modules/staking",
+              "modules/slashing",
+              "modules/upgrade",
+              "modules/evidence"
+            ]
+          },
+          {
+            "group": "Supplementary Modules",
+            "pages": [
+              "modules/authz",
+              "modules/feegrant",
+              "modules/epochs",
+              "modules/protocolpool"
+            ]
+          },
+          {
+            "group": "Enterprise Modules",
+            "pages": [
+              "modules/enterprise-overview",
+              "modules/poa"
+            ]
+          }
+        ]
+      },
+      {
+        "tab": "API Reference",
+        "groups": [
+          {
+            "group": "Core APIs",
+            "pages": [
+              "api/baseapp",
+              "api/runtime",
+              "api/store",
+              "api/types"
+            ]
+          },
+          {
+            "group": "Client APIs",
+            "pages": [
+              "api/client",
+              "api/grpc",
+              "api/rest"
+            ]
+          },
+          {
+            "group": "Module APIs",
+            "pages": [
+              "api/module-manager",
+              "api/keeper-patterns",
+              "api/msg-service"
             ]
           }
         ]
       }
-    ],
-    "global": {
-      "anchors": [
-        {
-          "anchor": "Documentation",
-          "href": "https://mintlify.com/docs",
-          "icon": "book-open-cover"
-        },
-        {
-          "anchor": "Blog",
-          "href": "https://mintlify.com/blog",
-          "icon": "newspaper"
-        }
-      ]
-    }
-  },
-  "logo": {
-    "light": "/logo/light.svg",
-    "dark": "/logo/dark.svg"
-  },
-  "navbar": {
-    "links": [
-      {
-        "label": "Support",
-        "href": "mailto:hi@mintlify.com"
-      }
-    ],
-    "primary": {
-      "type": "button",
-      "label": "Dashboard",
-      "href": "https://dashboard.mintlify.com"
-    }
-  },
-  "contextual": {
-    "options": [
-     "copy",
-     "view",
-     "chatgpt",
-     "claude",
-     "perplexity",
-     "mcp",
-     "cursor",
-     "vscode"
-   ]
-  },
-  "footer": {
-    "socials": {
-      "x": "https://x.com/mintlify",
-      "github": "https://github.com/mintlify",
-      "linkedin": "https://linkedin.com/company/mintlify"
-    }
+    ]
   }
 }

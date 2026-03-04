@@ -1,0 +1,187 @@
+---
+title: Architecture Overview
+description: High-level overview of Cosmos SDK architecture and design patterns
+---
+
+## Introduction
+
+The Cosmos SDK is a modular framework for building application-specific blockchains. It follows a layered architecture that separates concerns and enables developers to build complex applications through composition of modules.
+
+## Architectural Layers
+
+The Cosmos SDK architecture consists of several key layers:
+
+### Application Layer (BaseApp)
+
+At the core is **BaseApp**, which implements the ABCI (Application Blockchain Interface) and serves as the foundation for all Cosmos SDK applications.
+
+```go
+// BaseApp reflects the ABCI application implementation
+type BaseApp struct {
+    logger            log.Logger
+    name              string
+    db                dbm.DB
+    cms               storetypes.CommitMultiStore  // Main state
+    storeLoader       StoreLoader
+    grpcQueryRouter   *GRPCQueryRouter
+    msgServiceRouter  *MsgServiceRouter
+    mempool           mempool.Mempool
+    anteHandler       sdk.AnteHandler
+    postHandler       sdk.PostHandler
+    // ... more fields
+}
+```
+
+<Note>
+BaseApp is responsible for managing the application state machine, routing messages, and coordinating ABCI method calls from CometBFT.
+</Note>
+
+### Module Layer
+
+Modules are self-contained units of functionality that encapsulate state, message handlers, and business logic. Each module:
+
+- Defines its own state schema using [Collections](/architecture/state-management)
+- Implements message and query handlers
+- Registers routes with BaseApp's routers
+- Can depend on other modules through keeper interfaces
+
+### State Layer
+
+The state layer provides:
+
+- **CommitMultiStore**: Root store containing all module substores
+- **KVStore**: Key-value store interface for state access
+- **Collections**: Type-safe state management abstractions
+- **IAVL**: Merkle tree for state commitments and proofs
+
+See [State Management](/architecture/state-management) for details.
+
+### Consensus Integration
+
+Cosmos SDK integrates with CometBFT (formerly Tendermint) consensus engine through ABCI:
+
+```go
+const (
+    execModeCheck               // Check transaction validity
+    execModeReCheck             // Recheck pending transactions
+    execModeSimulate            // Simulate execution
+    execModePrepareProposal     // Prepare block proposal
+    execModeProcessProposal     // Process block proposal
+    execModeVoteExtension       // Vote extensions
+    execModeVerifyVoteExtension // Verify vote extensions
+    execModeFinalize            // Finalize block
+)
+```
+
+## Design Principles
+
+### Modularity
+
+The SDK uses a modular architecture where each module is independent and composable:
+
+- Modules interact through well-defined keeper interfaces
+- Dependencies are managed through dependency injection (depinject)
+- Modules can be added, removed, or upgraded independently
+
+### State Machine Replication
+
+The SDK implements a deterministic state machine:
+
+1. Transactions modify state through message handlers
+2. State changes are committed atomically per block
+3. All nodes execute the same transactions in the same order
+4. State root hashes prove consistency across the network
+
+### Object Capability Model
+
+Security through capabilities:
+
+- Modules receive only the capabilities they need
+- Store keys are capabilities for accessing state
+- Keepers are capabilities for accessing module functionality
+- No global state access - everything is explicit
+
+## Execution Modes
+
+The SDK supports multiple execution contexts:
+
+| Mode | Purpose | State Changes |
+|------|---------|---------------|
+| `CheckTx` | Validate transactions before mempool | No (discarded) |
+| `PrepareProposal` | Proposer prepares block | No |
+| `ProcessProposal` | Validators verify block | No |
+| `FinalizeBlock` | Execute and commit transactions | Yes |
+| `Simulate` | Estimate gas and test execution | No |
+
+```go
+type Context struct {
+    baseCtx          context.Context
+    ms               storetypes.MultiStore
+    header           cmtproto.Header
+    txBytes          []byte
+    logger           log.Logger
+    gasMeter         storetypes.GasMeter
+    blockGasMeter    storetypes.GasMeter
+    execMode         ExecMode
+    eventManager     *EventManager
+    // ...
+}
+```
+
+## Component Interaction
+
+<Steps>
+  <Step title="Transaction Submission">
+    Client submits a transaction to a node's mempool
+  </Step>
+  
+  <Step title="Transaction Validation">
+    BaseApp runs `CheckTx` to validate before accepting into mempool
+  </Step>
+  
+  <Step title="Block Proposal">
+    Proposer selects transactions and calls `PrepareProposal`
+  </Step>
+  
+  <Step title="Block Validation">
+    Validators verify the block using `ProcessProposal`
+  </Step>
+  
+  <Step title="Block Execution">
+    Consensus achieved, `FinalizeBlock` executes all transactions
+  </Step>
+  
+  <Step title="State Commitment">
+    Changes are committed to the CommitMultiStore and app hash computed
+  </Step>
+</Steps>
+
+## Key Architecture Files
+
+Explore the implementation:
+
+- `baseapp/baseapp.go:86` - BaseApp struct definition
+- `baseapp/abci.go` - ABCI method implementations
+- `types/context.go:41` - Context struct for request handling
+- `store/types/store.go` - Store interfaces
+- `core/appmodule/module.go` - Module interfaces
+
+## Next Steps
+
+<CardGroup cols={3}>
+  <Card title="BaseApp" icon="cubes" href="/architecture/baseapp">
+    Dive into BaseApp architecture
+  </Card>
+  <Card title="Modules" icon="puzzle-piece" href="/architecture/modules">
+    Learn about the module system
+  </Card>
+  <Card title="Transactions" icon="exchange-alt" href="/architecture/transactions">
+    Understand transaction flow
+  </Card>
+</CardGroup>
+
+## Related Documentation
+
+- [State Management](/architecture/state-management) - State storage and collections
+- [Consensus Integration](/architecture/consensus) - ABCI and CometBFT
+- [Module Development](/modules/overview) - Building custom modules

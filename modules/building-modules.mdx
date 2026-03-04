@@ -1,0 +1,670 @@
+---
+title: Building Cosmos SDK Modules
+description: Complete guide to developing custom modules with keeper patterns, message handlers, and lifecycle hooks
+---
+
+# Building Cosmos SDK Modules
+
+This guide covers the essential concepts, patterns, and best practices for building custom modules in the Cosmos SDK. Learn how to structure your module, implement keepers, handle messages, and integrate with the module lifecycle.
+
+## Module Structure
+
+A well-structured module follows the standard Cosmos SDK layout:
+
+```
+x/mymodule/
+├── keeper/
+│   ├── keeper.go       # Keeper implementation
+│   ├── msg_server.go   # Message handler implementation
+│   └── query_server.go # Query handler implementation
+├── types/
+│   ├── keys.go         # Store keys and prefixes
+│   ├── genesis.go      # Genesis state types
+│   ├── msgs.go         # Message types
+│   ├── query.pb.go     # Generated query types
+│   └── tx.pb.go        # Generated transaction types
+├── client/
+│   └── cli/
+│       ├── query.go    # Query CLI commands
+│       └── tx.go       # Transaction CLI commands
+├── module.go           # Module definition
+├── proto/              # Protobuf definitions
+└── README.md           # Module documentation
+```
+
+## Core Module Interfaces
+
+Cosmos SDK modules implement the `AppModule` interface from the `core/appmodule` package. This interface serves as the foundation for all module functionality.
+
+### AppModule Interface
+
+The base `AppModule` interface is a tag interface that identifies a struct as an app module:
+
+```go
+package appmodule
+
+type AppModule interface {
+    depinject.OnePerModuleType
+    
+    // IsAppModule is a dummy method to tag a struct as implementing an AppModule.
+    IsAppModule()
+}
+```
+
+### Extension Interfaces
+
+Modules extend functionality by implementing additional interfaces:
+
+#### HasServices
+
+Register gRPC services for queries and message handling:
+
+```go
+type HasServices interface {
+    AppModule
+    
+    // RegisterServices registers the module's services with the app's service registrar.
+    // Two types of services are currently supported:
+    // - read-only gRPC query services (default)
+    // - transaction message services (protobuf option cosmos.msg.v1.service = true)
+    RegisterServices(grpc.ServiceRegistrar) error
+}
+```
+
+#### HasGenesis
+
+Handle genesis state initialization and export:
+
+```go
+type HasGenesis interface {
+    AppModule
+    
+    // DefaultGenesis writes the default genesis for this module
+    DefaultGenesis(GenesisTarget) error
+    
+    // ValidateGenesis validates the genesis data
+    ValidateGenesis(GenesisSource) error
+    
+    // InitGenesis initializes module state from genesis
+    InitGenesis(context.Context, GenesisSource) error
+    
+    // ExportGenesis exports module state to genesis
+    ExportGenesis(context.Context, GenesisTarget) error
+}
+```
+
+#### Block Lifecycle Hooks
+
+Modules can hook into different phases of block processing:
+
+```go
+// HasPreBlocker runs custom logic before BeginBlock
+type HasPreBlocker interface {
+    AppModule
+    PreBlock(context.Context) (ResponsePreBlock, error)
+}
+
+// HasBeginBlocker runs before transaction processing
+type HasBeginBlocker interface {
+    AppModule
+    BeginBlock(context.Context) error
+}
+
+// HasEndBlocker runs after transaction processing
+type HasEndBlocker interface {
+    AppModule
+    EndBlock(context.Context) error
+}
+```
+
+## Keeper Patterns
+
+The keeper is the core component of a module, managing state and business logic. Keepers follow strict access control patterns to ensure security and modularity.
+
+### Basic Keeper Structure
+
+```go
+package keeper
+
+import (
+    "context"
+    "cosmossdk.io/core/store"
+    "cosmossdk.io/log/v2"
+    "github.com/cosmos/cosmos-sdk/codec"
+    sdk "github.com/cosmos/cosmos-sdk/types"
+    "myapp/x/mymodule/types"
+)
+
+type Keeper struct {
+    cdc          codec.BinaryCodec
+    storeService store.KVStoreService
+    authority    string // the address capable of executing privileged operations
+    logger       log.Logger
+    
+    // Dependencies on other module keepers
+    bankKeeper    types.BankKeeper
+    stakingKeeper types.StakingKeeper
+}
+
+func NewKeeper(
+    cdc codec.BinaryCodec,
+    storeService store.KVStoreService,
+    bankKeeper types.BankKeeper,
+    stakingKeeper types.StakingKeeper,
+    authority string,
+    logger log.Logger,
+) Keeper {
+    // Validate authority address
+    if _, err := sdk.AccAddressFromBech32(authority); err != nil {
+        panic(fmt.Errorf("invalid authority address: %w", err))
+    }
+    
+    return Keeper{
+        cdc:           cdc,
+        storeService:  storeService,
+        bankKeeper:    bankKeeper,
+        stakingKeeper: stakingKeeper,
+        authority:     authority,
+        logger:        logger.With(log.ModuleKey, "x/mymodule"),
+    }
+}
+```
+
+### Keeper Interface Pattern
+
+Define minimal interfaces for keeper dependencies to reduce coupling:
+
+```go
+// In types/expected_keepers.go
+package types
+
+import (
+    "context"
+    sdk "github.com/cosmos/cosmos-sdk/types"
+)
+
+// BankKeeper defines the expected interface for the Bank module
+type BankKeeper interface {
+    SendCoins(ctx context.Context, fromAddr, toAddr sdk.AccAddress, amt sdk.Coins) error
+    GetBalance(ctx context.Context, addr sdk.AccAddress, denom string) sdk.Coin
+    SpendableCoins(ctx context.Context, addr sdk.AccAddress) sdk.Coins
+}
+
+// StakingKeeper defines the expected interface for the Staking module
+type StakingKeeper interface {
+    GetValidator(ctx context.Context, addr sdk.ValAddress) (validator types.Validator, found bool)
+    Delegate(ctx context.Context, delAddr sdk.AccAddress, amount sdk.Coin) error
+}
+```
+
+### Real-World Example: Bank Keeper
+
+The bank keeper demonstrates tiered access control:
+
+```go reference
+https://github.com/cosmos/cosmos-sdk/blob/main/x/bank/keeper/keeper.go#L23-L62
+```
+
+**Key patterns:**
+- **Keeper interface hierarchy**: ViewKeeper → SendKeeper → BaseKeeper
+- **Restricted permissions**: `WithMintCoinsRestriction` limits minting capabilities
+- **Module accounts**: Special handling for module-owned accounts
+- **Send restrictions**: Composable restrictions using `SendRestrictionFn`
+
+## Message Handlers
+
+Message handlers process user transactions and update module state. They implement the gRPC service defined in your protobuf files.
+
+### Message Server Implementation
+
+```go
+package keeper
+
+import (
+    "context"
+    sdk "github.com/cosmos/cosmos-sdk/types"
+    "myapp/x/mymodule/types"
+)
+
+type msgServer struct {
+    Keeper
+}
+
+// NewMsgServerImpl returns an implementation of the module MsgServer interface
+func NewMsgServerImpl(keeper Keeper) types.MsgServer {
+    return &msgServer{Keeper: keeper}
+}
+
+var _ types.MsgServer = msgServer{}
+
+// CreateResource handles the MsgCreateResource message
+func (k msgServer) CreateResource(goCtx context.Context, msg *types.MsgCreateResource) (*types.MsgCreateResourceResponse, error) {
+    ctx := sdk.UnwrapSDKContext(goCtx)
+    
+    // Validate message (additional validation beyond protobuf)
+    if err := msg.ValidateBasic(); err != nil {
+        return nil, err
+    }
+    
+    // Parse addresses
+    creator, err := sdk.AccAddressFromBech32(msg.Creator)
+    if err != nil {
+        return nil, sdkerrors.ErrInvalidAddress.Wrapf("invalid creator address: %s", err)
+    }
+    
+    // Business logic
+    resource := types.Resource{
+        Id:      k.GetNextResourceID(ctx),
+        Creator: msg.Creator,
+        Data:    msg.Data,
+    }
+    
+    // Store state
+    k.SetResource(ctx, resource)
+    
+    // Emit event
+    ctx.EventManager().EmitEvent(
+        sdk.NewEvent(
+            types.EventTypeCreateResource,
+            sdk.NewAttribute(types.AttributeKeyCreator, msg.Creator),
+            sdk.NewAttribute(types.AttributeKeyResourceID, fmt.Sprintf("%d", resource.Id)),
+        ),
+    )
+    
+    return &types.MsgCreateResourceResponse{Id: resource.Id}, nil
+}
+```
+
+### Real-World Example: Bank Send Message
+
+The bank module's Send handler demonstrates proper validation and error handling:
+
+```go reference
+https://github.com/cosmos/cosmos-sdk/blob/main/x/bank/keeper/msg_server.go#L29-L83
+```
+
+**Key patterns:**
+- Address validation and parsing
+- Coin validation (IsValid, IsAllPositive)
+- Send restrictions checking
+- Blocked address validation
+- Telemetry for monitoring
+
+## Query Services
+
+Query services provide read-only access to module state:
+
+```go
+package keeper
+
+import (
+    "context"
+    "cosmossdk.io/collections"
+    "github.com/cosmos/cosmos-sdk/types/query"
+    "myapp/x/mymodule/types"
+)
+
+var _ types.QueryServer = Keeper{}
+
+// Resource queries a single resource by ID
+func (k Keeper) Resource(goCtx context.Context, req *types.QueryResourceRequest) (*types.QueryResourceResponse, error) {
+    if req == nil {
+        return nil, status.Error(codes.InvalidArgument, "invalid request")
+    }
+    
+    ctx := sdk.UnwrapSDKContext(goCtx)
+    
+    resource, found := k.GetResource(ctx, req.Id)
+    if !found {
+        return nil, status.Errorf(codes.NotFound, "resource %d not found", req.Id)
+    }
+    
+    return &types.QueryResourceResponse{Resource: resource}, nil
+}
+
+// Resources queries all resources with pagination
+func (k Keeper) Resources(goCtx context.Context, req *types.QueryResourcesRequest) (*types.QueryResourcesResponse, error) {
+    if req == nil {
+        return nil, status.Error(codes.InvalidArgument, "invalid request")
+    }
+    
+    ctx := sdk.UnwrapSDKContext(goCtx)
+    
+    var resources []types.Resource
+    pageRes, err := query.CollectionPaginate(
+        ctx,
+        k.Resources,
+        req.Pagination,
+        func(key uint64, value types.Resource) (types.Resource, error) {
+            return value, nil
+        },
+    )
+    if err != nil {
+        return nil, status.Error(codes.Internal, err.Error())
+    }
+    
+    return &types.QueryResourcesResponse{
+        Resources:  resources,
+        Pagination: pageRes,
+    }, nil
+}
+```
+
+## Module Lifecycle
+
+Modules can hook into various stages of block processing to execute custom logic.
+
+### PreBlock
+
+Runs before BeginBlock. Can modify consensus parameters:
+
+```go
+func (am AppModule) PreBlock(ctx context.Context) (appmodule.ResponsePreBlock, error) {
+    // Update consensus parameters if needed
+    // Return whether consensus params changed
+    return appmodule.ConsensusParamsChanged(false), nil
+}
+```
+
+### BeginBlock
+
+Executes logic at the beginning of each block, before transactions:
+
+```go
+func (am AppModule) BeginBlock(ctx context.Context) error {
+    // Example: Track historical information
+    sdkCtx := sdk.UnwrapSDKContext(ctx)
+    
+    // Store current block info
+    am.keeper.TrackHistoricalInfo(ctx)
+    
+    return nil
+}
+```
+
+**Common BeginBlock operations:**
+- Historical data tracking (staking module)
+- Time-based state transitions
+- Inflation minting (mint module)
+- Epoch transitions (epochs module)
+
+### EndBlock
+
+Executes logic at the end of each block, after all transactions:
+
+```go
+func (am AppModule) EndBlock(ctx context.Context) error {
+    sdkCtx := sdk.UnwrapSDKContext(ctx)
+    
+    // Example: Process matured unbonding delegations
+    return am.keeper.BlockValidatorUpdates(ctx)
+}
+```
+
+**Common EndBlock operations:**
+- Validator set updates (staking module)
+- Proposal tallying (governance module)
+- Queue processing (unbonding, redelegations)
+- Distribution of rewards
+
+### Real-World Example: Staking EndBlock
+
+The staking module's EndBlock handles validator set changes:
+
+```go
+// Staking EndBlock processes validator set updates
+func (am AppModule) EndBlock(ctx context.Context) error {
+    // 1. Process unbonding validators
+    // 2. Process unbonding delegations
+    // 3. Process redelegations
+    // 4. Update validator set
+    // 5. Return validator updates to CometBFT
+    return am.keeper.BlockValidatorUpdates(ctx)
+}
+```
+
+See x/staking/README.md:742-820 for complete details on validator set changes.
+
+## State Management
+
+### Collections (Modern Approach)
+
+The modern approach uses the collections package for type-safe state management:
+
+```go
+import "cosmossdk.io/collections"
+
+type Keeper struct {
+    Schema collections.Schema
+    
+    // State stores
+    Resources collections.Map[uint64, types.Resource]
+    NextID    collections.Sequence
+    Params    collections.Item[types.Params]
+}
+
+func NewKeeper(storeService store.KVStoreService) Keeper {
+    sb := collections.NewSchemaBuilder(storeService)
+    
+    k := Keeper{
+        Resources: collections.NewMap(sb, types.ResourcePrefix, "resources", collections.Uint64Key, codec.CollValue[types.Resource](cdc)),
+        NextID:    collections.NewSequence(sb, types.NextIDPrefix, "next_id"),
+        Params:    collections.NewItem(sb, types.ParamsPrefix, "params", codec.CollValue[types.Params](cdc)),
+    }
+    
+    schema, err := sb.Build()
+    if err != nil {
+        panic(err)
+    }
+    k.Schema = schema
+    
+    return k
+}
+
+// Using collections
+func (k Keeper) SetResource(ctx context.Context, resource types.Resource) error {
+    return k.Resources.Set(ctx, resource.Id, resource)
+}
+
+func (k Keeper) GetResource(ctx context.Context, id uint64) (types.Resource, bool) {
+    resource, err := k.Resources.Get(ctx, id)
+    if err != nil {
+        return types.Resource{}, false
+    }
+    return resource, true
+}
+```
+
+### Store Keys and Prefixes
+
+Define your store keys in `types/keys.go`:
+
+```go
+package types
+
+const (
+    // ModuleName defines the module name
+    ModuleName = "mymodule"
+    
+    // StoreKey defines the primary module store key
+    StoreKey = ModuleName
+    
+    // RouterKey defines the module's message routing key
+    RouterKey = ModuleName
+)
+
+// Store key prefixes
+var (
+    ResourcePrefix = collections.NewPrefix(0)
+    NextIDPrefix   = collections.NewPrefix(1)
+    ParamsPrefix   = collections.NewPrefix(2)
+)
+```
+
+## Best Practices
+
+### 1. Keeper Design
+
+- **Minimal interfaces**: Only expose what's necessary to other modules
+- **Validation**: Perform thorough validation in message handlers
+- **Atomicity**: Ensure state changes are atomic within a transaction
+- **Events**: Emit events for all state changes for indexing and monitoring
+
+### 2. Error Handling
+
+```go
+import (
+    errorsmod "cosmossdk.io/errors"
+    sdkerrors "github.com/cosmos/cosmos-sdk/types/errors"
+)
+
+// Use standard error wrapping
+if err != nil {
+    return nil, errorsmod.Wrap(sdkerrors.ErrInvalidRequest, "resource not found")
+}
+
+// Use formatted errors for context
+if resource.Owner != msg.Sender {
+    return nil, sdkerrors.ErrUnauthorized.Wrapf("%s is not the owner of resource %d", msg.Sender, resource.Id)
+}
+```
+
+### 3. Events
+
+Emit structured events for all significant state changes:
+
+```go
+ctx.EventManager().EmitEvents(sdk.Events{
+    sdk.NewEvent(
+        types.EventTypeCreateResource,
+        sdk.NewAttribute(types.AttributeKeyCreator, msg.Creator),
+        sdk.NewAttribute(types.AttributeKeyResourceID, fmt.Sprintf("%d", resource.Id)),
+    ),
+    sdk.NewEvent(
+        sdk.EventTypeMessage,
+        sdk.NewAttribute(sdk.AttributeKeyModule, types.ModuleName),
+        sdk.NewAttribute(sdk.AttributeKeyAction, types.ActionCreateResource),
+        sdk.NewAttribute(sdk.AttributeKeySender, msg.Creator),
+    ),
+})
+```
+
+### 4. Genesis State
+
+Handle genesis initialization and export:
+
+```go
+// InitGenesis initializes the module's state from genesis
+func (k Keeper) InitGenesis(ctx context.Context, data types.GenesisState) {
+    // Validate genesis state
+    if err := data.Validate(); err != nil {
+        panic(err)
+    }
+    
+    // Set parameters
+    k.SetParams(ctx, data.Params)
+    
+    // Initialize resources
+    for _, resource := range data.Resources {
+        k.SetResource(ctx, resource)
+    }
+    
+    // Set next ID
+    k.NextID.Set(ctx, data.NextId)
+}
+
+// ExportGenesis exports the module's state to genesis
+func (k Keeper) ExportGenesis(ctx context.Context) *types.GenesisState {
+    var resources []types.Resource
+    k.Resources.Walk(ctx, nil, func(key uint64, value types.Resource) (bool, error) {
+        resources = append(resources, value)
+        return false, nil
+    })
+    
+    nextID, _ := k.NextID.Peek(ctx)
+    
+    return &types.GenesisState{
+        Params:    k.GetParams(ctx),
+        Resources: resources,
+        NextId:    nextID,
+    }
+}
+```
+
+### 5. Testing
+
+Write comprehensive tests for your keeper and message handlers:
+
+```go
+func (suite *KeeperTestSuite) TestCreateResource() {
+    ctx := suite.ctx
+    keeper := suite.keeper
+    
+    msg := types.NewMsgCreateResource(suite.addrs[0].String(), "test data")
+    
+    // Test successful creation
+    res, err := keeper.CreateResource(ctx, msg)
+    suite.Require().NoError(err)
+    suite.Require().NotNil(res)
+    
+    // Verify state
+    resource, found := keeper.GetResource(ctx, res.Id)
+    suite.Require().True(found)
+    suite.Require().Equal(msg.Creator, resource.Creator)
+    suite.Require().Equal(msg.Data, resource.Data)
+}
+```
+
+## Module Registration
+
+Implement the AppModule interface in `module.go`:
+
+```go
+package mymodule
+
+import (
+    "cosmossdk.io/core/appmodule"
+    "github.com/cosmos/cosmos-sdk/types/module"
+)
+
+var (
+    _ module.AppModuleBasic = AppModule{}
+    _ appmodule.AppModule   = AppModule{}
+    _ appmodule.HasServices = AppModule{}
+    _ appmodule.HasGenesis  = AppModule{}
+)
+
+type AppModule struct {
+    keeper Keeper
+}
+
+func NewAppModule(keeper Keeper) AppModule {
+    return AppModule{
+        keeper: keeper,
+    }
+}
+
+// IsAppModule implements the appmodule.AppModule interface
+func (AppModule) IsAppModule() {}
+
+// RegisterServices registers module services
+func (am AppModule) RegisterServices(registrar grpc.ServiceRegistrar) error {
+    types.RegisterMsgServer(registrar, keeper.NewMsgServerImpl(am.keeper))
+    types.RegisterQueryServer(registrar, am.keeper)
+    return nil
+}
+```
+
+## Resources
+
+- [Cosmos SDK Documentation](https://docs.cosmos.network/main/build/building-modules/intro)
+- [Module Tutorial](https://tutorials.cosmos.network)
+- [Bank Module Source](https://github.com/cosmos/cosmos-sdk/tree/main/x/bank) - Reference implementation
+- [Staking Module Source](https://github.com/cosmos/cosmos-sdk/tree/main/x/staking) - Complex lifecycle example
+- [Collections Package](https://pkg.go.dev/cosmossdk.io/collections) - Modern state management
+
+## Next Steps
+
+- **[Module Examples](/modules/)** - Browse existing module implementations
+- **[Testing Modules](https://docs.cosmos.network/main/build/building-modules/testing)** - Testing strategies and tools
+- **[Module Simulation](https://docs.cosmos.network/main/build/building-modules/simulator)** - Simulation testing for modules

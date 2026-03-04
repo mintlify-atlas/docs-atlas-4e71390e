@@ -1,0 +1,583 @@
+---
+title: Telemetry and Monitoring
+description: Configuring OpenTelemetry-based telemetry and monitoring for Cosmos SDK applications
+---
+
+Cosmos SDK provides comprehensive telemetry and monitoring capabilities through OpenTelemetry, enabling operators to track metrics, traces, and logs for their blockchain applications.
+
+## Overview
+
+Starting with recent versions, Cosmos SDK uses OpenTelemetry as the standard for instrumentation. The legacy go-metrics based telemetry is deprecated in favor of OpenTelemetry's unified observability framework.
+
+## OpenTelemetry Configuration
+
+### Configuration File
+
+Telemetry is configured via `otel.yaml` in your node's config directory:
+
+```yaml title="config/otel.yaml"
+# OpenTelemetry Configuration
+
+# Tracer provider configuration
+tracer_provider:
+  processors:
+    - batch:
+        exporter:
+          otlp:
+            endpoint: "localhost:4317"
+            protocol: grpc
+
+# Meter provider configuration
+meter_provider:
+  readers:
+    - periodic:
+        interval: 10s
+        exporter:
+          otlp:
+            endpoint: "localhost:4317"
+            protocol: grpc
+
+# Logger provider configuration  
+logger_provider:
+  processors:
+    - batch:
+        exporter:
+          otlp:
+            endpoint: "localhost:4317"
+            protocol: grpc
+
+# Resource attributes
+resource:
+  attributes:
+    service.name: "cosmos-app"
+    service.version: "v1.0.0"
+    deployment.environment: "production"
+
+# Extensions for additional instrumentation
+extensions:
+  # Propagators for distributed tracing
+  propagators:
+    - tracecontext
+    - baggage
+    - b3
+    - jaeger
+  
+  # Host metrics instrumentation
+  instruments:
+    host: {}
+    runtime: {}
+    diskio:
+      disable_virtual_device_filter: false
+```
+
+### Initialization
+
+Telemetry is initialized automatically from the config file:
+
+```go title="telemetry/config.go"
+func InitializeOpenTelemetry(filePath string) error {
+    if openTelemetrySDK != nil {
+        return nil
+    }
+
+    var opts []otelconf.ConfigurationOption
+
+    if _, err := os.Stat(filePath); err != nil {
+        if os.IsNotExist(err) {
+            setNoop()
+            return nil
+        }
+        return err
+    }
+
+    bz, err := os.ReadFile(filePath)
+    if err != nil {
+        return fmt.Errorf("failed to read telemetry config file: %w", err)
+    }
+    if len(bz) == 0 {
+        setNoop()
+        return nil
+    }
+
+    cfg, err := otelconf.ParseYAML(bz)
+    if err != nil {
+        return fmt.Errorf("failed to parse telemetry config file: %w", err)
+    }
+
+    opts = append(opts, otelconf.WithOpenTelemetryConfiguration(*cfg))
+
+    otelSDK, err := otelconf.NewSDK(opts...)
+    if err != nil {
+        return fmt.Errorf("failed to initialize telemetry: %w", err)
+    }
+    openTelemetrySDK = &otelSDK
+
+    // setup otel global providers
+    otel.SetTracerProvider(openTelemetrySDK.TracerProvider())
+    otel.SetMeterProvider(openTelemetrySDK.MeterProvider())
+    loggerProvider := openTelemetrySDK.LoggerProvider()
+    logglobal.SetLoggerProvider(loggerProvider)
+
+    return nil
+}
+```
+
+Source: [telemetry/config.go:70](https://github.com/cosmos/cosmos-sdk/blob/main/telemetry/config.go#L70)
+
+### Environment Variable
+
+Enable telemetry via environment variable for early initialization:
+
+```bash
+export OTEL_EXPERIMENTAL_CONFIG_FILE="/path/to/otel.yaml"
+./appd start
+```
+
+Source: [telemetry/config.go:52](https://github.com/cosmos/cosmos-sdk/blob/main/telemetry/config.go#L52)
+
+## Metrics
+
+### Module Metrics
+
+The SDK automatically tracks module execution time:
+
+```go title="x/upgrade/abci.go"
+func PreBlocker(ctx context.Context, k *keeper.Keeper) (appmodule.ResponsePreBlock, error) {
+    defer telemetry.ModuleMeasureSince(types.ModuleName, telemetry.Now(), telemetry.MetricKeyPreBlocker)
+    
+    // ... preblocker logic ...
+}
+```
+
+Source: [x/upgrade/abci.go:28](https://github.com/cosmos/cosmos-sdk/blob/main/x/upgrade/abci.go#L28)
+
+### Common Metric Keys
+
+```go title="telemetry/wrapper.go"
+const (
+    MetricKeyPreBlocker   = "pre_blocker"
+    MetricKeyBeginBlocker = "begin_blocker"
+    MetricKeyEndBlocker   = "end_blocker"
+    MetricLabelNameModule = "module"
+)
+```
+
+Source: [telemetry/wrapper.go:10](https://github.com/cosmos/cosmos-sdk/blob/main/telemetry/wrapper.go#L10)
+
+### Custom Metrics
+
+Add custom metrics in your modules:
+
+```go
+import (
+    "go.opentelemetry.io/otel"
+    "go.opentelemetry.io/otel/metric"
+)
+
+type Keeper struct {
+    meter         metric.Meter
+    txCounter     metric.Int64Counter
+    balanceGauge  metric.Float64Gauge
+}
+
+func NewKeeper() Keeper {
+    meter := otel.Meter("mymodule")
+    
+    txCounter, _ := meter.Int64Counter(
+        "mymodule.transactions.total",
+        metric.WithDescription("Total number of transactions processed"),
+    )
+    
+    balanceGauge, _ := meter.Float64Gauge(
+        "mymodule.balance",
+        metric.WithDescription("Current balance in module"),
+    )
+    
+    return Keeper{
+        meter:        meter,
+        txCounter:    txCounter,
+        balanceGauge: balanceGauge,
+    }
+}
+
+func (k Keeper) ProcessTransaction(ctx context.Context) error {
+    // Increment counter
+    k.txCounter.Add(ctx, 1, metric.WithAttributes(
+        attribute.String("status", "success"),
+    ))
+    
+    // Record gauge value
+    balance := k.GetBalance(ctx)
+    k.balanceGauge.Record(ctx, float64(balance.Int64()))
+    
+    return nil
+}
+```
+
+## Distributed Tracing
+
+### Creating Spans
+
+Trace execution flow across your application:
+
+```go
+import (
+    "go.opentelemetry.io/otel"
+    "go.opentelemetry.io/otel/trace"
+    "go.opentelemetry.io/otel/attribute"
+)
+
+func (k Keeper) ProcessBlock(ctx context.Context, height int64) error {
+    tracer := otel.Tracer("mymodule")
+    
+    ctx, span := tracer.Start(ctx, "ProcessBlock",
+        trace.WithAttributes(
+            attribute.Int64("block.height", height),
+        ),
+    )
+    defer span.End()
+    
+    // Record events
+    span.AddEvent("starting validation")
+    
+    if err := k.ValidateBlock(ctx, height); err != nil {
+        span.RecordError(err)
+        span.SetStatus(codes.Error, err.Error())
+        return err
+    }
+    
+    span.AddEvent("validation complete")
+    span.SetStatus(codes.Ok, "block processed successfully")
+    
+    return nil
+}
+```
+
+### Nested Spans
+
+Create hierarchical traces:
+
+```go
+func (k Keeper) ProcessBlock(ctx context.Context, height int64) error {
+    tracer := otel.Tracer("mymodule")
+    ctx, span := tracer.Start(ctx, "ProcessBlock")
+    defer span.End()
+    
+    // Child span inherits context
+    if err := k.ValidateTransactions(ctx); err != nil {
+        return err
+    }
+    
+    return k.ExecuteTransactions(ctx)
+}
+
+func (k Keeper) ValidateTransactions(ctx context.Context) error {
+    tracer := otel.Tracer("mymodule")
+    ctx, span := tracer.Start(ctx, "ValidateTransactions")
+    defer span.End()
+    
+    // Validation logic
+    return nil
+}
+```
+
+## Structured Logging
+
+### Log Levels
+
+Use OpenTelemetry logging:
+
+```go
+import (
+    otellog "go.opentelemetry.io/otel/log"
+    logglobal "go.opentelemetry.io/otel/log/global"
+)
+
+func (k Keeper) ProcessMessage(ctx context.Context, msg sdk.Msg) error {
+    logger := logglobal.GetLoggerProvider().Logger("mymodule")
+    
+    // Info log
+    logger.Emit(ctx, otellog.Record{
+        Severity: otellog.SeverityInfo,
+        Body:     otellog.StringValue("processing message"),
+        Attributes: []otellog.KeyValue{
+            otellog.String("msg_type", sdk.MsgTypeURL(msg)),
+        },
+    })
+    
+    if err := k.process(msg); err != nil {
+        // Error log
+        logger.Emit(ctx, otellog.Record{
+            Severity: otellog.SeverityError,
+            Body:     otellog.StringValue("failed to process message"),
+            Attributes: []otellog.KeyValue{
+                otellog.String("error", err.Error()),
+            },
+        })
+        return err
+    }
+    
+    return nil
+}
+```
+
+### Check if Logging is Enabled
+
+```go title="telemetry/config.go"
+func IsOtelLoggerEnabled() bool {
+    l := logglobal.GetLoggerProvider().Logger("")
+    return l.Enabled(context.Background(), otellog.EnabledParameters{
+        Severity: otellog.SeverityFatal4,
+    })
+}
+```
+
+Source: [telemetry/config.go:40](https://github.com/cosmos/cosmos-sdk/blob/main/telemetry/config.go#L40)
+
+## Instrumentation Extensions
+
+### Host Metrics
+
+Monitor host system metrics:
+
+```yaml title="config/otel.yaml"
+extensions:
+  instruments:
+    host: {}
+```
+
+Collects:
+- CPU usage
+- Memory usage
+- Disk I/O
+- Network I/O
+
+### Runtime Metrics
+
+Monitor Go runtime metrics:
+
+```yaml title="config/otel.yaml"
+extensions:
+  instruments:
+    runtime: {}
+```
+
+Collects:
+- Goroutines
+- GC stats
+- Memory allocations
+- Stack usage
+
+### Disk I/O Metrics
+
+Monitor disk operations:
+
+```yaml title="config/otel.yaml"
+extensions:
+  instruments:
+    diskio:
+      disable_virtual_device_filter: false
+```
+
+Source: [telemetry/config.go:177](https://github.com/cosmos/cosmos-sdk/blob/main/telemetry/config.go#L177)
+
+## Exporters
+
+### OTLP Exporter
+
+Export to OpenTelemetry Collector:
+
+```yaml
+tracer_provider:
+  processors:
+    - batch:
+        exporter:
+          otlp:
+            endpoint: "otel-collector:4317"
+            protocol: grpc
+            headers:
+              api-key: "your-api-key"
+```
+
+### Prometheus Exporter
+
+Expose metrics for Prometheus scraping:
+
+```yaml
+meter_provider:
+  readers:
+    - pull:
+        exporter:
+          prometheus:
+            host: "0.0.0.0"
+            port: 9090
+```
+
+### Console Exporter
+
+Log telemetry to console for debugging:
+
+```yaml
+tracer_provider:
+  processors:
+    - batch:
+        exporter:
+          console: {}
+```
+
+## Context Propagation
+
+Configure propagators for distributed tracing:
+
+```yaml title="config/otel.yaml"
+extensions:
+  propagators:
+    - tracecontext  # W3C Trace Context
+    - baggage       # W3C Baggage
+    - b3            # Zipkin B3 (single header)
+    - b3multi       # Zipkin B3 (multi-header)
+    - jaeger        # Jaeger propagation
+```
+
+Source: [telemetry/config.go:140](https://github.com/cosmos/cosmos-sdk/blob/main/telemetry/config.go#L140)
+
+## Resource Attributes
+
+Identify your service:
+
+```yaml
+resource:
+  attributes:
+    service.name: "cosmos-hub"
+    service.version: "v1.0.0"
+    service.namespace: "cosmos"
+    deployment.environment: "production"
+    host.name: "validator-01"
+    cloud.provider: "aws"
+    cloud.region: "us-east-1"
+```
+
+## Sampling
+
+Control trace sampling:
+
+```yaml
+tracer_provider:
+  sampler:
+    parent_based:
+      root:
+        trace_id_ratio_based:
+          ratio: 0.1  # Sample 10% of traces
+```
+
+## Legacy Telemetry (Deprecated)
+
+The legacy go-metrics based telemetry is deprecated:
+
+```go title="telemetry/metrics.go"
+// Deprecated: Use OpenTelemetry instead.
+type Config struct {
+    ServiceName             string
+    Enabled                 bool
+    EnableHostname          bool
+    EnableHostnameLabel     bool
+    EnableServiceLabel      bool
+    PrometheusRetentionTime int64
+    GlobalLabels            [][]string
+    MetricsSink             string
+    StatsdAddr              string
+    DatadogHostname         string
+}
+```
+
+Source: [telemetry/metrics.go:69](https://github.com/cosmos/cosmos-sdk/blob/main/telemetry/metrics.go#L69)
+
+Migrate to OpenTelemetry for new applications.
+
+## Shutdown
+
+Properly shutdown telemetry:
+
+```go title="telemetry/config.go"
+func Shutdown(ctx context.Context) error {
+    if openTelemetrySDK != nil {
+        err := openTelemetrySDK.Shutdown(ctx)
+        if err != nil {
+            return fmt.Errorf("failed to shutdown telemetry: %w", err)
+        }
+        for _, f := range shutdownFuncs {
+            if err := f(ctx); err != nil {
+                return fmt.Errorf("failed to shutdown telemetry: %w", err)
+            }
+        }
+    }
+    return nil
+}
+```
+
+Source: [telemetry/config.go:222](https://github.com/cosmos/cosmos-sdk/blob/main/telemetry/config.go#L222)
+
+Call during application shutdown:
+
+```go
+func (app *App) Close() error {
+    ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+    defer cancel()
+    
+    return telemetry.Shutdown(ctx)
+}
+```
+
+## Best Practices
+
+1. **Meaningful Names**: Use descriptive metric and span names
+2. **Cardinality**: Avoid high-cardinality labels (e.g., user IDs)
+3. **Sampling**: Use sampling in high-throughput environments
+4. **Resource Attributes**: Set appropriate service identification
+5. **Error Tracking**: Record errors in spans for debugging
+6. **Performance**: Be mindful of telemetry overhead
+7. **Privacy**: Don't log sensitive data in traces/logs
+
+## Monitoring Stack Example
+
+### Docker Compose Setup
+
+```yaml title="docker-compose.yml"
+version: '3'
+services:
+  otel-collector:
+    image: otel/opentelemetry-collector
+    command: ["--config=/etc/otel-config.yaml"]
+    volumes:
+      - ./otel-config.yaml:/etc/otel-config.yaml
+    ports:
+      - "4317:4317"  # OTLP gRPC
+      - "4318:4318"  # OTLP HTTP
+
+  prometheus:
+    image: prom/prometheus
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml
+    ports:
+      - "9090:9090"
+
+  jaeger:
+    image: jaegertracing/all-in-one
+    ports:
+      - "16686:16686"  # Jaeger UI
+      - "14250:14250"  # gRPC
+
+  grafana:
+    image: grafana/grafana
+    ports:
+      - "3000:3000"
+    environment:
+      - GF_AUTH_ANONYMOUS_ENABLED=true
+```
+
+## See Also
+
+- [OpenTelemetry Documentation](https://opentelemetry.io/docs/)
+- [Prometheus](https://prometheus.io/) - Metrics collection
+- [Jaeger](https://www.jaegertracing.io/) - Distributed tracing
+- [Grafana](https://grafana.com/) - Visualization

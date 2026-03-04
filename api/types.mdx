@@ -1,0 +1,442 @@
+---
+title: Types
+description: Core SDK types including Context, Msg, Coin, and Address
+---
+
+## Overview
+
+The types package provides fundamental types used throughout Cosmos SDK, including the request context, messages, coins, and addresses.
+
+## Context
+
+### Context Structure
+
+```go
+type Context struct {
+    baseCtx              context.Context
+    ms                   storetypes.MultiStore
+    header               cmtproto.Header
+    headerHash           []byte
+    chainID              string
+    txBytes              []byte
+    logger               log.Logger
+    voteInfo             []abci.VoteInfo
+    gasMeter             storetypes.GasMeter
+    blockGasMeter        storetypes.GasMeter
+    checkTx              bool
+    recheckTx            bool
+    sigverifyTx          bool
+    execMode             ExecMode
+    minGasPrice          DecCoins
+    consParams           cmtproto.ConsensusParams
+    eventManager         *EventManager
+    priority             int64
+    kvGasConfig          storetypes.GasConfig
+    transientKVGasConfig storetypes.GasConfig
+    streamingManager     storetypes.StreamingManager
+    cometInfo            comet.BlockInfo
+    headerInfo           header.Info
+    txIndex              int
+    msgIndex             int
+}
+```
+
+**Location:** `types/context.go:41-81`
+
+Context is an immutable object containing all information needed to process a request.
+
+### Context Methods
+
+```go
+// Read-only accessors
+func (c Context) Context() context.Context
+func (c Context) MultiStore() storetypes.MultiStore
+func (c Context) BlockHeight() int64
+func (c Context) BlockTime() time.Time
+func (c Context) ChainID() string
+func (c Context) TxBytes() []byte
+func (c Context) Logger() log.Logger
+func (c Context) GasMeter() storetypes.GasMeter
+func (c Context) BlockGasMeter() storetypes.GasMeter
+func (c Context) IsCheckTx() bool
+func (c Context) ExecMode() ExecMode
+func (c Context) EventManager() *EventManager
+func (c Context) HeaderInfo() header.Info
+```
+
+**Location:** `types/context.go:89-116`
+
+### Creating and Modifying Context
+
+```go
+// Create new context
+func NewContext(
+    ms storetypes.MultiStore,
+    header cmtproto.Header,
+    isCheckTx bool,
+    logger log.Logger,
+) Context
+
+// Context is immutable - modifications return new instance
+func (c Context) WithBlockHeight(height int64) Context
+func (c Context) WithBlockTime(newTime time.Time) Context
+func (c Context) WithLogger(logger log.Logger) Context
+func (c Context) WithGasMeter(meter storetypes.GasMeter) Context
+func (c Context) WithEventManager(em *EventManager) Context
+func (c Context) WithValue(key, value any) Context
+```
+
+**Location:** `types/context.go:146-200`
+
+### ExecMode
+
+```go
+type ExecMode uint8
+
+const (
+    ExecModeCheck               ExecMode = iota // Check a transaction
+    ExecModeReCheck                             // Recheck a (pending) transaction
+    ExecModeSimulate                            // Simulate a transaction
+    ExecModePrepareProposal                     // Prepare a block proposal
+    ExecModeProcessProposal                     // Process a block proposal
+    ExecModeVoteExtension                       // Extend or verify a pre-commit vote
+    ExecModeVerifyVoteExtension                 // Verify a vote extension
+    ExecModeFinalize                            // Finalize a block proposal
+)
+```
+
+**Location:** `types/context.go:18-31`
+
+## Messages
+
+### Msg Interface
+
+```go
+type Msg = proto.Message
+
+// Legacy interface (up through v0.47)
+type LegacyMsg interface {
+    Msg
+    
+    // GetSigners returns the addrs of signers that must sign
+    GetSigners() []AccAddress
+}
+```
+
+**Location:** `types/tx_msg.go:17-30`
+
+Messages represent state transitions and are the primary way users interact with modules.
+
+### Transaction Interfaces
+
+```go
+type Tx interface {
+    // GetMsgs gets all the transaction's messages
+    GetMsgs() []Msg
+    
+    // GetMsgsV2 gets messages as protobuf v2
+    GetMsgsV2() ([]protov2.Message, error)
+}
+
+type FeeTx interface {
+    Tx
+    GetGas() uint64
+    GetFee() Coins
+    FeePayer() []byte
+    FeeGranter() []byte
+}
+
+type TxWithMemo interface {
+    Tx
+    GetMemo() string
+}
+```
+
+**Location:** `types/tx_msg.go:46-73`
+
+## Coins and Amounts
+
+### Coin
+
+```go
+type Coin struct {
+    Denom  string   `protobuf:"bytes,1,opt,name=denom,proto3" json:"denom,omitempty"`
+    Amount math.Int `protobuf:"bytes,2,opt,name=amount,proto3,customtype=Int" json:"amount"`
+}
+
+func NewCoin(denom string, amount math.Int) Coin
+func NewInt64Coin(denom string, amount int64) Coin
+```
+
+**Location:** `types/coin.go:15-30`
+
+### Coin Methods
+
+```go
+// Validation
+func (coin Coin) Validate() error
+func (coin Coin) IsValid() bool
+func (coin Coin) IsZero() bool
+
+// Comparison
+func (coin Coin) IsGT(other Coin) bool
+func (coin Coin) IsGTE(other Coin) bool
+func (coin Coin) IsLT(other Coin) bool
+func (coin Coin) IsLTE(other Coin) bool
+func (coin Coin) IsEqual(other Coin) bool
+
+// Arithmetic
+func (coin Coin) Add(coinB Coin) Coin
+func (coin Coin) AddAmount(amount math.Int) Coin
+func (coin Coin) Sub(coinB Coin) Coin
+func (coin Coin) SafeSub(coinB Coin) (Coin, error)
+```
+
+**Location:** `types/coin.go:38-150`
+
+### Coins (Multiple Denominations)
+
+```go
+type Coins []Coin
+
+func NewCoins(coins ...Coin) Coins
+
+// Operations
+func (coins Coins) Add(coinsB ...Coin) Coins
+func (coins Coins) Sub(coinsB ...Coin) (Coins, error)
+func (coins Coins) IsAllGT(coinsB Coins) bool
+func (coins Coins) IsAllGTE(coinsB Coins) bool
+func (coins Coins) IsAnyGT(coinsB Coins) bool
+func (coins Coins) IsAnyGTE(coinsB Coins) bool
+func (coins Coins) IsZero() bool
+func (coins Coins) IsValid() bool
+func (coins Coins) AmountOf(denom string) math.Int
+
+// Sorting and validation
+func (coins Coins) Sort() Coins
+func (coins Coins) Validate() error
+```
+
+## Addresses
+
+### AccAddress
+
+```go
+type AccAddress []byte
+
+// Create from string
+func AccAddressFromBech32(address string) (AccAddress, error)
+
+// Create from bytes
+func AccAddressFromBytes(bz []byte) AccAddress
+
+// Convert to string
+func (aa AccAddress) String() string
+
+// Validation
+func (aa AccAddress) Empty() bool
+func (aa AccAddress) Equals(other AccAddress) bool
+```
+
+Account addresses identify user accounts.
+
+### ValAddress
+
+```go
+type ValAddress []byte
+
+func ValAddressFromBech32(address string) (ValAddress, error)
+func ValAddressFromBytes(bz []byte) ValAddress
+func (va ValAddress) String() string
+```
+
+Validator addresses identify validators in the staking module.
+
+### ConsAddress
+
+```go
+type ConsAddress []byte
+
+func ConsAddressFromBech32(address string) (ConsAddress, error)
+func ConsAddressFromBytes(bz []byte) ConsAddress
+func (ca ConsAddress) String() string
+```
+
+Consensus addresses identify validators in the consensus engine.
+
+## Usage Examples
+
+### Using Context in Handlers
+
+```go
+func (k Keeper) Transfer(
+    ctx sdk.Context,
+    from sdk.AccAddress,
+    to sdk.AccAddress,
+    amount sdk.Coins,
+) error {
+    // Access block information
+    height := ctx.BlockHeight()
+    blockTime := ctx.BlockTime()
+    
+    // Get logger
+    logger := ctx.Logger()
+    logger.Info("processing transfer", "from", from, "to", to)
+    
+    // Access store
+    store := ctx.KVStore(k.storeKey)
+    
+    // Check gas
+    if ctx.GasMeter().GasRemaining() < 1000 {
+        return sdkerrors.ErrOutOfGas
+    }
+    
+    // Emit events
+    ctx.EventManager().EmitEvent(
+        sdk.NewEvent(
+            "transfer",
+            sdk.NewAttribute("from", from.String()),
+            sdk.NewAttribute("to", to.String()),
+            sdk.NewAttribute("amount", amount.String()),
+        ),
+    )
+    
+    return nil
+}
+```
+
+### Working with Coins
+
+```go
+// Create coins
+stake := sdk.NewInt64Coin("stake", 1000)
+atom := sdk.NewCoin("atom", math.NewInt(500))
+
+// Create multi-denom coins
+coins := sdk.NewCoins(stake, atom)
+
+// Arithmetic
+total := coins.Add(sdk.NewInt64Coin("stake", 500))
+remaining, err := total.SafeSub(sdk.NewCoins(stake))
+if err != nil {
+    return err
+}
+
+// Query amount
+stakeAmount := coins.AmountOf("stake") // Returns math.Int
+
+// Validation
+if !coins.IsValid() {
+    return errors.New("invalid coins")
+}
+
+if coins.IsZero() {
+    return errors.New("zero coins")
+}
+
+// Comparison
+fee := sdk.NewCoins(sdk.NewInt64Coin("stake", 100))
+if !coins.IsAllGTE(fee) {
+    return errors.New("insufficient funds")
+}
+```
+
+### Defining Messages
+
+```go
+package types
+
+import (
+    sdk "github.com/cosmos/cosmos-sdk/types"
+)
+
+// Message definition
+type MsgSend struct {
+    FromAddress string     `protobuf:"bytes,1,opt,name=from_address,json=fromAddress,proto3"`
+    ToAddress   string     `protobuf:"bytes,2,opt,name=to_address,json=toAddress,proto3"`
+    Amount      sdk.Coins  `protobuf:"bytes,3,rep,name=amount,proto3,castrepeated=github.com/cosmos/cosmos-sdk/types.Coins"`
+}
+
+// Implement Msg interface (via protobuf)
+
+// Legacy GetSigners for compatibility
+func (msg MsgSend) GetSigners() []sdk.AccAddress {
+    from, _ := sdk.AccAddressFromBech32(msg.FromAddress)
+    return []sdk.AccAddress{from}
+}
+
+// Validation
+func (msg MsgSend) ValidateBasic() error {
+    if _, err := sdk.AccAddressFromBech32(msg.FromAddress); err != nil {
+        return sdkerrors.Wrap(err, "invalid from address")
+    }
+    
+    if _, err := sdk.AccAddressFromBech32(msg.ToAddress); err != nil {
+        return sdkerrors.Wrap(err, "invalid to address")
+    }
+    
+    if !msg.Amount.IsValid() {
+        return sdkerrors.Wrap(sdkerrors.ErrInvalidCoins, msg.Amount.String())
+    }
+    
+    if !msg.Amount.IsAllPositive() {
+        return sdkerrors.Wrap(sdkerrors.ErrInvalidCoins, "amount must be positive")
+    }
+    
+    return nil
+}
+```
+
+### Address Conversion
+
+```go
+// String to address
+addr, err := sdk.AccAddressFromBech32("cosmos1...")
+if err != nil {
+    return err
+}
+
+// Address to string
+addrStr := addr.String() // Returns bech32 format
+
+// Bytes to address
+addrBytes := []byte{0x01, 0x02, ...}
+addr = sdk.AccAddressFromBytes(addrBytes)
+
+// Address comparison
+if addr.Equals(otherAddr) {
+    // addresses match
+}
+
+// Check if empty
+if addr.Empty() {
+    return errors.New("empty address")
+}
+```
+
+### Cached Context
+
+```go
+// Create cached context for atomic operations
+cachedCtx, writeCache := ctx.CacheContext()
+
+// Perform operations
+err := k.DeductFee(cachedCtx, fee)
+if err != nil {
+    return err // Changes discarded
+}
+
+err = k.Transfer(cachedCtx, from, to, amount)
+if err != nil {
+    return err // Changes discarded
+}
+
+// Commit all changes atomically
+writeCache()
+```
+
+## Related APIs
+
+- [BaseApp](/api/baseapp) - Application lifecycle with Context
+- [Store](/api/store) - Accessing stores from Context
+- [Keeper Patterns](/api/keeper-patterns) - Using Context in keepers

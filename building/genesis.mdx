@@ -1,0 +1,498 @@
+---
+title: Genesis File Configuration
+description: Understand genesis file structure and initialization in Cosmos SDK chains
+---
+
+# Genesis File Configuration
+
+The genesis file defines the initial state of your blockchain. It contains the genesis accounts, module parameters, and initial validator set.
+
+## Genesis State Structure
+
+The genesis state is a map of module names to their genesis data from `simapp/genesis.go:1-15`:
+
+```go
+package simapp
+
+import (
+    "encoding/json"
+)
+
+// GenesisState of the blockchain is represented here as a map of raw json
+// messages key'd by a identifier string.
+// The identifier is used to determine which module genesis information belongs
+// to so it may be appropriately routed during init chain.
+// Within this application default genesis information is retrieved from
+// the ModuleBasicManager which populates json from each BasicModule
+// object provided to it during init.
+type GenesisState map[string]json.RawMessage
+```
+
+## Genesis File Format
+
+A typical genesis file includes:
+
+```json
+{
+  "app_name": "simd",
+  "app_version": "v0.50.0",
+  "genesis_time": "2024-01-01T00:00:00Z",
+  "chain_id": "my-chain-1",
+  "initial_height": 1,
+  "app_state": {
+    "auth": {...},
+    "bank": {...},
+    "staking": {...},
+    "distribution": {...}
+  },
+  "consensus": {
+    "params": {...},
+    "validators": [...]
+  }
+}
+```
+
+## Initializing Genesis
+
+### The init Command
+
+The `genutil` module provides the `init` command to create a genesis file. From `x/genutil/client/cli/init.go:77-194`:
+
+```go
+func InitCmd(mbm module.BasicManager, defaultNodeHome string) *cobra.Command {
+    cmd := &cobra.Command{
+        Use:   "init [moniker]",
+        Short: "Initialize private validator, p2p, genesis, and application configuration files",
+        Long:  `Initialize validators's and node's configuration files.`,
+        Args:  cobra.ExactArgs(1),
+        RunE: func(cmd *cobra.Command, args []string) error {
+            clientCtx := client.GetClientContextFromCmd(cmd)
+            cdc := clientCtx.Codec
+            serverCtx := server.GetServerContextFromCmd(cmd)
+            config := serverCtx.Config
+            config.SetRoot(clientCtx.HomeDir)
+
+            // Get or generate chain ID
+            chainID, _ := cmd.Flags().GetString(flags.FlagChainID)
+            switch {
+            case chainID != "":
+            case clientCtx.ChainID != "":
+                chainID = clientCtx.ChainID
+            default:
+                chainID = fmt.Sprintf("test-chain-%v", unsafe.Str(6))
+            }
+
+            // Initialize node validator files
+            nodeID, _, err := genutil.InitializeNodeValidatorFilesFromMnemonic(
+                config, 
+                mnemonic,
+            )
+            if err != nil {
+                return err
+            }
+
+            config.Moniker = args[0]
+            genFile := config.GenesisFile()
+
+            // Generate default genesis state
+            appGenState := mbm.DefaultGenesis(cdc)
+            appState, err := json.MarshalIndent(appGenState, "", " ")
+            if err != nil {
+                return err
+            }
+
+            // Create genesis file
+            appGenesis := &types.AppGenesis{}
+            appGenesis.AppName = version.AppName
+            appGenesis.AppVersion = version.Version
+            appGenesis.ChainID = chainID
+            appGenesis.AppState = appState
+            appGenesis.InitialHeight = initHeight
+            appGenesis.Consensus = &types.ConsensusGenesis{
+                Validators: nil,
+                Params:     cmttypes.DefaultConsensusParams(),
+            }
+
+            if err = genutil.ExportGenesisFile(appGenesis, genFile); err != nil {
+                return err
+            }
+
+            return displayInfo(toPrint)
+        },
+    }
+
+    cmd.Flags().String(flags.FlagHome, defaultNodeHome, "node's home directory")
+    cmd.Flags().BoolP(FlagOverwrite, "o", false, "overwrite the genesis.json file")
+    cmd.Flags().Bool(FlagRecover, false, "provide seed phrase to recover existing key")
+    cmd.Flags().String(flags.FlagChainID, "", "genesis file chain-id")
+    cmd.Flags().String(FlagDefaultBondDenom, "", "genesis file default denomination")
+    cmd.Flags().Int64(flags.FlagInitHeight, 1, "specify the initial block height")
+
+    return cmd
+}
+```
+
+## Default Genesis Generation
+
+Each module provides default genesis state from `runtime/app.go:243-246`:
+
+```go
+// DefaultGenesis returns a default genesis from the registered AppModuleBasic's.
+func (a *App) DefaultGenesis() map[string]json.RawMessage {
+    return a.basicManager.DefaultGenesis(a.cdc)
+}
+```
+
+For SimApp from `simapp/app.go:766-768`:
+
+```go
+func (a *SimApp) DefaultGenesis() map[string]json.RawMessage {
+    return a.BasicModuleManager.DefaultGenesis(a.appCodec)
+}
+```
+
+## InitChain Processing
+
+### Application InitChainer
+
+The `InitChainer` processes the genesis file during chain initialization from `simapp/app.go:701-711`:
+
+```go
+func (app *SimApp) InitChainer(
+    ctx sdk.Context, 
+    req *abci.RequestInitChain,
+) (*abci.ResponseInitChain, error) {
+    var genesisState GenesisState
+    if err := json.Unmarshal(req.AppStateBytes, &genesisState); err != nil {
+        panic(err)
+    }
+    
+    // Set module version map for upgrades
+    err := app.UpgradeKeeper.SetModuleVersionMap(
+        ctx, 
+        app.ModuleManager.GetVersionMap(),
+    )
+    if err != nil {
+        return nil, err
+    }
+    
+    return app.ModuleManager.InitGenesis(ctx, app.appCodec, genesisState)
+}
+```
+
+### Module InitGenesis Order
+
+Modules must be initialized in a specific order from `simapp/app.go:534-551`:
+
+```go
+genesisModuleOrder := []string{
+    authtypes.ModuleName,        // Must be first
+    banktypes.ModuleName,
+    distrtypes.ModuleName,
+    stakingtypes.ModuleName,
+    slashingtypes.ModuleName,
+    govtypes.ModuleName,
+    minttypes.ModuleName,
+    genutiltypes.ModuleName,     // Must be after staking
+    evidencetypes.ModuleName,
+    authz.ModuleName,
+    feegrant.ModuleName,
+    upgradetypes.ModuleName,
+    vestingtypes.ModuleName,
+    consensusparamtypes.ModuleName,
+    epochstypes.ModuleName,
+    protocolpooltypes.ModuleName,
+}
+
+app.ModuleManager.SetOrderInitGenesis(genesisModuleOrder...)
+```
+
+**Important ordering rules:**
+
+- `auth` must be first (creates accounts)
+- `bank` must be before modules that need balances
+- `staking` must be before `genutil` (validator setup)
+- `genutil` processes genesis transactions
+
+## Common Genesis Configurations
+
+### Auth Module Genesis
+
+Defines account settings:
+
+```json
+{
+  "auth": {
+    "params": {
+      "max_memo_characters": "256",
+      "tx_sig_limit": "7",
+      "tx_size_cost_per_byte": "10",
+      "sig_verify_cost_ed25519": "590",
+      "sig_verify_cost_secp256k1": "1000"
+    },
+    "accounts": [
+      {
+        "@type": "/cosmos.auth.v1beta1.BaseAccount",
+        "address": "cosmos1...",
+        "pub_key": null,
+        "account_number": "0",
+        "sequence": "0"
+      }
+    ]
+  }
+}
+```
+
+### Bank Module Genesis
+
+Defines initial balances and supply:
+
+```json
+{
+  "bank": {
+    "params": {
+      "send_enabled": [],
+      "default_send_enabled": true
+    },
+    "balances": [
+      {
+        "address": "cosmos1...",
+        "coins": [
+          {
+            "denom": "stake",
+            "amount": "100000000"
+          }
+        ]
+      }
+    ],
+    "supply": [
+      {
+        "denom": "stake",
+        "amount": "100000000"
+      }
+    ],
+    "denom_metadata": []
+  }
+}
+```
+
+### Staking Module Genesis
+
+Defines validators and staking parameters:
+
+```json
+{
+  "staking": {
+    "params": {
+      "unbonding_time": "1814400s",
+      "max_validators": 100,
+      "max_entries": 7,
+      "historical_entries": 10000,
+      "bond_denom": "stake",
+      "min_commission_rate": "0.000000000000000000"
+    },
+    "last_total_power": "0",
+    "last_validator_powers": [],
+    "validators": [],
+    "delegations": [],
+    "unbonding_delegations": [],
+    "redelegations": [],
+    "exported": false
+  }
+}
+```
+
+### Gov Module Genesis
+
+Defines governance parameters:
+
+```json
+{
+  "gov": {
+    "starting_proposal_id": "1",
+    "deposits": [],
+    "votes": [],
+    "proposals": [],
+    "params": {
+      "min_deposit": [
+        {
+          "denom": "stake",
+          "amount": "10000000"
+        }
+      ],
+      "max_deposit_period": "172800s",
+      "voting_period": "172800s",
+      "quorum": "0.334000000000000000",
+      "threshold": "0.500000000000000000",
+      "veto_threshold": "0.334000000000000000"
+    }
+  }
+}
+```
+
+## Testing Genesis States
+
+Create custom genesis states for testing from `simapp/test_helpers.go:123-151`:
+
+```go
+func SetupWithGenesisValSet(
+    t *testing.T, 
+    valSet *cmttypes.ValidatorSet, 
+    genAccs []authtypes.GenesisAccount, 
+    balances ...banktypes.Balance,
+) *SimApp {
+    t.Helper()
+
+    app, genesisState := setup(true, 5)
+    
+    // Create genesis state with validator set
+    genesisState, err := simtestutil.GenesisStateWithValSet(
+        app.AppCodec(), 
+        genesisState, 
+        valSet, 
+        genAccs, 
+        balances...,
+    )
+    require.NoError(t, err)
+
+    stateBytes, err := json.MarshalIndent(genesisState, "", " ")
+    require.NoError(t, err)
+
+    // Initialize chain with genesis state
+    _, err = app.InitChain(&abci.RequestInitChain{
+        Validators:      []abci.ValidatorUpdate{},
+        ConsensusParams: simtestutil.DefaultConsensusParams,
+        AppStateBytes:   stateBytes,
+    })
+    require.NoError(t, err)
+
+    return app
+}
+```
+
+## Genesis Simulation
+
+Generate random genesis states for simulation testing from `simapp/sim_test.go:62-70`:
+
+```go
+func setupStateFactory(app *SimApp) sims.SimStateFactory {
+    return sims.SimStateFactory{
+        Codec:         app.AppCodec(),
+        AppStateFn:    simtestutil.AppStateFn(
+            app.AppCodec(), 
+            app.SimulationManager(), 
+            app.DefaultGenesis(),
+        ),
+        BlockedAddr:   BlockedAddresses(),
+        AccountSource: app.AccountKeeper,
+        BalanceSource: app.BankKeeper,
+    }
+}
+```
+
+## Exporting Genesis
+
+Export current chain state to genesis format from `simapp/app_test.go:82-96`:
+
+```go
+exported, err := app.ExportAppStateAndValidators(
+    false,              // jailAllowedAddrs
+    exportWithValidatorSet,
+    exportAllModules,
+)
+require.NoError(t, err)
+
+// Use exported state to initialize new chain
+var genesisState GenesisState
+require.NoError(t, json.Unmarshal(exported.AppState, &genesisState))
+
+newApp := NewSimApp(...)
+_, err = newApp.ModuleManager.InitGenesis(
+    ctx, 
+    newApp.appCodec, 
+    genesisState,
+)
+```
+
+## Chain Initialization Flow
+
+1. **Genesis file created** - Via `init` command or manual creation
+2. **Node starts** - Reads genesis file from data directory
+3. **InitChain called** - CometBFT calls ABCI `InitChain`
+4. **Genesis unmarshaled** - App state bytes decoded to module genesis
+5. **Modules initialized** - Each module processes its genesis in order
+6. **Validators set** - Initial validator set configured
+7. **First block** - Chain begins producing blocks
+
+## Validation
+
+Validate genesis files before starting:
+
+```bash
+# Validate genesis file structure
+simd validate-genesis
+
+# Collect genesis transactions
+simd collect-gentxs
+
+# Add genesis account
+simd genesis add-genesis-account cosmos1... 100000000stake
+
+# Generate genesis transaction
+simd genesis gentx validator1 1000000stake \
+  --chain-id my-chain-1 \
+  --moniker "Validator 1"
+```
+
+## Best Practices
+
+### Use Sensible Defaults
+
+- Set appropriate unbonding periods (e.g., 21 days)
+- Configure reasonable voting periods
+- Set minimum deposits that balance accessibility and spam prevention
+
+### Account Setup
+
+- Fund fee collector account for validator rewards
+- Ensure module accounts have correct permissions
+- Set up initial validator accounts with sufficient stake
+
+### Parameter Tuning
+
+- Test governance parameters before mainnet
+- Configure block gas limits appropriately
+- Set inflation parameters for your tokenomics
+
+### Testing
+
+- Always test genesis files in testnet first
+- Verify all accounts and balances
+- Test upgrade paths from genesis
+- Validate consensus parameters
+
+## Common Issues
+
+### Empty Validator Set
+
+Ensure `genutil` module runs after `staking` and includes genesis transactions:
+
+```bash
+simd genesis gentx validator1 1000000stake --chain-id my-chain-1
+simd genesis collect-gentxs
+```
+
+### Module Ordering
+
+Incorrect module order causes initialization failures. Always follow dependency order.
+
+### Balance Mismatches
+
+Total supply must equal sum of all account balances plus module account balances.
+
+## Next Steps
+
+- Learn [App Creation](/building/app-creation) patterns
+- Explore [Testing](/building/testing) genesis configurations
+- Understand [Simulation](/building/simulation) for genesis fuzzing
+- Review [Module Development](/modules/overview)

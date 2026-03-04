@@ -1,0 +1,435 @@
+---
+title: Module Manager
+description: Module lifecycle coordination and dependency management
+---
+
+## Overview
+
+The Module Manager orchestrates the lifecycle of all modules in a Cosmos SDK application, handling initialization, genesis operations, begin/end block execution, and migrations.
+
+## Core Types
+
+### Manager
+
+```go
+type Manager struct {
+    Modules                   map[string]interface{}
+    OrderInitGenesis          []string
+    OrderExportGenesis        []string
+    OrderBeginBlockers        []string
+    OrderEndBlockers          []string
+    OrderPrepareCheckStaters  []string
+    OrderPrecommiters         []string
+    OrderMigrations           []string
+}
+```
+
+**Location:** `types/module/module.go`
+
+Manager handles module lifecycle operations in a specific order.
+
+### AppModule Interface
+
+```go
+type AppModule interface {
+    AppModuleBasic
+    
+    // RegisterServices allows a module to register services
+    RegisterServices(Configurator)
+    
+    // ConsensusVersion is a sequence number for state-breaking change
+    ConsensusVersion() uint64
+}
+```
+
+**Location:** `types/module/module.go`
+
+### AppModuleBasic Interface
+
+```go
+type AppModuleBasic interface {
+    HasName
+    RegisterLegacyAminoCodec(*codec.LegacyAmino)
+    RegisterInterfaces(types.InterfaceRegistry)
+    RegisterGRPCGatewayRoutes(client.Context, *runtime.ServeMux)
+}
+```
+
+**Location:** `types/module/module.go:60-66`
+
+Basic, non-dependent module functionality.
+
+### HasGenesis Interface
+
+```go
+type HasGenesis interface {
+    HasGenesisBasics
+    InitGenesis(sdk.Context, codec.JSONCodec, json.RawMessage)
+    ExportGenesis(sdk.Context, codec.JSONCodec) json.RawMessage
+}
+
+type HasABCIGenesis interface {
+    HasGenesisBasics
+    InitGenesis(sdk.Context, codec.JSONCodec, json.RawMessage) []abci.ValidatorUpdate
+    ExportGenesis(sdk.Context, codec.JSONCodec) json.RawMessage
+}
+```
+
+**Location:** `types/module/module.go:190-200`
+
+## Creating a Manager
+
+### NewManager
+
+```go
+func NewManager(modules ...AppModule) *Manager
+
+// Usage
+app.ModuleManager = module.NewManager(
+    auth.NewAppModule(app.AccountKeeper),
+    bank.NewAppModule(app.BankKeeper, app.AccountKeeper),
+    staking.NewAppModule(app.StakingKeeper, app.AccountKeeper, app.BankKeeper),
+    distribution.NewAppModule(app.DistrKeeper, app.AccountKeeper, app.BankKeeper, app.StakingKeeper),
+    gov.NewAppModule(app.GovKeeper, app.AccountKeeper, app.BankKeeper),
+    // ... other modules
+)
+```
+
+### NewManagerFromMap
+
+```go
+func NewManagerFromMap(modules map[string]appmodule.AppModule) *Manager
+
+// Used with runtime/depinject
+app.ModuleManager = module.NewManagerFromMap(moduleMap)
+```
+
+**Location:** `types/module/module.go`
+
+## Setting Module Order
+
+### SetOrderInitGenesis
+
+```go
+func (m *Manager) SetOrderInitGenesis(moduleNames ...string)
+
+// Example
+app.ModuleManager.SetOrderInitGenesis(
+    authtypes.ModuleName,
+    banktypes.ModuleName,
+    stakingtypes.ModuleName,
+    distrtypes.ModuleName,
+    govtypes.ModuleName,
+    minttypes.ModuleName,
+)
+```
+
+Defines the order in which modules are initialized during genesis.
+
+### SetOrderExportGenesis
+
+```go
+func (m *Manager) SetOrderExportGenesis(moduleNames ...string)
+
+app.ModuleManager.SetOrderExportGenesis(
+    authtypes.ModuleName,
+    banktypes.ModuleName,
+    stakingtypes.ModuleName,
+    // ...
+)
+```
+
+Defines export order for genesis state.
+
+### SetOrderBeginBlockers
+
+```go
+func (m *Manager) SetOrderBeginBlockers(moduleNames ...string)
+
+app.ModuleManager.SetOrderBeginBlockers(
+    minttypes.ModuleName,      // Mint new tokens first
+    distrtypes.ModuleName,     // Then distribute rewards
+    slashingtypes.ModuleName,  // Apply slashing
+    stakingtypes.ModuleName,   // Process staking
+)
+```
+
+Defines the order of BeginBlock execution.
+
+### SetOrderEndBlockers
+
+```go
+func (m *Manager) SetOrderEndBlockers(moduleNames ...string)
+
+app.ModuleManager.SetOrderEndBlockers(
+    stakingtypes.ModuleName,  // Process validator updates
+    govtypes.ModuleName,      // Execute passed proposals
+)
+```
+
+Defines the order of EndBlock execution.
+
+## Module Operations
+
+### InitGenesis
+
+```go
+func (m *Manager) InitGenesis(
+    ctx sdk.Context,
+    cdc codec.JSONCodec,
+    genesisData map[string]json.RawMessage,
+) abci.ResponseInitChain
+
+// Called in app.InitChainer
+func (app *App) InitChainer(
+    ctx sdk.Context,
+    req *abci.RequestInitChain,
+) (*abci.ResponseInitChain, error) {
+    var genesisState GenesisState
+    if err := json.Unmarshal(req.AppStateBytes, &genesisState); err != nil {
+        return nil, err
+    }
+    
+    return app.ModuleManager.InitGenesis(ctx, app.appCodec, genesisState), nil
+}
+```
+
+### ExportGenesis
+
+```go
+func (m *Manager) ExportGenesis(
+    ctx sdk.Context,
+    cdc codec.JSONCodec,
+) map[string]json.RawMessage
+
+// Export current state
+func (app *App) ExportAppStateAndValidators(
+    forZeroHeight bool,
+    jailAllowedAddrs []string,
+) (servertypes.ExportedApp, error) {
+    ctx := app.NewContext(true)
+    
+    if forZeroHeight {
+        // Prepare for zero height export
+        app.prepForZeroHeightGenesis(ctx, jailAllowedAddrs)
+    }
+    
+    genState := app.ModuleManager.ExportGenesis(ctx, app.appCodec)
+    appState, err := json.MarshalIndent(genState, "", "  ")
+    if err != nil {
+        return servertypes.ExportedApp{}, err
+    }
+    
+    validators, err := staking.WriteValidators(ctx, app.StakingKeeper)
+    return servertypes.ExportedApp{
+        AppState:        appState,
+        Validators:      validators,
+        Height:          app.LastBlockHeight(),
+        ConsensusParams: app.BaseApp.GetConsensusParams(ctx),
+    }, err
+}
+```
+
+### RegisterServices
+
+```go
+func (m *Manager) RegisterServices(cfg Configurator)
+
+// Called during app initialization
+func (app *App) RegisterServices() {
+    app.configurator = module.NewConfigurator(
+        app.appCodec,
+        app.MsgServiceRouter(),
+        app.GRPCQueryRouter(),
+    )
+    app.ModuleManager.RegisterServices(app.configurator)
+}
+```
+
+## Configurator
+
+```go
+type Configurator interface {
+    // MsgServer returns a gRPC message server
+    MsgServer() grpc.Server
+    
+    // QueryServer returns a gRPC query server
+    QueryServer() grpc.Server
+    
+    // RegisterMigration registers an in-place store migration
+    RegisterMigration(
+        moduleName string,
+        fromVersion uint64,
+        handler MigrationHandler,
+    ) error
+}
+
+type MigrationHandler func(sdk.Context) error
+```
+
+Configurator provides tools for modules to register services and migrations.
+
+## Module Migrations
+
+### Registering Migrations
+
+```go
+package mymodule
+
+import (
+    "github.com/cosmos/cosmos-sdk/types/module"
+)
+
+func (am AppModule) RegisterServices(cfg module.Configurator) {
+    // Register msg and query servers
+    types.RegisterMsgServer(cfg.MsgServer(), keeper.NewMsgServerImpl(am.keeper))
+    types.RegisterQueryServer(cfg.QueryServer(), am.keeper)
+    
+    // Register migrations
+    err := cfg.RegisterMigration(
+        types.ModuleName,
+        1, // from version
+        func(ctx sdk.Context) error {
+            return keeper.MigrateV1ToV2(ctx, am.keeper)
+        },
+    )
+    if err != nil {
+        panic(err)
+    }
+    
+    err = cfg.RegisterMigration(
+        types.ModuleName,
+        2, // from version
+        func(ctx sdk.Context) error {
+            return keeper.MigrateV2ToV3(ctx, am.keeper)
+        },
+    )
+    if err != nil {
+        panic(err)
+    }
+}
+
+func (am AppModule) ConsensusVersion() uint64 {
+    return 3 // current version
+}
+```
+
+### Running Migrations
+
+```go
+func (m *Manager) RunMigrations(
+    ctx sdk.Context,
+    cfg Configurator,
+    fromVM VersionMap,
+) (VersionMap, error)
+
+// In upgrade handler
+func (app *App) RegisterUpgradeHandlers() {
+    app.UpgradeKeeper.SetUpgradeHandler(
+        "v2",
+        func(ctx sdk.Context, plan upgradetypes.Plan, fromVM module.VersionMap) (module.VersionMap, error) {
+            // Run all module migrations
+            return app.ModuleManager.RunMigrations(ctx, app.configurator, fromVM)
+        },
+    )
+}
+```
+
+## Usage in SimApp
+
+```go
+package simapp
+
+import (
+    "github.com/cosmos/cosmos-sdk/types/module"
+)
+
+func NewSimApp(
+    logger log.Logger,
+    db dbm.DB,
+    // ...
+) *SimApp {
+    // ... create keepers ...
+    
+    // Create module manager
+    app.ModuleManager = module.NewManager(
+        auth.NewAppModule(appCodec, app.AccountKeeper, authsims.RandomGenesisAccounts),
+        vesting.NewAppModule(app.AccountKeeper, app.BankKeeper),
+        bank.NewAppModule(appCodec, app.BankKeeper, app.AccountKeeper),
+        staking.NewAppModule(appCodec, app.StakingKeeper, app.AccountKeeper, app.BankKeeper),
+        distr.NewAppModule(appCodec, app.DistrKeeper, app.AccountKeeper, app.BankKeeper, app.StakingKeeper),
+        gov.NewAppModule(appCodec, &app.GovKeeper, app.AccountKeeper, app.BankKeeper),
+        mint.NewAppModule(appCodec, app.MintKeeper, app.AccountKeeper),
+        slashing.NewAppModule(appCodec, app.SlashingKeeper, app.AccountKeeper, app.BankKeeper, app.StakingKeeper),
+        upgrade.NewAppModule(app.UpgradeKeeper),
+    )
+    
+    // Set order of operations
+    app.ModuleManager.SetOrderInitGenesis(
+        authtypes.ModuleName,
+        banktypes.ModuleName,
+        distrtypes.ModuleName,
+        stakingtypes.ModuleName,
+        slashingtypes.ModuleName,
+        govtypes.ModuleName,
+        minttypes.ModuleName,
+        upgradetypes.ModuleName,
+    )
+    
+    app.ModuleManager.SetOrderBeginBlockers(
+        minttypes.ModuleName,
+        distrtypes.ModuleName,
+        slashingtypes.ModuleName,
+        stakingtypes.ModuleName,
+    )
+    
+    app.ModuleManager.SetOrderEndBlockers(
+        govtypes.ModuleName,
+        stakingtypes.ModuleName,
+    )
+    
+    // Register services
+    app.configurator = module.NewConfigurator(
+        app.appCodec,
+        app.MsgServiceRouter(),
+        app.GRPCQueryRouter(),
+    )
+    app.ModuleManager.RegisterServices(app.configurator)
+    
+    // Set init chainer, begin blocker, end blocker
+    app.SetInitChainer(app.InitChainer)
+    app.SetBeginBlocker(app.BeginBlocker)
+    app.SetEndBlocker(app.EndBlocker)
+    
+    return app
+}
+
+func (app *SimApp) InitChainer(
+    ctx sdk.Context,
+    req *abci.RequestInitChain,
+) (*abci.ResponseInitChain, error) {
+    var genesisState GenesisState
+    if err := json.Unmarshal(req.AppStateBytes, &genesisState); err != nil {
+        return nil, err
+    }
+    return app.ModuleManager.InitGenesis(ctx, app.appCodec, genesisState), nil
+}
+
+func (app *SimApp) BeginBlocker(
+    ctx sdk.Context,
+) (sdk.BeginBlock, error) {
+    return app.ModuleManager.BeginBlock(ctx)
+}
+
+func (app *SimApp) EndBlocker(
+    ctx sdk.Context,
+) (sdk.EndBlock, error) {
+    return app.ModuleManager.EndBlock(ctx)
+}
+```
+
+## Related APIs
+
+- [BaseApp](/api/baseapp) - Application lifecycle
+- [Runtime](/api/runtime) - Dependency injection
+- [Keeper Patterns](/api/keeper-patterns) - Module state management

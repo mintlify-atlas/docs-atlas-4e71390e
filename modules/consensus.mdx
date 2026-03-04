@@ -1,0 +1,353 @@
+---
+title: Consensus Module
+description: Modify CometBFT consensus parameters through governance
+---
+
+# Consensus Module (x/consensus)
+
+## Overview
+
+The `x/consensus` module provides functionality to modify CometBFT's ABCI consensus parameters on-chain through governance proposals, eliminating the need for hard forks when updating critical consensus settings.
+
+**Purpose**: Enable dynamic updates to blockchain consensus parameters through governance without requiring chain restarts or hard forks.
+
+## Key Features
+
+- **On-Chain Parameter Updates**: Modify consensus parameters through governance
+- **Authority Control**: Restrict parameter updates to authorized addresses
+- **Comprehensive Validation**: Ensure parameter changes are safe before application
+- **ABCI Integration**: Direct integration with CometBFT consensus engine
+- **No Hard Forks Required**: Update consensus rules seamlessly
+
+## Consensus Parameters
+
+The module manages four categories of CometBFT consensus parameters:
+
+### Block Parameters
+
+Control block size and gas limits:
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| MaxBytes | int64 | Maximum block size in bytes (e.g., 22020096 = ~21MB) |
+| MaxGas | int64 | Maximum gas per block (e.g., 10000000) |
+
+**Example Values**:
+```go
+Block: &types.BlockParams{
+    MaxBytes: 22020096,  // ~21MB
+    MaxGas:   10000000,  // 10M gas units
+}
+```
+
+### Evidence Parameters
+
+Control how evidence of misbehavior is handled:
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| MaxAgeNumBlocks | int64 | Maximum age of evidence in blocks |
+| MaxAgeDuration | time.Duration | Maximum age of evidence in time |
+| MaxBytes | int64 | Maximum evidence size in bytes |
+
+**Example Values**:
+```go
+Evidence: &types.EvidenceParams{
+    MaxAgeNumBlocks: 100000,        // blocks
+    MaxAgeDuration:  48 * time.Hour, // 2 days
+    MaxBytes:        1048576,        // 1MB
+}
+```
+
+### Validator Parameters
+
+Define supported validator key types:
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| PubKeyTypes | []string | Supported public key algorithms for validators |
+
+**Supported Key Types**:
+- `ed25519` - Primary key type for CometBFT validators
+- `secp256k1` - Alternative key type
+
+**Example Values**:
+```go
+Validator: &types.ValidatorParams{
+    PubKeyTypes: []string{"ed25519"},
+}
+```
+
+### ABCI Parameters
+
+Control advanced ABCI features:
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| VoteExtensionsEnableHeight | int64 | Block height to enable vote extensions (0 = disabled) |
+
+**Example Values**:
+```go
+Abci: &types.ABCIParams{
+    VoteExtensionsEnableHeight: 0,  // disabled
+}
+```
+
+## Messages
+
+### MsgUpdateParams
+
+Update consensus parameters through governance:
+
+```go
+message MsgUpdateParams {
+    // Authority is the address that controls protocol parameters
+    string authority = 1;
+    
+    // Block parameters
+    BlockParams block = 2;
+    
+    // Evidence parameters
+    EvidenceParams evidence = 3;
+    
+    // Validator parameters
+    ValidatorParams validator = 4;
+    
+    // ABCI parameters
+    ABCIParams abci = 5;
+}
+```
+
+**Validation Rules**:
+- Signer must be the designated authority (typically governance module)
+- Block parameters must be positive and within safe limits
+- Evidence age parameters must be positive
+- Validator key types must be supported by the chain
+
+## Queries
+
+### Query Current Parameters
+
+Retrieve the current consensus parameters:
+
+```bash
+simd query consensus params
+```
+
+Example output:
+```yaml
+block:
+  max_bytes: "22020096"
+  max_gas: "10000000"
+evidence:
+  max_age_num_blocks: "100000"
+  max_age_duration: "172800000000000"
+  max_bytes: "1048576"
+validator:
+  pub_key_types:
+  - ed25519
+abci:
+  vote_extensions_enable_height: "0"
+```
+
+## Governance Proposal
+
+### Create Parameter Update Proposal
+
+Submit a governance proposal to update consensus parameters:
+
+```go
+import (
+    "time"
+    consensustypes "github.com/cosmos/cosmos-sdk/x/consensus/types"
+    govtypes "github.com/cosmos/cosmos-sdk/x/gov/types"
+    authtypes "github.com/cosmos/cosmos-sdk/x/auth/types"
+)
+
+// Create update message
+msg := &consensustypes.MsgUpdateParams{
+    Authority: authtypes.NewModuleAddress(govtypes.ModuleName).String(),
+    Block: &consensustypes.BlockParams{
+        MaxBytes: 25165824, // Increase to ~24MB
+        MaxGas:   15000000, // Increase to 15M gas
+    },
+    Evidence: &consensustypes.EvidenceParams{
+        MaxAgeNumBlocks: 150000,
+        MaxAgeDuration:  72 * time.Hour,
+        MaxBytes:        2097152, // 2MB
+    },
+    Validator: &consensustypes.ValidatorParams{
+        PubKeyTypes: []string{"ed25519"},
+    },
+    Abci: &consensustypes.ABCIParams{
+        VoteExtensionsEnableHeight: 1000000,
+    },
+}
+```
+
+### Submit via CLI
+
+```bash
+simd tx gov submit-proposal \
+    --title="Increase Block Size" \
+    --summary="Proposal to increase max block size to 24MB" \
+    --deposit=10000000stake \
+    --from=mykey
+```
+
+## gRPC Endpoints
+
+### Query Params
+
+```bash
+grpcurl -plaintext \
+    localhost:9090 \
+    cosmos.consensus.v1.Query/Params
+```
+
+Example output:
+```json
+{
+  "params": {
+    "block": {
+      "maxBytes": "22020096",
+      "maxGas": "10000000"
+    },
+    "evidence": {
+      "maxAgeNumBlocks": "100000",
+      "maxAgeDuration": "172800s",
+      "maxBytes": "1048576"
+    },
+    "validator": {
+      "pubKeyTypes": ["ed25519"]
+    },
+    "abci": {
+      "voteExtensionsEnableHeight": "0"
+    }
+  }
+}
+```
+
+## Code Examples
+
+### Query Current Parameters
+
+```go
+// Query consensus parameters
+params, err := consensusKeeper.Params(ctx)
+if err != nil {
+    return err
+}
+
+fmt.Printf("Max Block Size: %d bytes\n", params.Block.MaxBytes)
+fmt.Printf("Max Gas: %d\n", params.Block.MaxGas)
+```
+
+### Update Parameters (via Handler)
+
+```go
+// In upgrade handler or governance execution
+func updateConsensusParams(ctx sdk.Context, keeper consensuskeeper.Keeper) error {
+    params := consensustypes.Params{
+        Block: &consensustypes.BlockParams{
+            MaxBytes: 25165824,
+            MaxGas:   15000000,
+        },
+        Evidence: &consensustypes.EvidenceParams{
+            MaxAgeNumBlocks: 150000,
+            MaxAgeDuration:  72 * time.Hour,
+            MaxBytes:        2097152,
+        },
+        Validator: &consensustypes.ValidatorParams{
+            PubKeyTypes: []string{"ed25519"},
+        },
+        Abci: &consensustypes.ABCIParams{
+            VoteExtensionsEnableHeight: 0,
+        },
+    }
+    
+    return keeper.SetParams(ctx, params)
+}
+```
+
+### Validate Parameters
+
+```go
+// Validate before updating
+func validateParams(params consensustypes.Params) error {
+    if params.Block.MaxBytes <= 0 {
+        return fmt.Errorf("max bytes must be positive")
+    }
+    
+    if params.Block.MaxGas < -1 {
+        return fmt.Errorf("max gas must be -1 (unlimited) or positive")
+    }
+    
+    if params.Evidence.MaxAgeNumBlocks <= 0 {
+        return fmt.Errorf("evidence max age blocks must be positive")
+    }
+    
+    return nil
+}
+```
+
+## Security Considerations
+
+### Authority Control
+
+Only the designated authority can update parameters:
+
+```go
+if msg.Authority != consensusKeeper.GetAuthority() {
+    return errorsmod.Wrapf(
+        govtypes.ErrInvalidSigner,
+        "invalid authority; expected %s, got %s",
+        consensusKeeper.GetAuthority(),
+        msg.Authority,
+    )
+}
+```
+
+### Parameter Limits
+
+Recommended safe ranges:
+
+- **MaxBytes**: 1MB - 100MB (too small = low throughput, too large = network issues)
+- **MaxGas**: -1 (unlimited) or 1M - 100M
+- **MaxAgeNumBlocks**: 10,000 - 1,000,000 blocks
+- **MaxAgeDuration**: 24 hours - 21 days
+
+## Best Practices
+
+1. **Test Changes**: Thoroughly test parameter changes on testnets before mainnet
+2. **Gradual Increases**: Increase block size gradually to monitor network performance
+3. **Monitor Impact**: Track block times, network bandwidth, and validator performance
+4. **Community Consensus**: Gather community feedback before major parameter changes
+5. **Emergency Plans**: Have rollback plans for problematic parameter changes
+
+## Integration Guide
+
+```go
+// Initialize consensus keeper
+app.ConsensusKeeper = consensuskeeper.NewKeeper(
+    appCodec,
+    runtime.NewKVStoreService(keys[consensustypes.StoreKey]),
+    authtypes.NewModuleAddress(govtypes.ModuleName).String(),
+)
+
+// Register module
+app.ModuleManager = module.NewManager(
+    consensus.NewAppModule(appCodec, app.ConsensusKeeper),
+    // other modules...
+)
+
+// Set consensus params in base app
+app.SetParamStore(app.ConsensusKeeper.ParamsStore)
+```
+
+## CLI Commands Reference
+
+| Command | Description |
+|---------|-------------|
+| `simd query consensus params` | Query current consensus parameters |
+| `simd tx gov submit-proposal` | Submit parameter update proposal |

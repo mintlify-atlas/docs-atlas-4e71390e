@@ -1,0 +1,562 @@
+---
+title: Protocol Pool Module (x/protocolpool)
+description: Learn about the x/protocolpool module for managing community pool funds in Cosmos SDK.
+---
+
+# Protocol Pool Module (x/protocolpool)
+
+The `x/protocolpool` module provides enhanced community pool functionality for Cosmos SDK chains. It offers a separate module account for tracking community pool assets, continuous funding mechanisms, and better integration with governance and distribution modules.
+
+## Overview
+
+Starting with Cosmos SDK v0.53, the `x/protocolpool` module can replace the community pool functionality of `x/distribution`. It provides:
+
+- **Dedicated module account** for community pool assets
+- **Continuous fund streams** for recurring payments to recipients
+- **Better fund tracking** and management
+- **Governance integration** for spending decisions
+
+This module is **supplemental** - chains can choose to use it instead of the built-in `x/distribution` community pool.
+
+## Key Concepts
+
+### Module Accounts
+
+The protocol pool uses two module accounts:
+
+1. **protocolpool**: Main community pool storage
+2. **protocolpool-escrow**: Intermediate account for distribution
+
+```go
+const (
+    ModuleName                 = "protocolpool"
+    ProtocolPoolEscrowAccount = "protocolpool-escrow"
+)
+```
+
+### ContinuousFund
+
+A continuous fund is a recurring payment stream to a specific recipient:
+
+```go
+type ContinuousFund struct {
+    Recipient  string              // Recipient address
+    Percentage math.LegacyDec      // Percentage of pool to distribute
+    Expiry     *time.Time          // Optional expiration time
+}
+```
+
+**How it works:**
+
+1. Funds accumulate in the escrow account from block rewards
+2. In `BeginBlock`, the keeper calculates each recipient's share based on percentage
+3. Funds are transferred to recipients
+4. Remaining funds go to the main community pool
+
+## Keeper Functions
+
+### FundCommunityPool
+
+Allow any account to fund the community pool:
+
+```go
+amount := sdk.NewCoins(sdk.NewInt64Coin("stake", 10000))
+err := k.FundCommunityPool(ctx, amount, senderAddr)
+```
+
+**Implementation:**
+
+```go
+func (k Keeper) FundCommunityPool(ctx sdk.Context, amount sdk.Coins, sender sdk.AccAddress) error {
+    return k.bankKeeper.SendCoinsFromAccountToModule(ctx, sender, types.ModuleName, amount)
+}
+```
+
+### DistributeFromCommunityPool
+
+Distribute funds from the pool to a recipient:
+
+```go
+amount := sdk.NewCoins(sdk.NewInt64Coin("stake", 5000))
+err := k.DistributeFromCommunityPool(ctx, amount, recipientAddr)
+```
+
+**Implementation:**
+
+```go
+func (k Keeper) DistributeFromCommunityPool(ctx sdk.Context, amount sdk.Coins, receiveAddr sdk.AccAddress) error {
+    return k.bankKeeper.SendCoinsFromModuleToAccount(ctx, types.ModuleName, receiveAddr, amount)
+}
+```
+
+### GetCommunityPool
+
+Retrieve the current community pool balance:
+
+```go
+balance, err := k.GetCommunityPool(ctx)
+if err != nil {
+    return err
+}
+
+fmt.Printf("Community pool balance: %s\n", balance)
+```
+
+**Implementation:**
+
+```go
+func (k Keeper) GetCommunityPool(ctx sdk.Context) (sdk.Coins, error) {
+    moduleAccount := k.authKeeper.GetModuleAccount(ctx, types.ModuleName)
+    if moduleAccount == nil {
+        return nil, sdkerrors.ErrUnknownAddress.Wrapf("module account %s does not exist", types.ModuleName)
+    }
+    return k.bankKeeper.GetAllBalances(ctx, moduleAccount.GetAddress()), nil
+}
+```
+
+## Message Handlers
+
+### MsgFundCommunityPool
+
+Send coins directly to the community pool:
+
+```go
+type MsgFundCommunityPool struct {
+    Amount    sdk.Coins
+    Depositor string
+}
+```
+
+**Example:**
+
+```go
+msg := &types.MsgFundCommunityPool{
+    Amount:    sdk.NewCoins(sdk.NewInt64Coin("stake", 1000)),
+    Depositor: depositorAddr.String(),
+}
+
+// Execute transaction
+res, err := msgServer.FundCommunityPool(ctx, msg)
+```
+
+### MsgCommunityPoolSpend
+
+Spend funds from the community pool (governance or authorized accounts):
+
+```go
+type MsgCommunityPoolSpend struct {
+    Authority string    // Module authority (governance)
+    Recipient string    // Recipient address
+    Amount    sdk.Coins // Amount to spend
+}
+```
+
+**Example:**
+
+```go
+msg := &types.MsgCommunityPoolSpend{
+    Authority: govModuleAddr.String(),
+    Recipient: recipientAddr.String(),
+    Amount:    sdk.NewCoins(sdk.NewInt64Coin("stake", 5000)),
+}
+
+// Submit via governance proposal
+proposal := govtypes.NewMsgSubmitProposal([]sdk.Msg{msg}, ...)
+```
+
+**Validation:**
+
+- Authority must match the module authority address
+- Recipient cannot be a blocked address
+- Amount must be available in the pool
+
+### MsgCreateContinuousFund
+
+Create a continuous fund stream to a recipient:
+
+```go
+type MsgCreateContinuousFund struct {
+    Authority  string            // Module authority
+    Recipient  string            // Recipient address
+    Percentage math.LegacyDec    // Percentage of funds (0.0 - 1.0)
+    Expiry     *time.Time        // Optional expiration
+}
+```
+
+**Example:**
+
+```go
+// Grant 2% of block rewards to a development team
+percentage := math.LegacyNewDecWithPrec(2, 2) // 0.02 = 2%
+expiry := time.Now().Add(365 * 24 * time.Hour) // 1 year
+
+msg := &types.MsgCreateContinuousFund{
+    Authority:  govModuleAddr.String(),
+    Recipient:  teamAddr.String(),
+    Percentage: percentage,
+    Expiry:     &expiry,
+}
+```
+
+**Validation:**
+
+```go
+if msg.Percentage.LTE(math.LegacyZeroDec()) || msg.Percentage.GT(math.LegacyOneDec()) {
+    return errors.New("percentage must be between 0 and 1")
+}
+
+if msg.Expiry != nil && msg.Expiry.Before(ctx.BlockTime()) {
+    return errors.New("expiry must be in the future")
+}
+```
+
+**Note:** Creating a continuous fund to an address that already has one will **replace** the existing fund.
+
+### MsgCancelContinuousFund
+
+Cancel an existing continuous fund:
+
+```go
+msg := &types.MsgCancelContinuousFund{
+    Authority:          govModuleAddr.String(),
+    RecipientAddress:  teamAddr.String(),
+}
+```
+
+## Continuous Fund Distribution
+
+The keeper distributes continuous funds in `BeginBlock`:
+
+```go
+func (k Keeper) DistributeFunds(ctx sdk.Context) error {
+    // Get escrow account balance
+    moduleAccount := k.authKeeper.GetModuleAccount(ctx, types.ProtocolPoolEscrowAccount)
+    params, _ := k.Params.Get(ctx)
+
+    // Only distribute whitelisted denoms
+    amountToDistribute := sdk.NewCoins()
+    for _, denom := range params.EnabledDistributionDenoms {
+        bal := k.bankKeeper.GetBalance(ctx, moduleAccount.GetAddress(), denom)
+        amountToDistribute = append(amountToDistribute, bal)
+    }
+
+    if amountToDistribute.IsZero() {
+        return nil
+    }
+
+    remainingCoins := sdk.NewCoins(amountToDistribute...)
+    iter, _ := k.ContinuousFunds.Iterate(ctx, nil)
+    kValues, _ := iter.KeyValues()
+
+    blockTime := ctx.BlockTime()
+    for _, kv := range kValues {
+        recipient := kv.Key
+        fund := kv.Value
+
+        // Remove expired funds
+        if fund.Expiry != nil && fund.Expiry.Before(blockTime) {
+            k.ContinuousFunds.Remove(ctx, recipient)
+            continue
+        }
+
+        // Calculate and distribute recipient's share
+        amountToStream := PercentageCoinMul(fund.Percentage, amountToDistribute)
+        remainingCoins, _ = remainingCoins.SafeSub(amountToStream...)
+
+        k.bankKeeper.SendCoinsFromModuleToAccount(
+            ctx,
+            types.ProtocolPoolEscrowAccount,
+            recipient,
+            amountToStream,
+        )
+    }
+
+    // Send remaining funds to community pool
+    k.bankKeeper.SendCoinsFromModuleToModule(
+        ctx,
+        types.ProtocolPoolEscrowAccount,
+        types.ModuleName,
+        remainingCoins,
+    )
+
+    return nil
+}
+```
+
+### Percentage Calculation
+
+```go
+func PercentageCoinMul(percentage math.LegacyDec, coins sdk.Coins) sdk.Coins {
+    ret := sdk.NewCoins()
+
+    for _, denom := range coins.Denoms() {
+        am := sdk.NewCoin(denom, percentage.MulInt(coins.AmountOf(denom)).TruncateInt())
+        ret = ret.Add(am)
+    }
+
+    return ret
+}
+```
+
+Example:
+- Escrow has 10,000 stake
+- Fund A has 10% (0.1)
+- Fund B has 5% (0.05)
+- Fund A receives: 10,000 * 0.1 = 1,000 stake
+- Fund B receives: 10,000 * 0.05 = 500 stake
+- Community pool receives: 10,000 - 1,000 - 500 = 8,500 stake
+
+## Query Endpoints
+
+### CommunityPool
+
+Query the community pool balance:
+
+```bash
+simd query protocolpool community-pool
+```
+
+**Response:**
+
+```yaml
+pool:
+- amount: "100000000"
+  denom: stake
+```
+
+### ContinuousFund
+
+Query a specific continuous fund:
+
+```bash
+simd query protocolpool continuous-fund cosmos1recipient...
+```
+
+**Response:**
+
+```yaml
+fund:
+  recipient: cosmos1recipient...
+  percentage: "0.020000000000000000"
+  expiry: "2025-12-31T23:59:59Z"
+```
+
+### ContinuousFunds
+
+Query all continuous funds:
+
+```bash
+simd query protocolpool continuous-funds
+```
+
+## Module Parameters
+
+```go
+type Params struct {
+    EnabledDistributionDenoms []string // Denoms eligible for distribution
+    DistributionFrequency     uint64   // Blocks between distributions
+}
+```
+
+**Default values:**
+
+```json
+{
+  "enabled_distribution_denoms": ["stake"],
+  "distribution_frequency": 1
+}
+```
+
+## CLI Examples
+
+### Fund Community Pool
+
+```bash
+simd tx protocolpool fund-community-pool 1000stake \
+    --from=alice \
+    --chain-id=mychain
+```
+
+### Create Continuous Fund (via Governance)
+
+```bash
+# Create proposal JSON
+cat > proposal.json <<EOF
+{
+  "messages": [{
+    "@type": "/cosmos.protocolpool.v1.MsgCreateContinuousFund",
+    "authority": "cosmos10d07y265gmmuvt4z0w9aw880jnsr700j6zn9kn",
+    "recipient": "cosmos1teamaddr...",
+    "percentage": "0.02",
+    "expiry": "2025-12-31T23:59:59Z"
+  }],
+  "metadata": "Fund development team",
+  "deposit": "10000000stake",
+  "title": "Fund Development Team",
+  "summary": "Allocate 2% of block rewards to development team for 1 year"
+}
+EOF
+
+simd tx gov submit-proposal proposal.json \
+    --from=alice \
+    --chain-id=mychain
+```
+
+### Query Community Pool
+
+```bash
+simd query protocolpool community-pool
+```
+
+### Query Continuous Funds
+
+```bash
+simd query protocolpool continuous-funds
+```
+
+## Integration with x/distribution
+
+When `x/protocolpool` is enabled, `x/distribution` automatically routes community pool operations to it:
+
+```go
+// In x/distribution module setup
+if externalCommunityPoolKeeper != nil {
+    distrKeeper.externalPoolKeeper = externalCommunityPoolKeeper
+}
+```
+
+The following `x/distribution` endpoints will return errors:
+- `QueryService/CommunityPool`
+- `MsgService/CommunityPoolSpend`
+- `MsgService/FundCommunityPool`
+
+## Use Cases
+
+### Development Team Funding
+
+```go
+// Grant 3% of block rewards to core development team
+percentage := math.LegacyNewDecWithPrec(3, 2) // 0.03
+expiry := time.Now().Add(2 * 365 * 24 * time.Hour) // 2 years
+
+msg := &types.MsgCreateContinuousFund{
+    Authority:  govAddr.String(),
+    Recipient:  devTeamAddr.String(),
+    Percentage: percentage,
+    Expiry:     &expiry,
+}
+```
+
+### Security Budget
+
+```go
+// Allocate 1% for bug bounties
+percentage := math.LegacyNewDecWithPrec(1, 2) // 0.01
+
+msg := &types.MsgCreateContinuousFund{
+    Authority:  govAddr.String(),
+    Recipient:  securityFundAddr.String(),
+    Percentage: percentage,
+    Expiry:     nil, // No expiration
+}
+```
+
+### Marketing Fund
+
+```go
+// Temporary 6-month marketing fund
+percentage := math.LegacyNewDecWithPrec(5, 2) // 0.05 = 5%
+expiry := time.Now().Add(180 * 24 * time.Hour) // 6 months
+
+msg := &types.MsgCreateContinuousFund{
+    Authority:  govAddr.String(),
+    Recipient:  marketingAddr.String(),
+    Percentage: percentage,
+    Expiry:     &expiry,
+}
+```
+
+## Migration from x/distribution
+
+To migrate from `x/distribution` community pool:
+
+1. **Enable x/protocolpool** in your app.go:
+
+```go
+import (
+    "github.com/cosmos/cosmos-sdk/x/protocolpool"
+    protocolpoolkeeper "github.com/cosmos/cosmos-sdk/x/protocolpool/keeper"
+    protocolpooltypes "github.com/cosmos/cosmos-sdk/x/protocolpool/types"
+)
+
+protocolPoolKeeper := protocolpoolkeeper.NewKeeper(
+    appCodec,
+    runtime.NewKVStoreService(keys[protocolpooltypes.StoreKey]),
+    app.AccountKeeper,
+    app.BankKeeper,
+    authtypes.NewModuleAddress(govtypes.ModuleName).String(),
+)
+
+app.ProtocolPoolKeeper = protocolPoolKeeper
+```
+
+2. **Wire distribution keeper** to use protocol pool:
+
+```go
+app.DistrKeeper = distrkeeper.NewKeeper(
+    appCodec,
+    runtime.NewKVStoreService(keys[distrtypes.StoreKey]),
+    app.AccountKeeper,
+    app.BankKeeper,
+    app.StakingKeeper,
+    authtypes.FeeCollectorName,
+    authtypes.NewModuleAddress(govtypes.ModuleName).String(),
+    app.ProtocolPoolKeeper, // Use protocol pool
+)
+```
+
+3. **Migrate funds** via upgrade handler:
+
+```go
+func (app *App) RegisterUpgradeHandlers() {
+    app.UpgradeKeeper.SetUpgradeHandler(
+        "v0.53",
+        func(ctx sdk.Context, plan upgradetypes.Plan, fromVM module.VersionMap) (module.VersionMap, error) {
+            // Get community pool from x/distribution
+            distrModuleAddr := app.AccountKeeper.GetModuleAddress(distrtypes.ModuleName)
+            balance := app.BankKeeper.GetAllBalances(ctx, distrModuleAddr)
+
+            // Transfer to x/protocolpool
+            protocolPoolAddr := app.AccountKeeper.GetModuleAddress(protocolpooltypes.ModuleName)
+            if err := app.BankKeeper.SendCoins(ctx, distrModuleAddr, protocolPoolAddr, balance); err != nil {
+                return nil, err
+            }
+
+            return app.ModuleManager.RunMigrations(ctx, app.Configurator(), fromVM)
+        },
+    )
+}
+```
+
+## Best Practices
+
+1. **Use governance** for creating continuous funds to ensure community consensus
+2. **Set expiration times** for continuous funds to allow reevaluation
+3. **Monitor percentages** to ensure total allocations don't exceed 100%
+4. **Whitelist denoms** in parameters to control which tokens are distributed
+5. **Track distributions** via events for transparency
+6. **Set reasonable distribution frequency** to balance accuracy and gas costs
+
+## Security Considerations
+
+- Only the module authority (governance) can create/cancel continuous funds
+- Blocked addresses cannot receive distributions
+- Percentages are validated to be between 0 and 1
+- Expired funds are automatically removed to prevent stale state
+- Distribution failures for unauthorized addresses don't halt the chain
+
+## References
+
+- [Source Code: x/protocolpool/keeper/keeper.go](/home/daytona/workspace/source/x/protocolpool/keeper/keeper.go:84-233)
+- [Protocol Pool README](https://github.com/cosmos/cosmos-sdk/blob/main/x/protocolpool/README.md)
+- [Migration Guide](https://github.com/cosmos/cosmos-sdk/blob/main/UPGRADING.md)

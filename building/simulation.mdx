@@ -1,0 +1,675 @@
+---
+title: Simulation Testing Framework
+description: Use simulation testing for randomized fuzzing and determinism testing of Cosmos SDK applications
+---
+
+# Simulation Testing Framework
+
+Simulation testing is a powerful technique for discovering edge cases, testing determinism, and ensuring your blockchain application behaves correctly under a wide range of conditions.
+
+## What is Simulation Testing?
+
+Simulation testing:
+
+- Generates random operations based on your modules
+- Executes hundreds of blocks with random transactions
+- Tests state machine determinism
+- Validates invariants throughout execution
+- Finds edge cases that unit tests miss
+
+## Simulation Components
+
+### Simulation Manager
+
+The simulation manager coordinates module simulation from `simapp/app.go:599-608`:
+
+```go
+// Create simulation manager
+overrideModules := map[string]module.AppModuleSimulation{
+    authtypes.ModuleName: auth.NewAppModule(
+        app.appCodec, 
+        app.AccountKeeper, 
+        authsims.RandomGenesisAccounts, 
+        nil,
+    ),
+}
+app.sm = module.NewSimulationManagerFromAppModules(
+    app.ModuleManager.Modules, 
+    overrideModules,
+)
+
+app.sm.RegisterStoreDecoders()
+```
+
+### Simulation State Factory
+
+From `simapp/sim_test.go:62-70`:
+
+```go
+func setupStateFactory(app *SimApp) sims.SimStateFactory {
+    return sims.SimStateFactory{
+        Codec:         app.AppCodec(),
+        AppStateFn:    simtestutil.AppStateFn(
+            app.AppCodec(), 
+            app.SimulationManager(), 
+            app.DefaultGenesis(),
+        ),
+        BlockedAddr:   BlockedAddresses(),
+        AccountSource: app.AccountKeeper,
+        BalanceSource: app.BankKeeper,
+    }
+}
+```
+
+## Running Simulations
+
+### Full Application Simulation
+
+From `simapp/sim_test.go:58-60`:
+
+```go
+func TestFullAppSimulation(t *testing.T) {
+    sims.Run(t, NewSimApp, setupStateFactory)
+}
+```
+
+### Custom Simulation Configuration
+
+Run simulations with custom parameters:
+
+```bash
+# Run with specific seed
+go test -mod=readonly ./simapp -run TestFullAppSimulation \
+    -SimulationEnabled=true \
+    -SimulationNumBlocks=500 \
+    -SimulationSeed=42
+
+# Run with specific genesis state
+go test -mod=readonly ./simapp -run TestFullAppSimulation \
+    -SimulationEnabled=true \
+    -SimulationGenesis=custom-genesis.json
+
+# Run with verbose logging
+go test -mod=readonly ./simapp -run TestFullAppSimulation \
+    -SimulationEnabled=true \
+    -SimulationVerbose=true
+```
+
+## Simulation Initialization
+
+From `x/simulation/simulate.go:27-56`:
+
+```go
+// Initialize the chain for simulation
+func initChain(
+    r *rand.Rand,
+    params Params,
+    accounts []simulation.Account,
+    app *baseapp.BaseApp,
+    appStateFn simulation.AppStateFn,
+    config simulation.Config,
+    cdc codec.JSONCodec,
+) (mockValidators, time.Time, []simulation.Account, string) {
+    blockMaxGas := int64(-1)
+    if config.BlockMaxGas > 0 {
+        blockMaxGas = config.BlockMaxGas
+    }
+    
+    // Generate random app state
+    appState, accounts, chainID, genesisTimestamp := appStateFn(
+        r, 
+        accounts, 
+        config,
+    )
+    consensusParams := randomConsensusParams(r, appState, cdc, blockMaxGas)
+    
+    // Initialize chain
+    req := abci.RequestInitChain{
+        AppStateBytes:   appState,
+        ChainId:         chainID,
+        ConsensusParams: consensusParams,
+        Time:            genesisTimestamp,
+    }
+    res, err := app.InitChain(&req)
+    if err != nil {
+        panic(err)
+    }
+    
+    validators := newMockValidators(r, res.Validators, params)
+    return validators, genesisTimestamp, accounts, chainID
+}
+```
+
+## Simulation Execution
+
+From `x/simulation/simulate.go:79-150`:
+
+```go
+func SimulateFromSeedX(
+    tb testing.TB,
+    logger log.Logger,
+    w io.Writer,
+    app *baseapp.BaseApp,
+    appStateFn simulation.AppStateFn,
+    randAccFn simulation.RandomAccountFn,
+    ops WeightedOperations,
+    blockedAddrs map[string]bool,
+    config simulation.Config,
+    cdc codec.JSONCodec,
+    logWriter LogWriter,
+) (exportedParams Params, accs []simulation.Account, err error) {
+    tb.Helper()
+    
+    // Create random source
+    r := rand.New(newByteSource(config.FuzzSeed, config.Seed))
+    params := RandomParams(r)
+
+    startTime := time.Now()
+    logger.Info("Starting SimulateFromSeed with randomness", "time", startTime)
+    logger.Debug("Randomized simulation setup", "params", mustMarshalJSONIndent(params))
+
+    timeDiff := maxTimePerBlock - minTimePerBlock
+    accs = randAccFn(r, params.NumKeys())
+    eventStats := NewEventStats()
+
+    // Initialize chain with random genesis
+    validators, blockTime, accs, chainID := initChain(
+        r, 
+        params, 
+        accs, 
+        app, 
+        appStateFn, 
+        config, 
+        cdc,
+    )
+    
+    // Ensure at least 2 accounts
+    if len(accs) <= 1 {
+        return params, accs, fmt.Errorf(
+            "at least two genesis accounts are required",
+        )
+    }
+
+    config.ChainID = chainID
+
+    // Remove module account addresses
+    var tmpAccs []simulation.Account
+    for _, acc := range accs {
+        if !blockedAddrs[acc.Address.String()] {
+            tmpAccs = append(tmpAccs, acc)
+        }
+    }
+    accs = tmpAccs
+    
+    // Continue simulation...
+    // Execute blocks with random operations
+}
+```
+
+## Import/Export Testing
+
+Test that chain state can be exported and imported correctly from `simapp/sim_test.go:77-115`:
+
+```go
+func TestAppImportExport(t *testing.T) {
+    sims.Run(
+        t, 
+        NewSimApp, 
+        setupStateFactory, 
+        func(tb testing.TB, ti sims.TestInstance[*SimApp], accs []simtypes.Account) {
+            tb.Helper()
+            app := ti.App
+            
+            // Export genesis after simulation
+            tb.Log("exporting genesis...\n")
+            exported, err := app.ExportAppStateAndValidators(
+                false, 
+                exportWithValidatorSet, 
+                exportAllModules,
+            )
+            require.NoError(tb, err)
+
+            // Import into new app
+            tb.Log("importing genesis...\n")
+            newTestInstance := sims.NewSimulationAppInstance(tb, ti.Cfg, NewSimApp)
+            newApp := newTestInstance.App
+            
+            var genesisState GenesisState
+            require.NoError(tb, json.Unmarshal(exported.AppState, &genesisState))
+            
+            ctxB := newApp.NewContextLegacy(
+                true, 
+                cmtproto.Header{Height: app.LastBlockHeight()},
+            )
+            _, err = newApp.ModuleManager.InitGenesis(
+                ctxB, 
+                newApp.appCodec, 
+                genesisState,
+            )
+            require.NoError(tb, err)
+
+            // Compare stores
+            tb.Log("comparing stores...")
+            skipPrefixes := map[string][][]byte{
+                stakingtypes.StoreKey: {
+                    stakingtypes.UnbondingQueueKey,
+                    stakingtypes.RedelegationQueueKey,
+                    stakingtypes.ValidatorQueueKey,
+                    stakingtypes.HistoricalInfoKey,
+                },
+            }
+            AssertEqualStores(tb, app, newApp, app.SimulationManager().StoreDecoders, skipPrefixes)
+        },
+    )
+}
+```
+
+## After Import Simulation
+
+Test that a chain can continue after import from `simapp/sim_test.go:122-158`:
+
+```go
+func TestAppSimulationAfterImport(t *testing.T) {
+    sims.Run(
+        t, 
+        NewSimApp, 
+        setupStateFactory, 
+        func(tb testing.TB, ti sims.TestInstance[*SimApp], accs []simtypes.Account) {
+            tb.Helper()
+            app := ti.App
+            
+            // Export genesis
+            tb.Log("exporting genesis...\n")
+            exported, err := app.ExportAppStateAndValidators(
+                false, 
+                exportWithValidatorSet, 
+                exportAllModules,
+            )
+            require.NoError(tb, err)
+
+            // Import and continue simulation
+            tb.Log("importing genesis...\n")
+            newTestInstance := sims.NewSimulationAppInstance(tb, ti.Cfg, NewSimApp)
+            newApp := newTestInstance.App
+            
+            _, err = newApp.InitChain(&abci.RequestInitChain{
+                AppStateBytes: exported.AppState,
+                ChainId:       sims.SimAppChainID,
+            })
+            require.NoError(tb, err)
+            
+            // Run more simulation blocks
+            newStateFactory := setupStateFactory(newApp)
+            _, _, err = simulation.SimulateFromSeedX(
+                tb,
+                newTestInstance.AppLogger,
+                sims.WriteToDebugLog(newTestInstance.AppLogger),
+                newApp.BaseApp,
+                newStateFactory.AppStateFn,
+                simtypes.RandomAccounts,
+                simtestutil.BuildSimulationOperations(
+                    newApp, 
+                    newApp.AppCodec(), 
+                    newTestInstance.Cfg, 
+                    newApp.TxConfig(),
+                ),
+                newStateFactory.BlockedAddr,
+                newTestInstance.Cfg,
+                newStateFactory.Codec,
+                ti.ExecLogWriter,
+            )
+            require.NoError(tb, err)
+        },
+    )
+}
+```
+
+## Determinism Testing
+
+Verify that the same seed produces the same results from `simapp/sim_test.go:164-230`:
+
+```go
+func TestAppStateDeterminism(t *testing.T) {
+    const numTimesToRunPerSeed = 3
+    var seeds []int64
+    
+    if s := simcli.NewConfigFromFlags().Seed; s != simcli.DefaultSeedValue {
+        // Test specific seed multiple times
+        for j := 0; j < numTimesToRunPerSeed; j++ {
+            seeds = append(seeds, s)
+        }
+    } else {
+        // Test with random seeds
+        for i := 0; i < 3; i++ {
+            seed := rand.Int63()
+            for j := 0; j < numTimesToRunPerSeed; j++ {
+                seeds = append(seeds, seed)
+            }
+        }
+    }
+    
+    // Track hashes per seed
+    var mx sync.Mutex
+    appHashResults := make(map[int64][][]byte)
+    appSimLogger := make(map[int64][]simulation.LogWriter)
+    
+    captureAndCheckHash := func(
+        tb testing.TB, 
+        ti sims.TestInstance[*SimApp], 
+        _ []simtypes.Account,
+    ) {
+        tb.Helper()
+        seed, appHash := ti.Cfg.Seed, ti.App.LastCommitID().Hash
+        
+        mx.Lock()
+        otherHashes, execWriters := appHashResults[seed], appSimLogger[seed]
+        if len(otherHashes) < numTimesToRunPerSeed-1 {
+            appHashResults[seed] = append(otherHashes, appHash)
+            appSimLogger[seed] = append(execWriters, ti.ExecLogWriter)
+        } else {
+            delete(appHashResults, seed)
+            delete(appSimLogger, seed)
+        }
+        mx.Unlock()
+
+        // Verify all hashes match for this seed
+        var failNow bool
+        for i := 0; i < len(otherHashes); i++ {
+            if !assert.Equal(tb, otherHashes[i], appHash) {
+                execWriters[i].PrintLogs()
+                failNow = true
+            }
+        }
+        if failNow {
+            ti.ExecLogWriter.PrintLogs()
+            tb.Fatalf("non-determinism in seed %d", seed)
+        }
+    }
+    
+    // Run simulations with seeds
+    sims.RunWithSeeds(
+        t, 
+        interBlockCachingAppFactory, 
+        setupStateFactory, 
+        seeds, 
+        []byte{}, 
+        captureAndCheckHash,
+    )
+}
+```
+
+## Store Comparison
+
+Compare store state between apps from `simapp/sim_test.go:239-275`:
+
+```go
+func AssertEqualStores(
+    tb testing.TB,
+    app, newApp ComparableStoreApp,
+    storeDecoders simtypes.StoreDecoderRegistry,
+    skipPrefixes map[string][][]byte,
+) {
+    tb.Helper()
+    ctxA := app.NewContextLegacy(
+        true, 
+        cmtproto.Header{Height: app.LastBlockHeight()},
+    )
+    ctxB := newApp.NewContextLegacy(
+        true, 
+        cmtproto.Header{Height: app.LastBlockHeight()},
+    )
+
+    storeKeys := app.GetStoreKeys()
+    require.NotEmpty(tb, storeKeys)
+
+    for _, appKeyA := range storeKeys {
+        // Only compare KV stores
+        if _, ok := appKeyA.(*storetypes.KVStoreKey); !ok {
+            continue
+        }
+
+        keyName := appKeyA.Name()
+        appKeyB := newApp.GetKey(keyName)
+
+        storeA := ctxA.KVStore(appKeyA)
+        storeB := ctxB.KVStore(appKeyB)
+
+        failedKVAs, failedKVBs := simtestutil.DiffKVStores(
+            storeA, 
+            storeB, 
+            skipPrefixes[keyName],
+        )
+        require.Equal(
+            tb, 
+            len(failedKVAs), 
+            len(failedKVBs), 
+            "unequal sets of key-values to compare",
+        )
+
+        tb.Logf(
+            "compared %d different key/value pairs between %s and %s\n", 
+            len(failedKVAs), 
+            appKeyA, 
+            appKeyB,
+        )
+        require.Equal(
+            tb, 
+            0, 
+            len(failedKVAs), 
+            simtestutil.GetSimulationLog(keyName, storeDecoders, failedKVAs, failedKVBs),
+        )
+    }
+}
+```
+
+## Fuzz Testing
+
+Integrate with Go's fuzzing framework from `simapp/sim_test.go:290-304`:
+
+```go
+func FuzzFullAppSimulation(f *testing.F) {
+    f.Fuzz(func(t *testing.T, rawSeed []byte) {
+        if len(rawSeed) < 8 {
+            t.Skip()
+            return
+        }
+        sims.RunWithSeeds(
+            t,
+            NewSimApp,
+            setupStateFactory,
+            []int64{int64(binary.BigEndian.Uint64(rawSeed))},
+            rawSeed[8:],
+        )
+    })
+}
+```
+
+## Simulation Parameters
+
+### Configuration Options
+
+```go
+type Config struct {
+    Seed             int64  // Random seed
+    NumBlocks        int    // Number of blocks to simulate
+    BlockSize        int    // Average transactions per block
+    InitialBlockHeight int64 // Starting block height
+    ExportStatePath  string // Path to export final state
+    ExportStatsPath  string // Path to export statistics
+    Commit           bool   // Commit state to disk
+    OnOperation      bool   // Run after each operation
+    AllInvariants    bool   // Check all invariants
+    GenesisTime      int64  // Genesis timestamp
+    DBBackend        string // Database backend
+    BlockMaxGas      int64  // Max gas per block
+    ChainID          string // Chain identifier
+}
+```
+
+### Common Flags
+
+```bash
+# Number of blocks to simulate
+-SimulationNumBlocks=500
+
+# Genesis seed
+-SimulationSeed=42
+
+# Commit state to database
+-SimulationCommit=true
+
+# Run on every operation
+-SimulationOnOperation=false
+
+# Print verbose logs
+-SimulationVerbose=true
+
+# Check invariants on every operation
+-SimulationAllInvariants=false
+
+# Export stats
+-SimulationExportStatePath=./stats.json
+```
+
+## Best Practices
+
+### Define Weighted Operations
+
+Each module should define weighted operations:
+
+```go
+func WeightedOperations(
+    appParams simulation.AppParams,
+    cdc codec.JSONCodec,
+    ak AccountKeeper,
+    bk BankKeeper,
+) simulation.WeightedOperations {
+    var weightMsgSend int
+    appParams.GetOrGenerate(
+        OpWeightMsgSend, 
+        &weightMsgSend, 
+        nil,
+        func(_ *rand.Rand) {
+            weightMsgSend = DefaultWeightMsgSend
+        },
+    )
+
+    return simulation.WeightedOperations{
+        simulation.NewWeightedOperation(
+            weightMsgSend,
+            SimulateMsgSend(ak, bk),
+        ),
+    }
+}
+```
+
+### Register Store Decoders
+
+Store decoders help debug simulation failures:
+
+```go
+func (am AppModule) RegisterStoreDecoder(sdr simtypes.StoreDecoderRegistry) {
+    sdr[types.StoreKey] = simulation.NewDecodeStore(am.cdc)
+}
+```
+
+### Test Invariants
+
+Define invariants to check during simulation:
+
+```go
+func RegisterInvariants(ir sdk.InvariantRegistry, k Keeper) {
+    ir.RegisterRoute(
+        types.ModuleName,
+        "module-account",
+        ModuleAccountInvariant(k),
+    )
+}
+
+func ModuleAccountInvariant(k Keeper) sdk.Invariant {
+    return func(ctx sdk.Context) (string, bool) {
+        // Check invariant
+        return "", false
+    }
+}
+```
+
+### Handle Empty Validator Sets
+
+From `simapp/sim_test.go:160-162`:
+
+```go
+func IsEmptyValidatorSetErr(err error) bool {
+    return err != nil && strings.Contains(
+        err.Error(), 
+        "validator set is empty after InitGenesis",
+    )
+}
+```
+
+## Debugging Simulation Failures
+
+### Reproduce with Seed
+
+```bash
+# Use the failing seed
+go test ./simapp -run TestFullAppSimulation \
+    -SimulationEnabled=true \
+    -SimulationSeed=<failing-seed> \
+    -v
+```
+
+### Enable Verbose Logging
+
+```bash
+go test ./simapp -run TestFullAppSimulation \
+    -SimulationEnabled=true \
+    -SimulationSeed=<seed> \
+    -SimulationVerbose=true
+```
+
+### Export State
+
+```bash
+go test ./simapp -run TestFullAppSimulation \
+    -SimulationEnabled=true \
+    -SimulationSeed=<seed> \
+    -SimulationExportStatePath=./failing-state.json
+```
+
+## Continuous Integration
+
+Run simulations in CI:
+
+```yaml
+# .github/workflows/simulation.yml
+name: Simulation Tests
+
+on:
+  push:
+  schedule:
+    - cron: '0 0 * * *'  # Daily
+
+jobs:
+  simulation:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+      - uses: actions/setup-go@v4
+        with:
+          go-version: '1.21'
+      
+      - name: Run simulations
+        run: |
+          make test-sim-nondeterminism
+          make test-sim-import-export
+          make test-sim-after-import
+          make test-sim-multi-seed-short
+```
+
+## Next Steps
+
+- Review [Testing](/building/testing) for unit and integration tests
+- Learn [App Creation](/building/app-creation) patterns
+- Understand [Genesis](/building/genesis) configuration
+- Explore [Module Development](/modules/overview)

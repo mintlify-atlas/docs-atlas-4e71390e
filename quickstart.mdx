@@ -1,80 +1,278 @@
 ---
-title: "Quickstart"
-description: "Start building awesome documentation in minutes"
+title: Quickstart
+description: Get up and running with Cosmos SDK in minutes
 ---
 
-## Get started in three steps
+Get your first Cosmos SDK blockchain running in minutes. This guide will walk you through initializing, configuring, and starting a local chain using `simapp`, the SDK's reference implementation.
 
-Get your documentation site running locally and make your first customization.
+## Prerequisites
 
-### Step 1: Set up your local environment
+Before you begin, ensure you have:
+
+- Go 1.21 or later installed
+- Git installed
+- Basic command-line knowledge
+- At least 2GB of available disk space
+
+<Note>
+If you haven't installed the Cosmos SDK yet, check out the [installation guide](/installation) first.
+</Note>
+
+## Initialize your chain
+
+<Steps>
+  <Step title="Clone the Cosmos SDK repository">
+    Clone the repository and navigate to the simapp directory:
+
+    ```bash
+    git clone https://github.com/cosmos/cosmos-sdk
+    cd cosmos-sdk
+    ```
+  </Step>
+
+  <Step title="Build the simapp binary">
+    Build the `simd` binary which is the blockchain daemon:
+
+    ```bash
+    make build
+    ```
+
+    Verify the installation:
+
+    ```bash
+    ./build/simd version
+    ```
+
+    You should see the SDK version output.
+  </Step>
+
+  <Step title="Initialize the chain">
+    Initialize your chain with a moniker (node name) and chain ID:
+
+    ```bash
+    ./build/simd init mynode --chain-id my-test-chain
+    ```
+
+    This creates the default configuration files in `~/.simapp/`:
+    - `config/app.toml` - Application configuration
+    - `config/config.toml` - CometBFT configuration  
+    - `config/genesis.json` - Genesis state
+    - `data/` - Blockchain data directory
+
+    <Accordion title="View initialization output">
+      ```json
+      {
+        "moniker": "mynode",
+        "chain_id": "my-test-chain",
+        "node_id": "a4f3c8d2e1b0...",
+        "gentxs_dir": "",
+        "app_message": {
+          "auth": {...},
+          "bank": {...},
+          ...
+        }
+      }
+      ```
+    </Accordion>
+  </Step>
+
+  <Step title="Create a key pair">
+    Create a key that will be used for your validator and test account:
+
+    ```bash
+    ./build/simd keys add alice
+    ```
+
+    <Warning>
+    Save the mnemonic phrase shown in the output. You'll need it to recover your key.
+    </Warning>
+
+    The output will show:
+    ```
+    - address: cosmos1...
+      name: alice
+      pubkey: '{"@type":"/cosmos.crypto.secp256k1.PubKey",...}'
+      type: local
+    
+    **Important** write this mnemonic phrase in a safe place.
+    ...24 word mnemonic...
+    ```
+  </Step>
+
+  <Step title="Add genesis account">
+    Add your key as a genesis account with initial tokens:
+
+    ```bash
+    ./build/simd genesis add-genesis-account alice 100000000stake --keyring-backend test
+    ```
+
+    This adds alice to the genesis file with 100,000,000 stake tokens.
+  </Step>
+
+  <Step title="Create genesis transaction">
+    Create a genesis transaction that makes your account a validator:
+
+    ```bash
+    ./build/simd genesis gentx alice 1000000stake --chain-id my-test-chain --keyring-backend test
+    ```
+
+    This creates a validator with 1,000,000 stake tokens delegated to it.
+  </Step>
+
+  <Step title="Collect genesis transactions">
+    Collect all genesis transactions (in this case, just one):
+
+    ```bash
+    ./build/simd genesis collect-gentxs
+    ```
+
+    This finalizes the genesis file.
+  </Step>
+
+  <Step title="Start the blockchain">
+    Start your blockchain node:
+
+    ```bash
+    ./build/simd start
+    ```
+
+    You should see blocks being produced:
+
+    ```
+    8:37PM INF finalizing commit of block hash=... height=1 module=consensus
+    8:37PM INF executed block height=1 module=state num_invalid_txs=0 num_valid_txs=0
+    8:37PM INF commit synced commit=... module=server
+    8:37PM INF committed state app_hash=... height=1 module=state
+    ```
+
+    <Tip>
+    Press `Ctrl+C` to stop the node when you're done testing.
+    </Tip>
+  </Step>
+</Steps>
+
+## Interact with your chain
+
+Once your chain is running, open a new terminal to interact with it:
+
+### Query account balance
+
+```bash
+./build/simd query bank balances $(./build/simd keys show alice -a --keyring-backend test)
+```
+
+### Send tokens
+
+Create another account and send tokens:
+
+```bash
+# Create bob's account
+./build/simd keys add bob --keyring-backend test
+
+# Send tokens from alice to bob
+./build/simd tx bank send alice $(./build/simd keys show bob -a --keyring-backend test) 1000stake \
+  --chain-id my-test-chain \
+  --keyring-backend test \
+  --yes
+```
+
+### Query transaction
+
+```bash
+./build/simd query tx <TX_HASH>
+```
+
+### Query block
+
+```bash
+./build/simd query block 1
+```
+
+## Configuration
+
+The default configuration is suitable for testing, but you can customize:
+
+### Application configuration (`~/.simapp/config/app.toml`)
+
+Key settings:
+- `minimum-gas-prices` - Minimum gas price for transactions
+- `pruning` - State pruning strategy
+- `api.enable` - Enable REST API server
+- `grpc.enable` - Enable gRPC server
+
+### CometBFT configuration (`~/.simapp/config/config.toml`)
+
+Key settings:
+- `moniker` - Node name
+- `proxy_app` - ABCI application address
+- `rpc.laddr` - RPC server listen address
+- `p2p.laddr` - P2P listen address
+- `p2p.seeds` - Seed nodes for discovery
+
+## Troubleshooting
 
 <AccordionGroup>
-  <Accordion icon="copy" title="Clone your docs locally">
-    During the onboarding process, you created a GitHub repository with your docs content if you didn't already have one. You can find a link to this repository in your [dashboard](https://dashboard.mintlify.com).
-    
-    To clone the repository locally so that you can make and preview changes to your docs, follow the [Cloning a repository](https://docs.github.com/en/repositories/creating-and-managing-repositories/cloning-a-repository) guide in the GitHub docs.
+  <Accordion title="Port already in use">
+    If you see `bind: address already in use`, another process is using the default ports (26656, 26657).
+
+    Stop other Cosmos SDK chains or change the ports in `config.toml`:
+    ```toml
+    [rpc]
+    laddr = "tcp://127.0.0.1:26657"
+
+    [p2p]
+    laddr = "tcp://0.0.0.0:26656"
+    ```
   </Accordion>
-  <Accordion icon="rectangle-terminal" title="Start the preview server">
-    1. Install the Mintlify CLI: `npm i -g mint`
-    2. Navigate to your docs directory and run: `mint dev`
-    3. Open `http://localhost:3000` to see your docs live!
-    
-    <Tip>Your preview updates automatically as you edit files.</Tip>
+
+  <Accordion title="Genesis transaction failed">
+    If `gentx` fails, ensure:
+    - The account exists in genesis: `simd genesis add-genesis-account`
+    - The chain-id matches: Use the same `--chain-id` everywhere
+    - The keyring backend matches: Use `--keyring-backend test` consistently
   </Accordion>
-</AccordionGroup>
 
-### Step 2: Deploy your changes
-
-<AccordionGroup>
-  <Accordion icon="github" title="Install our GitHub app">
-    Install the Mintlify GitHub app from your [dashboard](https://dashboard.mintlify.com/settings/organization/github-app).
-    
-    Our GitHub app automatically deploys your changes to your docs site, so you don't need to manage deployments yourself.
-</Accordion>
-<Accordion icon="palette" title="Update your site name and colors">
-    For a first change, let's update the name and colors of your docs site.
-
-    1. Open `docs.json` in your editor.
-    2. Change the `"name"` field to your project name.
-    3. Update the `"colors"` to match your brand.
-    4. Save and see your changes instantly at `http://localhost:3000`.
-
-    <Tip>Try changing the primary color to see an immediate difference!</Tip>
+  <Accordion title="Reset the chain">
+    To start fresh:
+    ```bash
+    ./build/simd tendermint unsafe-reset-all
+    rm -rf ~/.simapp
+    ```
+    Then repeat the initialization steps.
   </Accordion>
 </AccordionGroup>
-
-### Step 3: Go live
-
-<Accordion icon="rocket" title="Publish your docs">
-  1. Commit and push your changes.
-  2. Your docs will update and be live in moments!
-</Accordion>
 
 ## Next steps
 
-Now that you have your docs running, explore these key features:
-
 <CardGroup cols={2}>
-
-<Card title="Write Content" icon="pen-to-square" href="/essentials/markdown">
-  Learn MDX syntax and start writing your documentation.
-</Card>
-
-<Card title="Customize style" icon="palette" href="/essentials/settings">
-  Make your docs match your brand perfectly.
-</Card>
-
-<Card title="Add code examples" icon="square-code" href="/essentials/code">
-  Include syntax-highlighted code blocks.
-</Card>
-
-<Card title="API documentation" icon="code" href="/api-reference/introduction">
-  Auto-generate API docs from OpenAPI specs.
-</Card>
-
+  <Card title="Architecture" icon="sitemap" href="/architecture/overview">
+    Learn how Cosmos SDK applications are structured
+  </Card>
+  <Card title="Building chains" icon="hammer" href="/building/app-creation">
+    Create your own custom blockchain application
+  </Card>
+  <Card title="Modules" icon="cubes" href="/modules/index">
+    Explore available modules for your chain
+  </Card>
+  <Card title="API reference" icon="code" href="/api/baseapp">
+    Dive into the SDK's core APIs
+  </Card>
 </CardGroup>
 
-<Note>
-  **Need help?** See our [full documentation](https://mintlify.com/docs) or join our [community](https://mintlify.com/community).
-</Note>
+## Using the quick initialization script
+
+For rapid testing, use the built-in initialization script:
+
+```bash
+make init-simapp
+```
+
+This script automatically:
+1. Builds the binary
+2. Initializes the chain
+3. Creates test accounts (alice and bob)
+4. Adds genesis accounts
+5. Creates a genesis validator
+6. Starts the chain
+
+The script is defined in `scripts/init-simapp.sh` and is perfect for quick testing iterations.

@@ -1,0 +1,467 @@
+---
+title: Migrations
+description: Understanding module migrations, consensus version management, and upgrade handling in Cosmos SDK
+---
+
+# Migrations
+
+Migrations allow modules to upgrade their state and data structures between versions without breaking the blockchain. The SDK provides a structured migration system tied to consensus versions.
+
+## Consensus Versions
+
+Each module has a consensus version that tracks breaking changes:
+
+```go types/module/module.go
+// AppModule interface
+type AppModule interface {
+    AppModuleBasic
+    
+    // ConsensusVersion returns the consensus version number
+    ConsensusVersion() uint64
+    
+    // RegisterServices registers module services
+    RegisterServices(Configurator)
+}
+
+// Example module implementation
+type AppModule struct {
+    keeper Keeper
+}
+
+func (AppModule) ConsensusVersion() uint64 {
+    return 2  // Current consensus version
+}
+```
+
+### Version Tracking
+
+Consensus versions are stored in the module version map:
+
+```go
+// Version map stores module versions
+type VersionMap map[string]uint64
+
+// Example:
+// {
+//   "auth":  6,
+//   "bank":  2,
+//   "staking": 4,
+//   "gov": 3,
+// }
+```
+
+## Migrator Pattern
+
+### Creating a Migrator
+
+```go x/auth/keeper/migrations.go
+type Migrator struct {
+    keeper         AccountKeeper
+    queryServer    grpc.Server
+    legacySubspace exported.Subspace
+}
+
+func NewMigrator(
+    keeper AccountKeeper,
+    queryServer grpc.Server,
+    ss exported.Subspace,
+) Migrator {
+    return Migrator{
+        keeper:         keeper,
+        queryServer:    queryServer,
+        legacySubspace: ss,
+    }
+}
+```
+
+### Migration Methods
+
+```go x/auth/keeper/migrations.go
+// Migrate from version 5 to version 6
+func (m Migrator) Migrate5to6(ctx sdk.Context) error {
+    // Remove global account number from storage
+    return v6.Migrate(ctx, m.keeper.storeService, m.keeper.AccountNumber)
+}
+
+// Each migration targets a specific version jump
+func (m Migrator) Migrate4to5(ctx sdk.Context) error {
+    // Migration logic for 4->5
+    return nil
+}
+```
+
+## Registering Migrations
+
+### Module Setup
+
+```go
+func (am AppModule) RegisterServices(cfg module.Configurator) {
+    // Register message server
+    types.RegisterMsgServer(cfg.MsgServer(), keeper.NewMsgServerImpl(am.keeper))
+    
+    // Register query server
+    types.RegisterQueryServer(cfg.QueryServer(), am.keeper)
+    
+    // Register migrations
+    migrator := keeper.NewMigrator(am.keeper, cfg.QueryServer(), am.legacySubspace)
+    
+    // Register migration from v5 to v6
+    if err := cfg.RegisterMigration(types.ModuleName, 5, migrator.Migrate5to6); err != nil {
+        panic(err)
+    }
+    
+    // Register migration from v4 to v5
+    if err := cfg.RegisterMigration(types.ModuleName, 4, migrator.Migrate4to5); err != nil {
+        panic(err)
+    }
+}
+```
+
+## Migration Implementation
+
+### Example Migration
+
+```go
+// migrations/v6/migrate.go
+package v6
+
+import (
+    "cosmossdk.io/store/prefix"
+    storetypes "cosmossdk.io/store/types"
+    sdk "github.com/cosmos/cosmos-sdk/types"
+)
+
+// Migrate removes the global account number from store
+func Migrate(
+    ctx sdk.Context,
+    storeService store.KVStoreService,
+    accountNumberCounter collections.Sequence,
+) error {
+    store := storeService.OpenKVStore(ctx)
+    
+    // Get current global account number
+    currentNum, err := store.Get(types.GlobalAccountNumberKey)
+    if err != nil {
+        return err
+    }
+    
+    if currentNum != nil {
+        // Set the account number counter
+        if err := accountNumberCounter.Set(ctx, binary.BigEndian.Uint64(currentNum)); err != nil {
+            return err
+        }
+        
+        // Delete the old key
+        if err := store.Delete(types.GlobalAccountNumberKey); err != nil {
+            return err
+        }
+    }
+    
+    return nil
+}
+```
+
+### Complex Migration
+
+```go
+// Migrate accounts with new structure
+func MigrateAccounts(ctx sdk.Context, keeper AccountKeeper) error {
+    store := ctx.KVStore(keeper.storeKey)
+    iterator := sdk.KVStorePrefixIterator(store, types.AddressStoreKeyPrefix)
+    defer iterator.Close()
+    
+    for ; iterator.Valid(); iterator.Next() {
+        // Unmarshal old account format
+        var oldAccount OldAccountType
+        keeper.cdc.MustUnmarshal(iterator.Value(), &oldAccount)
+        
+        // Convert to new format
+        newAccount := ConvertAccount(oldAccount)
+        
+        // Validate new account
+        if err := newAccount.Validate(); err != nil {
+            return err
+        }
+        
+        // Store updated account
+        keeper.SetAccount(ctx, newAccount)
+    }
+    
+    return nil
+}
+```
+
+## Chain Upgrades
+
+### Upgrade Handler
+
+Define upgrade handlers in app.go:
+
+```go
+// app.go
+import upgradetypes "github.com/cosmos/cosmos-sdk/x/upgrade/types"
+
+func (app *App) RegisterUpgradeHandlers() {
+    app.UpgradeKeeper.SetUpgradeHandler(
+        "v2",  // Upgrade name
+        func(ctx sdk.Context, plan upgradetypes.Plan, fromVM module.VersionMap) (module.VersionMap, error) {
+            // Run migrations
+            return app.mm.RunMigrations(ctx, app.configurator, fromVM)
+        },
+    )
+}
+```
+
+### Upgrade Proposal
+
+```go
+// Submit software upgrade proposal
+proposal := &upgradetypes.SoftwareUpgradeProposal{
+    Title:       "Upgrade to v2",
+    Description: "Upgrade chain to version 2.0.0",
+    Plan: upgradetypes.Plan{
+        Name:   "v2",
+        Height: 1000000,  // Block height to upgrade
+        Info:   "https://github.com/org/chain/releases/tag/v2.0.0",
+    },
+}
+
+// Governance votes on proposal
+// At specified height, upgrade handler runs
+```
+
+### Version Map Handling
+
+```go
+// Initial version map (genesis)
+fromVM := module.VersionMap{
+    "auth":    5,  // auth at version 5
+    "bank":    2,
+    "staking": 4,
+}
+
+// Run migrations
+toVM, err := app.mm.RunMigrations(ctx, app.configurator, fromVM)
+if err != nil {
+    return err
+}
+
+// Result version map
+// {
+//   "auth":    6,  // migrated to version 6
+//   "bank":    2,  // no change
+//   "staking": 4,  // no change
+// }
+```
+
+## Migration Types
+
+### Store Migrations
+
+Modify key-value store structure:
+
+```go
+func MigrateStore(ctx sdk.Context, storeKey sdk.StoreKey) error {
+    store := ctx.KVStore(storeKey)
+    
+    // Migrate from old prefix to new prefix
+    oldPrefix := []byte{0x01}
+    newPrefix := []byte{0x02}
+    
+    iterator := sdk.KVStorePrefixIterator(store, oldPrefix)
+    defer iterator.Close()
+    
+    for ; iterator.Valid(); iterator.Next() {
+        oldKey := iterator.Key()
+        value := iterator.Value()
+        
+        // Create new key
+        newKey := append(newPrefix, oldKey[len(oldPrefix):]...)
+        
+        // Store at new location
+        store.Set(newKey, value)
+        
+        // Delete old location
+        store.Delete(oldKey)
+    }
+    
+    return nil
+}
+```
+
+### Param Migrations
+
+Move from legacy params to module params:
+
+```go
+func MigrateParams(
+    ctx sdk.Context,
+    legacySubspace exported.Subspace,
+    keeper Keeper,
+) error {
+    // Get old params
+    var oldParams OldParams
+    legacySubspace.GetParamSet(ctx, &oldParams)
+    
+    // Convert to new params structure
+    newParams := types.Params{
+        MaxMemoCharacters: oldParams.MaxMemoCharacters,
+        TxSigLimit:        oldParams.TxSigLimit,
+        // ... other params
+    }
+    
+    // Set new params
+    return keeper.SetParams(ctx, newParams)
+}
+```
+
+### Protobuf Migrations
+
+Update message definitions:
+
+```protobuf
+// Old version
+message MsgSend {
+    string from_address = 1;
+    string to_address = 2;
+    repeated cosmos.base.v1beta1.Coin amount = 3;
+}
+
+// New version (v2)
+message MsgSend {
+    string from_address = 1;
+    string to_address = 2;
+    repeated cosmos.base.v1beta1.Coin amount = 3;
+    string memo = 4;  // New field - backwards compatible
+}
+```
+
+## Testing Migrations
+
+### Unit Tests
+
+```go
+func TestMigrate5to6(t *testing.T) {
+    ctx, keeper := setupTestContext()
+    
+    // Set up state at version 5
+    store := ctx.KVStore(keeper.storeKey)
+    store.Set(types.GlobalAccountNumberKey, sdk.Uint64ToBigEndian(1000))
+    
+    // Run migration
+    migrator := keeper.NewMigrator(keeper, nil, nil)
+    err := migrator.Migrate5to6(ctx)
+    require.NoError(t, err)
+    
+    // Verify migration
+    // Old key should be deleted
+    require.False(t, store.Has(types.GlobalAccountNumberKey))
+    
+    // New counter should be set
+    num, err := keeper.AccountNumber.Peek(ctx)
+    require.NoError(t, err)
+    require.Equal(t, uint64(1000), num)
+}
+```
+
+### Integration Tests
+
+```go
+func TestChainUpgrade(t *testing.T) {
+    app := simapp.Setup(false)
+    ctx := app.BaseApp.NewContext(false, tmproto.Header{})
+    
+    // Simulate state at old version
+    fromVM := module.VersionMap{
+        "auth": 5,
+        "bank": 2,
+    }
+    
+    // Run migrations
+    toVM, err := app.mm.RunMigrations(ctx, app.configurator, fromVM)
+    require.NoError(t, err)
+    
+    // Verify versions updated
+    require.Equal(t, uint64(6), toVM["auth"])
+    require.Equal(t, uint64(2), toVM["bank"])
+    
+    // Verify state migrated correctly
+    // ... test specific state changes
+}
+```
+
+## Best Practices
+
+1. **Increment consensus version** for all breaking changes
+2. **Test migrations thoroughly** - data corruption is permanent
+3. **Make migrations idempotent** - safe to run multiple times
+4. **Validate state** after migration
+5. **Keep old code** temporarily for reference
+6. **Document breaking changes** clearly
+7. **Provide upgrade documentation** for node operators
+8. **Test on testnet first** before mainnet upgrade
+9. **Have rollback plan** for failed upgrades
+10. **Use semantic versioning** for clarity
+
+## Migration Checklist
+
+When creating a migration:
+
+- [ ] Increment `ConsensusVersion()` in AppModule
+- [ ] Create migration function (e.g., `Migrate5to6`)
+- [ ] Register migration in `RegisterServices`
+- [ ] Write migration logic
+- [ ] Add unit tests for migration
+- [ ] Add integration tests
+- [ ] Document breaking changes
+- [ ] Update CHANGELOG
+- [ ] Create upgrade proposal (for mainnet)
+- [ ] Test on testnet
+- [ ] Prepare upgrade documentation
+
+## Common Migration Patterns
+
+### Adding New Field
+
+```protobuf
+// Backwards compatible - safe to add
+message Account {
+    string address = 1;
+    uint64 sequence = 2;
+    string memo = 3;  // New optional field
+}
+```
+
+### Changing Field Type
+
+```go
+// Not backwards compatible - requires migration
+func MigrateBalance(oldBalance string) math.Int {
+    // Convert string to Int
+    amount, ok := sdk.NewIntFromString(oldBalance)
+    if !ok {
+        panic("invalid balance")
+    }
+    return amount
+}
+```
+
+### Removing Field
+
+```go
+// Remove deprecated field from store
+func RemoveDeprecatedField(ctx sdk.Context, store sdk.KVStore) {
+    iterator := sdk.KVStorePrefixIterator(store, DeprecatedPrefix)
+    defer iterator.Close()
+    
+    for ; iterator.Valid(); iterator.Next() {
+        store.Delete(iterator.Key())
+    }
+}
+```
+
+## Related Concepts
+
+- [Upgrades](/concepts/upgrades) - Chain upgrade process
+- [Modules](/essentials/modules) - Module structure and lifecycle
+- [Governance](/modules/gov) - Upgrade proposal governance

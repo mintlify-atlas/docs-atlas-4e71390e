@@ -1,0 +1,312 @@
+---
+title: PostHandler
+description: Understanding PostHandlers for post-transaction processing in Cosmos SDK
+---
+
+The PostHandler runs after transaction execution to perform additional processing or cleanup. Unlike the AnteHandler, which runs before message execution, the PostHandler operates after all messages have been executed.
+
+## Overview
+
+PostHandlers are optional middleware that execute after message handlers but before the transaction result is finalized. They use the same decorator pattern as AnteHandlers but are applied after state changes from message execution.
+
+### PostHandler Signature
+
+```go
+type PostHandler func(ctx Context, tx Tx, simulate bool, success bool) (newCtx Context, err error)
+```
+
+PostHandlers receive:
+- `ctx`: The current context with state after message execution
+- `tx`: The transaction that was executed
+- `simulate`: Whether this is a simulation run
+- `success`: Whether message execution succeeded
+
+They return a new context and an error if post-processing fails.
+
+## Default PostHandler
+
+The default PostHandler in `x/auth` is currently empty but provides the structure for chaining decorators:
+
+```go title="x/auth/posthandler/post.go"
+package posthandler
+
+import (
+    sdk "github.com/cosmos/cosmos-sdk/types"
+)
+
+// HandlerOptions are the options required for constructing a default SDK PostHandler.
+type HandlerOptions struct{}
+
+// NewPostHandler returns an empty PostHandler chain.
+func NewPostHandler(_ HandlerOptions) (sdk.PostHandler, error) {
+    postDecorators := []sdk.PostDecorator{}
+
+    return sdk.ChainPostDecorators(postDecorators...), nil
+}
+```
+
+Source: [x/auth/posthandler/post.go:10](https://github.com/cosmos/cosmos-sdk/blob/main/x/auth/posthandler/post.go#L10)
+
+## PostDecorator Pattern
+
+PostDecorators follow the same pattern as AnteDecorators:
+
+```go
+type PostDecorator interface {
+    PostHandle(ctx Context, tx Tx, simulate, success bool, next PostHandler) (Context, error)
+}
+```
+
+## Use Cases
+
+PostHandlers are useful for:
+
+### 1. Transaction Cleanup
+
+Perform cleanup operations after transaction execution:
+
+```go
+type CleanupDecorator struct{}
+
+func (cd CleanupDecorator) PostHandle(ctx sdk.Context, tx sdk.Tx, simulate, success bool, next sdk.PostHandler) (sdk.Context, error) {
+    // Perform cleanup regardless of success/failure
+    defer func() {
+        // cleanup logic
+    }()
+    
+    return next(ctx, tx, simulate, success)
+}
+```
+
+### 2. Post-Transaction Hooks
+
+Execute hooks after message processing:
+
+```go
+type HookDecorator struct {
+    hooks []TransactionHook
+}
+
+func (hd HookDecorator) PostHandle(ctx sdk.Context, tx sdk.Tx, simulate, success bool, next sdk.PostHandler) (sdk.Context, error) {
+    if !simulate {
+        for _, hook := range hd.hooks {
+            if err := hook.AfterTransaction(ctx, tx, success); err != nil {
+                // decide whether to fail the transaction or just log
+                ctx.Logger().Error("post-transaction hook failed", "error", err)
+            }
+        }
+    }
+    
+    return next(ctx, tx, simulate, success)
+}
+```
+
+### 3. Metrics and Logging
+
+Collect metrics about transaction execution:
+
+```go
+type MetricsDecorator struct {
+    recorder MetricsRecorder
+}
+
+func (md MetricsDecorator) PostHandle(ctx sdk.Context, tx sdk.Tx, simulate, success bool, next sdk.PostHandler) (sdk.Context, error) {
+    if !simulate {
+        // Record transaction metrics
+        md.recorder.RecordTransaction(ctx, tx, success)
+    }
+    
+    return next(ctx, tx, simulate, success)
+}
+```
+
+### 4. Fee Refunds
+
+Refund unused gas or fees:
+
+```go
+type FeeRefundDecorator struct {
+    accountKeeper AccountKeeper
+    bankKeeper    BankKeeper
+}
+
+func (frd FeeRefundDecorator) PostHandle(ctx sdk.Context, tx sdk.Tx, simulate, success bool, next sdk.PostHandler) (sdk.Context, error) {
+    if success && !simulate {
+        feeTx, ok := tx.(sdk.FeeTx)
+        if ok {
+            gasUsed := ctx.GasMeter().GasConsumed()
+            gasLimit := feeTx.GetGas()
+            
+            if gasUsed < gasLimit {
+                // Calculate refund for unused gas
+                refundAmount := calculateRefund(gasLimit - gasUsed, feeTx.GetFee())
+                
+                // Refund to fee payer
+                feePayer := feeTx.FeePayer()
+                if err := frd.refundFees(ctx, feePayer, refundAmount); err != nil {
+                    return ctx, err
+                }
+            }
+        }
+    }
+    
+    return next(ctx, tx, simulate, success)
+}
+```
+
+## Custom PostHandler Chain
+
+Create a custom PostHandler by chaining decorators:
+
+```go
+type CustomHandlerOptions struct {
+    MetricsRecorder MetricsRecorder
+    Hooks           []TransactionHook
+}
+
+func NewCustomPostHandler(opts CustomHandlerOptions) (sdk.PostHandler, error) {
+    postDecorators := []sdk.PostDecorator{
+        NewMetricsDecorator(opts.MetricsRecorder),
+        NewHookDecorator(opts.Hooks),
+        NewCleanupDecorator(),
+    }
+    
+    return sdk.ChainPostDecorators(postDecorators...), nil
+}
+```
+
+## Integrating PostHandler
+
+Set the PostHandler in your app:
+
+```go
+// In app.go
+postHandlerOptions := posthandler.HandlerOptions{}
+postHandler, err := posthandler.NewPostHandler(postHandlerOptions)
+if err != nil {
+    panic(err)
+}
+
+app.SetPostHandler(postHandler)
+```
+
+## PostHandler vs AnteHandler
+
+| Feature | AnteHandler | PostHandler |
+|---------|------------|-------------|
+| Execution | Before message execution | After message execution |
+| Purpose | Validation and preprocessing | Cleanup and post-processing |
+| State Access | Pre-execution state | Post-execution state |
+| Failure Impact | Prevents message execution | Can revert entire transaction |
+| Common Uses | Signature verification, fee deduction | Metrics, hooks, refunds |
+| Required | Yes (transaction won't execute without) | No (optional) |
+
+## Important Considerations
+
+### State Changes
+
+PostHandlers operate on the state **after** message execution:
+
+```go
+func (pd PostDecorator) PostHandle(ctx sdk.Context, tx sdk.Tx, simulate, success bool, next sdk.PostHandler) (sdk.Context, error) {
+    // State here reflects all message executions
+    // Any state changes made here are part of the transaction
+    
+    if !success {
+        // Handle failed transaction
+        // Note: message state changes have already been reverted
+    }
+    
+    return next(ctx, tx, simulate, success)
+}
+```
+
+### Error Handling
+
+Errors from PostHandlers will fail the entire transaction:
+
+```go
+func (pd PostDecorator) PostHandle(ctx sdk.Context, tx sdk.Tx, simulate, success bool, next sdk.PostHandler) (sdk.Context, error) {
+    if err := someOperation(); err != nil {
+        // This will revert ALL state changes from this transaction
+        return ctx, err
+    }
+    
+    return next(ctx, tx, simulate, success)
+}
+```
+
+### Simulation Mode
+
+Handle simulation appropriately:
+
+```go
+func (pd PostDecorator) PostHandle(ctx sdk.Context, tx sdk.Tx, simulate, success bool, next sdk.PostHandler) (sdk.Context, error) {
+    if simulate {
+        // Skip operations that shouldn't run in simulation
+        return next(ctx, tx, simulate, success)
+    }
+    
+    // Real execution logic
+    return next(ctx, tx, simulate, success)
+}
+```
+
+## Best Practices
+
+1. **Lightweight Operations**: Keep PostHandler logic fast and efficient
+2. **Idempotency**: Ensure operations are safe if called multiple times
+3. **Error Handling**: Be cautious about failing transactions in PostHandler
+4. **Simulation**: Always handle simulation mode correctly
+5. **Logging**: Use the context logger for debugging
+6. **Gas**: Be mindful of gas consumption in PostHandler operations
+
+## Example: Comprehensive PostHandler
+
+```go
+type ComprehensivePostHandler struct {
+    accountKeeper AccountKeeper
+    bankKeeper    BankKeeper
+    logger        log.Logger
+}
+
+func (cph ComprehensivePostHandler) PostHandle(
+    ctx sdk.Context, 
+    tx sdk.Tx, 
+    simulate, success bool, 
+    next sdk.PostHandler,
+) (sdk.Context, error) {
+    // Skip in simulation
+    if simulate {
+        return next(ctx, tx, simulate, success)
+    }
+    
+    // Log transaction result
+    cph.logger.Info(
+        "transaction processed",
+        "success", success,
+        "gas_used", ctx.GasMeter().GasConsumed(),
+    )
+    
+    // Emit post-execution events
+    ctx.EventManager().EmitEvent(
+        sdk.NewEvent(
+            "tx_post_processing",
+            sdk.NewAttribute("success", fmt.Sprintf("%t", success)),
+        ),
+    )
+    
+    // Only process successful transactions
+    if success {
+        // Additional processing for successful transactions
+    }
+    
+    return next(ctx, tx, simulate, success)
+}
+```
+
+## See Also
+
+- [AnteHandler](/advanced/ante-handler) - Pre-transaction validation
+- [Transaction Lifecycle](/core/transactions) - Complete transaction flow
+- [Events](/core/events) - Event emission and querying

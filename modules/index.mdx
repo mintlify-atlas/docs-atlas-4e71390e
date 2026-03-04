@@ -1,0 +1,142 @@
+---
+title: Modules Overview
+description: Complete guide to Cosmos SDK modules including essential, supplementary, and enterprise modules
+---
+
+# Cosmos SDK Modules Overview
+
+The Cosmos SDK provides a comprehensive collection of production-grade modules that enable developers to build feature-rich blockchain applications. This page provides an overview of all available modules, their categories, and use cases.
+
+## What are Cosmos SDK Modules?
+
+Modules are self-contained units of functionality that can be composed together to build a blockchain application. Each module encapsulates specific blockchain features such as token transfers, staking, governance, or custom application logic. Modules interact with each other through well-defined keeper interfaces and share a common runtime environment.
+
+## Module Categories
+
+Cosmos SDK modules are organized into three main categories:
+
+### Essential Modules
+
+Essential modules provide core functionality that must be included in your Cosmos SDK blockchain. These modules deliver fundamental behaviors needed for users and operators, including balance tracking, proof-of-stake capabilities, and governance.
+
+**Core Essential Modules:**
+
+- **[Auth](/modules/auth)** - Authentication of accounts and transactions. Handles signature verification, account management, and fee deduction.
+- **[Bank](/modules/bank)** - Token transfer functionalities and balance tracking. Manages multi-asset coin transfers between accounts.
+- **[Staking](/modules/staking)** - Proof-of-Stake layer for public blockchains. Enables token holders to become validators and delegate tokens.
+- **[Distribution](/modules/distribution)** - Fee distribution and staking token provision. Handles reward distribution to validators and delegators.
+- **[Governance](/modules/gov)** - On-chain proposals and voting. Enables decentralized decision-making for chain upgrades and parameter changes.
+
+**Infrastructure Essential Modules:**
+
+- **[Consensus](/modules/consensus)** - Consensus module for modifying CometBFT's ABCI consensus parameters.
+- **[Genutil](/modules/genutil)** - Genesis utilities for bootstrapping the Cosmos SDK blockchain.
+- **[Mint](/modules/mint)** - Creation of new units of staking token through inflation mechanisms.
+- **[Slashing](/modules/slashing)** - Validator punishment mechanisms for misbehavior such as downtime or double-signing.
+- **[Upgrade](/modules/upgrade)** - Software upgrades handling and coordination for seamless chain upgrades.
+- **[Evidence](/modules/evidence)** - Evidence handling for double signing, misbehavior, and other consensus violations.
+
+### Supplementary Modules
+
+Supplementary modules are maintained in the Cosmos SDK but are not necessary for core functionality. They extend the capabilities of your blockchain or provide specialized features for specific use cases.
+
+- **[Authz](/modules/authz)** - Authorization for accounts to perform actions on behalf of other accounts. Enables granular permission granting.
+- **[Epochs](/modules/epochs)** - Registration system for SDK modules to execute logic on timed intervals.
+- **[Feegrant](/modules/feegrant)** - Grant fee allowances for executing transactions. Allows one account to pay fees for another.
+- **[ProtocolPool](/modules/protocolpool)** - Extended management of community pool functionality with enhanced governance controls.
+
+### Enterprise Modules
+
+Enterprise modules are specialized modules designed for permissioned or consortium blockchain use cases. These modules use different licenses than the Apache 2.0 core SDK modules.
+
+> **Important:** Please review the LICENSE file in each enterprise module directory before use.
+
+- **[PoA (Proof of Authority)](/modules/poa)** - Admin-controlled validator set for permissioned networks with governance integration. Ideal for consortium chains.
+
+For complete information about enterprise modules, licensing, and documentation, see the [Enterprise Modules documentation](https://github.com/cosmos/cosmos-sdk/tree/main/enterprise).
+
+## External Ecosystem Modules
+
+### IBC (Inter-Blockchain Communication)
+
+The IBC module enables cross-chain communication and is maintained by the IBC Go team in its [own repository](https://github.com/cosmos/ibc-go). IBC allows independent blockchains to transfer tokens and data between each other.
+
+The [capability module](https://github.com/cosmos/ibc-go/tree/main/modules/capability) is also maintained by the IBC Go team and provides object-capability authentication for IBC and other modules.
+
+### CosmWasm
+
+CosmWasm enables smart contracts written in Rust that compile to WebAssembly. Learn more at the [CosmWasm documentation site](https://book.cosmwasm.com/) or visit [the repository](https://github.com/CosmWasm/cosmwasm).
+
+### EVM Module
+
+The EVM module allows running Solidity smart contracts on Cosmos SDK chains. Read more about writing smart contracts with Solidity at the official [EVM documentation page](https://evm.cosmos.network/).
+
+## Module Use Cases
+
+### Financial Applications
+
+- **Token Management**: Bank, Mint, Distribution
+- **DeFi Protocols**: Bank, Authz, Feegrant
+- **Asset Transfers**: Bank, IBC
+
+### Governance & DAO
+
+- **On-chain Voting**: Governance, Staking
+- **Treasury Management**: ProtocolPool, Governance
+- **Parameter Updates**: Governance, Upgrade
+
+### Validator Operations
+
+- **Network Security**: Staking, Slashing, Evidence
+- **Consensus Management**: Consensus, Upgrade
+- **Reward Distribution**: Distribution, Mint
+
+### Enterprise & Permissioned Chains
+
+- **Controlled Access**: PoA (Proof of Authority)
+- **Consortium Governance**: PoA, Governance
+- **Custom Validators**: PoA
+
+## Deprecated Modules
+
+The following modules are deprecated and will no longer be actively maintained:
+
+- **[Crisis](https://github.com/cosmos/cosmos-sdk/tree/main/contrib/x/crisis)** - Halting the blockchain under certain circumstances (deprecated)
+- **[Params](https://github.com/cosmos/cosmos-sdk/tree/main/x/params)** - Globally available parameter store (deprecated in favor of module-specific params)
+- **[NFT](https://github.com/cosmos/cosmos-sdk/tree/main/contrib/x/nft)** - NFT module based on ADR-043 (deprecated)
+- **[Group](https://github.com/cosmos/cosmos-sdk/tree/main/enterprise/group)** - On-chain multisig accounts (deprecated, now an enterprise module)
+- **[Circuit](https://github.com/cosmos/cosmos-sdk/tree/main/contrib/x/circuit)** - Circuit breaker for pausing messages (deprecated)
+
+## Module Architecture
+
+All Cosmos SDK modules follow a consistent architecture pattern:
+
+```
+x/{module}/
+├── keeper/          # State management and business logic
+├── types/           # Protocol buffer definitions and types
+├── client/          # CLI and REST client interfaces
+├── module.go        # AppModule implementation
+└── README.md        # Module documentation
+```
+
+### Key Components
+
+- **Keeper**: Manages module state and provides methods for other modules to interact with it
+- **Messages**: Define state transitions triggered by user transactions
+- **Queries**: Enable read-only access to module state
+- **Genesis**: Handle initialization and export of module state
+- **Events**: Emit structured data about state changes
+
+## Next Steps
+
+- **[Building Modules](/modules/building-modules)** - Learn how to develop custom modules
+- **[Module Interfaces](https://docs.cosmos.network/main/build/building-modules/intro)** - Understanding module interfaces and patterns
+- **[Keeper Design](/modules/building-modules#keeper-patterns)** - Best practices for keeper implementation
+
+## Resources
+
+- [Cosmos SDK Documentation](https://docs.cosmos.network)
+- [Module Development Guide](https://docs.cosmos.network/main/build/building-modules/intro)
+- [Cosmos SDK GitHub Repository](https://github.com/cosmos/cosmos-sdk)
+- [ADR (Architecture Decision Records)](https://docs.cosmos.network/main/build/architecture)

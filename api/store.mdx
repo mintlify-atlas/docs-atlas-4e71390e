@@ -1,0 +1,425 @@
+---
+title: Store
+description: State storage interfaces and multi-store management
+---
+
+## Overview
+
+The store package provides interfaces for persisting application state in Cosmos SDK. It implements a multi-store pattern with support for IAVL trees, transient storage, and state commitment.
+
+## Core Interfaces
+
+### Store
+
+```go
+type Store interface {
+    GetStoreType() StoreType
+    CacheWrapper
+}
+```
+
+Base interface for all store types.
+
+**Location:** `store/types/store.go:17-20`
+
+### Committer
+
+```go
+type Committer interface {
+    Commit() CommitID
+    LastCommitID() CommitID
+    WorkingHash() []byte
+    
+    SetPruning(pruningtypes.PruningOptions)
+    GetPruning() pruningtypes.PruningOptions
+}
+```
+
+Interface for stores that can commit state to disk.
+
+**Location:** `store/types/store.go:23-32`
+
+### KVStore
+
+```go
+type KVStore interface {
+    Store
+    
+    // Get returns nil if key doesn't exist
+    Get(key []byte) []byte
+    
+    // Has checks if key exists
+    Has(key []byte) bool
+    
+    // Set sets the key
+    Set(key, value []byte)
+    
+    // Delete removes the key
+    Delete(key []byte)
+    
+    // Iterator over a domain of keys in ascending order
+    Iterator(start, end []byte) Iterator
+    
+    // ReverseIterator over a domain of keys in descending order
+    ReverseIterator(start, end []byte) Iterator
+}
+```
+
+Primary interface for key-value storage operations.
+
+### CommitKVStore
+
+```go
+type CommitKVStore interface {
+    Committer
+    KVStore
+}
+```
+
+KVStore with commit capabilities.
+
+## MultiStore
+
+### MultiStore Interface
+
+```go
+type MultiStore interface {
+    Store
+    
+    // Cache the multistore
+    CacheMultiStore() CacheMultiStore
+    
+    // Cache at specific version
+    CacheMultiStoreWithVersion(version int64) (CacheMultiStore, error)
+    
+    // Get substores
+    GetStore(StoreKey) Store
+    GetKVStore(StoreKey) KVStore
+    GetObjKVStore(StoreKey) ObjKVStore
+    
+    // Tracing
+    TracingEnabled() bool
+    SetTracer(w io.Writer) MultiStore
+    SetTracingContext(TraceContext) MultiStore
+    
+    // Latest version
+    LatestVersion() int64
+}
+```
+
+**Location:** `store/types/store.go:115-148`
+
+### CommitMultiStore
+
+```go
+type CommitMultiStore interface {
+    Committer
+    MultiStore
+    snapshottypes.Snapshotter
+    
+    // Earliest version
+    EarliestVersion() int64
+    
+    // Mount stores
+    MountStoreWithDB(key StoreKey, typ StoreType, db dbm.DB)
+    
+    // Get commit stores
+    GetCommitStore(key StoreKey) CommitStore
+    GetCommitKVStore(key StoreKey) CommitKVStore
+    
+    // Load versions
+    LoadLatestVersion() error
+    LoadLatestVersionAndUpgrade(upgrades *StoreUpgrades) error
+    LoadVersionAndUpgrade(ver int64, upgrades *StoreUpgrades) error
+    LoadVersion(ver int64) error
+    
+    // Inter-block cache
+    SetInterBlockCache(MultiStorePersistentCache)
+    
+    // Set initial version for new chain
+    SetInitialVersion(version int64) error
+}
+```
+
+**Location:** `store/types/store.go:157-200`
+
+Manages multiple substores with atomic commits.
+
+## Store Keys
+
+### StoreKey Types
+
+```go
+type StoreKey interface {
+    Name() string
+    String() string
+}
+
+type KVStoreKey struct {
+    name string
+}
+
+type TransientStoreKey struct {
+    name string
+}
+
+type MemoryStoreKey struct {
+    name string
+}
+```
+
+Store keys identify different state stores in the multistore.
+
+### Creating Store Keys
+
+```go
+func NewKVStoreKey(name string) *KVStoreKey
+func NewTransientStoreKey(name string) *TransientStoreKey
+func NewMemoryStoreKey(name string) *MemoryStoreKey
+```
+
+## Store Types
+
+```go
+const (
+    StoreTypeMulti     StoreType = iota // Multi-store
+    StoreTypeDB                          // Database store
+    StoreTypeIAVL                        // IAVL tree store
+    StoreTypeTransient                   // Transient store
+    StoreTypeMemory                      // Memory store
+)
+```
+
+- **IAVL**: Merkle tree for committed state
+- **Transient**: Reset after each block (for temporary state)
+- **Memory**: In-memory only, not persisted
+
+## Gas Metering
+
+### GasMeter
+
+```go
+type GasMeter interface {
+    GasConsumed() Gas
+    GasConsumedToLimit() Gas
+    GasRemaining() Gas
+    Limit() Gas
+    ConsumeGas(amount Gas, descriptor string)
+    RefundGas(amount Gas, descriptor string)
+    IsPastLimit() bool
+    IsOutOfGas() bool
+    String() string
+}
+```
+
+Tracks gas consumption during transaction execution.
+
+### Gas Configuration
+
+```go
+type GasConfig struct {
+    HasCost          Gas
+    DeleteCost       Gas
+    ReadCostFlat     Gas
+    ReadCostPerByte  Gas
+    WriteCostFlat    Gas
+    WriteCostPerByte Gas
+    IterNextCostFlat Gas
+}
+
+// Default gas configuration
+func KVGasConfig() GasConfig
+func TransientGasConfig() GasConfig
+```
+
+Configures gas costs for different store operations.
+
+## Usage Examples
+
+### Mounting Stores in BaseApp
+
+```go
+import (
+    "github.com/cosmos/cosmos-sdk/baseapp"
+    storetypes "cosmossdk.io/store/types"
+)
+
+// Define store keys
+keys := sdk.NewKVStoreKeys(
+    authtypes.StoreKey,
+    banktypes.StoreKey,
+    stakingtypes.StoreKey,
+)
+
+tkeys := sdk.NewTransientStoreKeys(
+    paramstypes.TStoreKey,
+)
+
+memKeys := sdk.NewMemoryStoreKeys(
+    capabilitytypes.MemStoreKey,
+)
+
+// Mount stores in BaseApp
+bApp := baseapp.NewBaseApp(...)
+bApp.MountStores(keys[authtypes.StoreKey], keys[banktypes.StoreKey])
+bApp.MountStores(tkeys[paramstypes.TStoreKey])
+bApp.MountStores(memKeys[capabilitytypes.MemStoreKey])
+
+// Load latest version
+if err := bApp.LoadLatestVersion(); err != nil {
+    panic(err)
+}
+```
+
+### Using KVStore in Keeper
+
+```go
+type Keeper struct {
+    storeKey storetypes.StoreKey
+    cdc      codec.BinaryCodec
+}
+
+func (k Keeper) SetBalance(
+    ctx sdk.Context,
+    addr sdk.AccAddress,
+    balance sdk.Coin,
+) {
+    store := ctx.KVStore(k.storeKey)
+    key := types.BalanceKey(addr, balance.Denom)
+    value := k.cdc.MustMarshal(&balance)
+    store.Set(key, value)
+}
+
+func (k Keeper) GetBalance(
+    ctx sdk.Context,
+    addr sdk.AccAddress,
+    denom string,
+) sdk.Coin {
+    store := ctx.KVStore(k.storeKey)
+    key := types.BalanceKey(addr, denom)
+    value := store.Get(key)
+    
+    if value == nil {
+        return sdk.NewCoin(denom, math.ZeroInt())
+    }
+    
+    var balance sdk.Coin
+    k.cdc.MustUnmarshal(value, &balance)
+    return balance
+}
+```
+
+### Iterating Over Keys
+
+```go
+func (k Keeper) IterateBalances(
+    ctx sdk.Context,
+    cb func(addr sdk.AccAddress, balance sdk.Coin) bool,
+) {
+    store := ctx.KVStore(k.storeKey)
+    iterator := store.Iterator(BalancePrefix, nil)
+    defer iterator.Close()
+    
+    for ; iterator.Valid(); iterator.Next() {
+        var balance sdk.Coin
+        k.cdc.MustUnmarshal(iterator.Value(), &balance)
+        
+        addr := AddressFromBalanceKey(iterator.Key())
+        if cb(addr, balance) {
+            break
+        }
+    }
+}
+```
+
+### Using Prefix Store
+
+```go
+import "cosmossdk.io/store/prefix"
+
+func (k Keeper) GetAccountStore(ctx sdk.Context, addr sdk.AccAddress) sdk.KVStore {
+    store := ctx.KVStore(k.storeKey)
+    return prefix.NewStore(store, types.AddressPrefix(addr))
+}
+
+// Now operations are scoped to the address prefix
+accountStore := k.GetAccountStore(ctx, addr)
+accountStore.Set([]byte("balance"), balanceBytes)
+```
+
+### Gas Meter Usage
+
+```go
+func (k Keeper) ExpensiveOperation(ctx sdk.Context) error {
+    // Check gas before expensive operation
+    gasMeter := ctx.GasMeter()
+    if gasMeter.GasRemaining() < 1000 {
+        return sdkerrors.Wrap(sdkerrors.ErrOutOfGas, "insufficient gas")
+    }
+    
+    // Consume gas for operation
+    gasMeter.ConsumeGas(1000, "expensive operation")
+    
+    // Perform operation
+    store := ctx.KVStore(k.storeKey)
+    // Gas is automatically consumed for store operations
+    store.Set(key, value)
+    
+    return nil
+}
+```
+
+### Store Upgrades
+
+```go
+import storetypes "cosmossdk.io/store/types"
+
+func (app *App) RegisterUpgradeHandlers() {
+    app.UpgradeKeeper.SetUpgradeHandler(
+        "v2",
+        func(ctx sdk.Context, plan upgradetypes.Plan, vm module.VersionMap) (module.VersionMap, error) {
+            // Upgrade logic
+            return app.ModuleManager.RunMigrations(ctx, app.configurator, vm)
+        },
+    )
+    
+    upgradeInfo, err := app.UpgradeKeeper.ReadUpgradeInfoFromDisk()
+    if err != nil {
+        panic(err)
+    }
+    
+    if upgradeInfo.Name == "v2" {
+        storeUpgrades := storetypes.StoreUpgrades{
+            Added: []string{"newmodule"},
+            Deleted: []string{"oldmodule"},
+        }
+        
+        app.SetStoreLoader(
+            upgradetypes.UpgradeStoreLoader(upgradeInfo.Height, &storeUpgrades),
+        )
+    }
+}
+```
+
+## Caching and Branching
+
+```go
+// Create a cached context for temporary state
+cachedCtx, writeCache := ctx.CacheContext()
+
+// Perform operations on cached context
+k.SetValue(cachedCtx, key, value)
+
+// Discard or commit changes
+if success {
+    writeCache() // Commit to parent context
+} else {
+    // Changes are discarded
+}
+```
+
+## Related APIs
+
+- [Context](/api/types#context) - Accessing stores from context
+- [BaseApp](/api/baseapp) - Store mounting and loading
+- [Keeper Patterns](/api/keeper-patterns) - Using stores in keepers
